@@ -181,6 +181,7 @@ pub struct WaylandRuntimeConfig {
     pub output_name: Option<String>,
     pub preferred_scale: f32,
     pub exit_after_ms: Option<u64>,
+    pub initial_visible: bool,
     pub renderer: veilshell_render::RendererPreference,
     pub wallpaper: Option<veilshell_render::WallpaperImage>,
 }
@@ -192,6 +193,7 @@ impl Default for WaylandRuntimeConfig {
             output_name: None,
             preferred_scale: 1.0,
             exit_after_ms: None,
+            initial_visible: true,
             renderer: veilshell_render::RendererPreference::Auto,
             wallpaper: None,
         }

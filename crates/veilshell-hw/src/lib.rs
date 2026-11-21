@@ -1,8 +1,34 @@
-//! Hardware telemetry snapshots and declarative device profile parsing.
+//! Hardware telemetry snapshots, live Linux backends, control actions, and declarative device profiles.
+
+pub mod linux;
 
 use std::fmt;
 
 use veilshell_core::Orientation;
+
+pub use linux::{detect_dmi_device, load_matching_profile, LinuxHardware, SensorGuard};
+
+/// Errors returned by [`HardwareController`] operations when applying live settings.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HardwareError {
+    /// Underlying system CLI or `sysfs` write failed.
+    CommandFailed { tool: &'static str, detail: String },
+    /// Required system tool or hardware device is unavailable on this host.
+    Unavailable(&'static str),
+}
+
+impl fmt::Display for HardwareError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CommandFailed { tool, detail } => {
+                write!(f, "hardware command '{tool}' failed: {detail}")
+            }
+            Self::Unavailable(msg) => write!(f, "hardware control unavailable: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for HardwareError {}
 
 /// Point-in-time hardware status consumed by the shell and quick settings shade.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -17,6 +43,7 @@ pub struct HardwareSnapshot {
     pub brightness_pct: u8,
     pub volume_pct: u8,
     pub muted: bool,
+    pub night_light: bool,
     pub keyboard_attached: bool,
     pub orientation: Orientation,
 }
@@ -33,16 +60,56 @@ impl Default for HardwareSnapshot {
             brightness_pct: 60,
             volume_pct: 50,
             muted: false,
+            night_light: false,
             keyboard_attached: true,
             orientation: Orientation::Normal,
         }
     }
 }
 
-/// Read-only hardware telemetry source (`iio-sensor-proxy`, `UPower`, `NetworkManager`, etc.).
+/// Read-only hardware telemetry source (`iio-sensor-proxy`, `sysfs`, `NetworkManager`, etc.).
 pub trait HardwareBackend {
     /// Capture the latest [`HardwareSnapshot`].
     fn snapshot(&self) -> HardwareSnapshot;
+}
+
+/// Write/control interface for Quick Settings toggles and sliders.
+pub trait HardwareController {
+    /// Enable or disable the `Wi-Fi` radio.
+    ///
+    /// # Errors
+    /// Returns [`HardwareError`] if the backend tool fails or is unavailable.
+    fn set_wifi(&mut self, enabled: bool) -> Result<(), HardwareError>;
+
+    /// Enable or disable `Bluetooth` controller power.
+    ///
+    /// # Errors
+    /// Returns [`HardwareError`] if the backend tool fails or is unavailable.
+    fn set_bluetooth(&mut self, enabled: bool) -> Result<(), HardwareError>;
+
+    /// Enable or disable `WWAN` / cellular data radio.
+    ///
+    /// # Errors
+    /// Returns [`HardwareError`] if the backend tool fails or is unavailable.
+    fn set_wwan(&mut self, enabled: bool) -> Result<(), HardwareError>;
+
+    /// Set display backlight brightness percentage (`0..=100`).
+    ///
+    /// # Errors
+    /// Returns [`HardwareError`] if the backlight backend fails or is unavailable.
+    fn set_brightness(&mut self, pct: u8) -> Result<(), HardwareError>;
+
+    /// Set default audio sink volume percentage (`0..=100`).
+    ///
+    /// # Errors
+    /// Returns [`HardwareError`] if the audio mixer fails or is unavailable.
+    fn set_volume(&mut self, pct: u8) -> Result<(), HardwareError>;
+
+    /// Enable or disable warm-color Night Light mode.
+    ///
+    /// # Errors
+    /// Returns [`HardwareError`] if the display color backend fails or is unavailable.
+    fn set_night_light(&mut self, enabled: bool) -> Result<(), HardwareError>;
 }
 
 /// Deterministic hardware backend for tests and offline previews.
@@ -67,6 +134,43 @@ impl MockHardware {
 impl HardwareBackend for MockHardware {
     fn snapshot(&self) -> HardwareSnapshot {
         self.state.clone()
+    }
+}
+
+impl HardwareController for MockHardware {
+    fn set_wifi(&mut self, enabled: bool) -> Result<(), HardwareError> {
+        self.state.wifi_connected = enabled;
+        self.state.wifi_ssid = if enabled {
+            Some("MockNet".into())
+        } else {
+            None
+        };
+        Ok(())
+    }
+
+    fn set_bluetooth(&mut self, enabled: bool) -> Result<(), HardwareError> {
+        self.state.bluetooth_enabled = enabled;
+        Ok(())
+    }
+
+    fn set_wwan(&mut self, enabled: bool) -> Result<(), HardwareError> {
+        self.state.lte_signal_pct = if enabled { Some(80) } else { None };
+        Ok(())
+    }
+
+    fn set_brightness(&mut self, pct: u8) -> Result<(), HardwareError> {
+        self.state.brightness_pct = pct.clamp(5, 100);
+        Ok(())
+    }
+
+    fn set_volume(&mut self, pct: u8) -> Result<(), HardwareError> {
+        self.state.volume_pct = pct.min(100);
+        Ok(())
+    }
+
+    fn set_night_light(&mut self, enabled: bool) -> Result<(), HardwareError> {
+        self.state.night_light = enabled;
+        Ok(())
     }
 }
 
@@ -103,7 +207,10 @@ pub struct HardwareProfile {
     pub refresh_hz: u32,
     pub touch_device: Option<String>,
     pub mode_strategy: String,
+    pub usb_vendor_id: Option<String>,
+    pub usb_product_id: Option<String>,
     pub auto_rotate_in_tablet_mode: bool,
+    pub swap_left_right: bool,
 }
 
 impl HardwareProfile {
@@ -121,7 +228,10 @@ impl HardwareProfile {
         let mut refresh_hz = 60_u32;
         let mut touch_device = None;
         let mut mode_strategy = "manual".to_owned();
+        let mut usb_vendor_id = None;
+        let mut usb_product_id = None;
         let mut auto_rotate_in_tablet_mode = true;
+        let mut swap_left_right = false;
 
         for raw_line in src.lines() {
             let line = raw_line.trim();
@@ -162,12 +272,24 @@ impl HardwareProfile {
                 }
                 ("touch", "device_name") => touch_device = Some(val.to_owned()),
                 ("mode_switch", "strategy") => val.clone_into(&mut mode_strategy),
+                ("mode_switch", "usb_vendor_id") if !val.is_empty() => {
+                    usb_vendor_id = Some(val.to_ascii_lowercase());
+                }
+                ("mode_switch", "usb_product_id") if !val.is_empty() => {
+                    usb_product_id = Some(val.to_ascii_lowercase());
+                }
                 ("sensors", "auto_rotate_in_tablet_mode") => {
                     auto_rotate_in_tablet_mode =
                         val.parse().map_err(|_| ProfileError::InvalidValue {
                             field: "sensors.auto_rotate_in_tablet_mode",
                             value: val.to_owned(),
                         })?;
+                }
+                ("sensors", "swap_left_right") => {
+                    swap_left_right = val.parse().map_err(|_| ProfileError::InvalidValue {
+                        field: "sensors.swap_left_right",
+                        value: val.to_owned(),
+                    })?;
                 }
                 _ => {}
             }
@@ -182,8 +304,38 @@ impl HardwareProfile {
             refresh_hz,
             touch_device,
             mode_strategy,
+            usb_vendor_id,
+            usb_product_id,
             auto_rotate_in_tablet_mode,
+            swap_left_right,
         })
+    }
+
+    /// Built-in hardware profiles embedded in `veilshell-hw`.
+    #[must_use]
+    pub fn built_in_profiles() -> Vec<Self> {
+        const SURFACE_GO_3: &str =
+            include_str!("../../../hardware-profiles/microsoft-surface-go-3.toml");
+        Self::parse_toml(SURFACE_GO_3).into_iter().collect()
+    }
+
+    /// Find the first profile matching a `DMI` `sys_vendor` and `product_name` pair.
+    #[must_use]
+    pub fn match_dmi<'a>(profiles: &'a [Self], vendor: &str, product: &str) -> Option<&'a Self> {
+        let vendor = vendor.trim();
+        let product = product.trim();
+        profiles.iter().find(|p| {
+            p.vendor.eq_ignore_ascii_case(vendor) && p.product.eq_ignore_ascii_case(product)
+        })
+    }
+
+    /// Return the configured detachable `USB` `(vendor_id, product_id)` pair if present.
+    #[must_use]
+    pub fn usb_keyboard_ids(&self) -> Option<(&str, &str)> {
+        match (&self.usb_vendor_id, &self.usb_product_id) {
+            (Some(v), Some(p)) => Some((v.as_str(), p.as_str())),
+            _ => None,
+        }
     }
 }
 
@@ -205,6 +357,39 @@ mod tests {
             Some("ELAN9038:00 04F3:2A1C")
         );
         assert_eq!(profile.mode_strategy, "usb_keyboard_presence");
+        assert_eq!(profile.usb_vendor_id.as_deref(), Some("045e"));
+        assert_eq!(profile.usb_product_id.as_deref(), Some("09b5"));
         assert!(profile.auto_rotate_in_tablet_mode);
+        assert!(!profile.swap_left_right);
+    }
+
+    #[test]
+    fn matches_built_in_surface_go_3_dmi() {
+        let profiles = HardwareProfile::built_in_profiles();
+        let matched =
+            HardwareProfile::match_dmi(&profiles, "Microsoft Corporation", "Surface Go 3")
+                .expect("Surface Go 3 should match");
+        assert_eq!(matched.usb_keyboard_ids(), Some(("045e", "09b5")));
+        assert!(HardwareProfile::match_dmi(&profiles, "Acme", "Unknown Tablet").is_none());
+    }
+
+    #[test]
+    fn mock_hardware_controller_mutates_snapshot() {
+        let mut mock = MockHardware::default();
+        mock.set_wifi(false).expect("wifi off");
+        mock.set_bluetooth(true).expect("bt on");
+        mock.set_wwan(true).expect("wwan on");
+        mock.set_brightness(2).expect("brightness clamped");
+        mock.set_volume(91).expect("volume set");
+        mock.set_night_light(true).expect("night light on");
+
+        let snap = mock.snapshot();
+        assert!(!snap.wifi_connected);
+        assert!(snap.wifi_ssid.is_none());
+        assert!(snap.bluetooth_enabled);
+        assert_eq!(snap.lte_signal_pct, Some(80));
+        assert_eq!(snap.brightness_pct, 5);
+        assert_eq!(snap.volume_pct, 91);
+        assert!(snap.night_light);
     }
 }

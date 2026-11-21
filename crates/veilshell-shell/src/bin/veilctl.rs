@@ -1,4 +1,4 @@
-//! `veilctl` control, inspection, `.desktop` app browser, and offscreen PNG snapshot CLI.
+//! `veilctl` control, inspection, live hardware telemetry, `.desktop` app browser, and offscreen `PNG` snapshot `CLI`.
 
 use std::env;
 use std::io::Write as _;
@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use veilshell_compositor::{CompositorBackend, HyprlandBackend, MockBackend};
 use veilshell_core::{ModePolicy, Orientation};
-use veilshell_hw::MockHardware;
+use veilshell_hw::{detect_dmi_device, HardwareBackend, LinuxHardware};
 use veilshell_render::{
     ActiveRenderer, RendererBackend, RendererPreference, SceneContext, SceneKind, SnapshotSpec,
     ViewportSize, WallpaperImage,
@@ -35,6 +35,10 @@ fn main() -> ExitCode {
         }
         "status" => {
             cmd_status();
+            ExitCode::SUCCESS
+        }
+        "hw" => {
+            cmd_hw();
             ExitCode::SUCCESS
         }
         "show" => cmd_show(args.get(1).map(String::as_str)),
@@ -142,13 +146,76 @@ fn cmd_apps() {
     }
 }
 
+fn cmd_hw() {
+    let hw = LinuxHardware::auto_detect();
+    let snap = hw.snapshot();
+    println!("Hardware telemetry:");
+    match detect_dmi_device() {
+        Some((vendor, product)) => println!("  dmi        : {vendor} — {product}"),
+        None => println!("  dmi        : unavailable"),
+    }
+    match hw.profile() {
+        Some(p) => println!(
+            "  profile    : {} (scale {:.2}x, kbd strategy: {}, auto-rotate: {})",
+            p.id, p.preferred_scale, p.mode_strategy, p.auto_rotate_in_tablet_mode
+        ),
+        None => println!("  profile    : generic default"),
+    }
+    println!(
+        "  keyboard   : {}",
+        if snap.keyboard_attached {
+            "attached"
+        } else {
+            "detached"
+        }
+    );
+    println!(
+        "  battery    : {}%{}",
+        snap.battery_pct,
+        if snap.charging { " (charging)" } else { "" }
+    );
+    println!("  backlight  : {}%", snap.brightness_pct);
+    println!(
+        "  volume     : {}%{}",
+        snap.volume_pct,
+        if snap.muted { " (muted)" } else { "" }
+    );
+    println!(
+        "  wifi       : {}",
+        snap.wifi_ssid.as_deref().unwrap_or(if snap.wifi_connected {
+            "connected"
+        } else {
+            "off"
+        })
+    );
+    println!(
+        "  bluetooth  : {}",
+        if snap.bluetooth_enabled { "on" } else { "off" }
+    );
+    println!(
+        "  wwan/lte   : {} (modem present: {})",
+        snap.lte_signal_pct
+            .map_or_else(|| "disconnected".to_owned(), |s| format!("{s}%")),
+        hw.has_wwan_hardware()
+    );
+    println!(
+        "  night_light: {}",
+        if snap.night_light { "on" } else { "off" }
+    );
+}
+
 fn cmd_status() {
     let palette = load_best_available();
+    let hw = LinuxHardware::auto_detect();
+    let profile_id = hw.profile().map(|p| p.id.clone());
     if let Some(hypr) = HyprlandBackend::from_env().filter(HyprlandBackend::is_available) {
         let outputs = hypr.list_outputs().unwrap_or_default();
         let windows = hypr.list_windows().unwrap_or_default();
-        let state = ShellState::new(hypr, MockHardware::default(), palette);
+        let state = ShellState::new(hypr, hw, palette);
         print!("{}", state.status_report());
+        if let Some(id) = profile_id {
+            println!("  profile    : {id}");
+        }
         println!("  outputs    : {}", outputs.len());
         for o in outputs {
             println!(
@@ -158,8 +225,11 @@ fn cmd_status() {
         }
         println!("  windows    : {}", windows.len());
     } else {
-        let state = ShellState::new(MockBackend::default(), MockHardware::default(), palette);
+        let state = ShellState::new(MockBackend::default(), hw, palette);
         print!("{}", state.status_report());
+        if let Some(id) = profile_id {
+            println!("  profile    : {id}");
+        }
         println!("  hyprland   : not active in current session");
     }
 
@@ -234,8 +304,9 @@ fn cmd_mode(arg: Option<&str>) -> ExitCode {
     }
 
     let palette = load_best_available();
+    let hw = LinuxHardware::auto_detect();
     if let Some(hypr) = HyprlandBackend::from_env().filter(HyprlandBackend::is_available) {
-        let mut state = ShellState::new(hypr, MockHardware::default(), palette);
+        let mut state = ShellState::new(hypr, hw, palette);
         let result = match policy_action {
             Some(p) => state.set_policy(p),
             None => state.toggle_mode(),
@@ -256,7 +327,7 @@ fn cmd_mode(arg: Option<&str>) -> ExitCode {
         };
     }
 
-    let mut state = ShellState::new(MockBackend::default(), MockHardware::default(), palette);
+    let mut state = ShellState::new(MockBackend::default(), hw, palette);
     let result = match policy_action {
         Some(p) => state.set_policy(p),
         None => state.toggle_mode(),
@@ -346,7 +417,15 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
     let palette = load_best_available();
     let mut ctx = SceneContext::default();
     if !demo {
+        let snap = LinuxHardware::auto_detect().snapshot();
         ctx.clock_text = current_clock_hhmm();
+        ctx.battery_pct = snap.battery_pct;
+        ctx.wifi_connected = snap.wifi_connected;
+        ctx.bluetooth_enabled = snap.bluetooth_enabled;
+        ctx.lte_connected = snap.lte_signal_pct.is_some();
+        ctx.night_light = snap.night_light;
+        ctx.brightness_pct = snap.brightness_pct;
+        ctx.volume_pct = snap.volume_pct;
         let discovered = discover_desktop_apps();
         if !discovered.is_empty() {
             ctx.home_apps = apps_to_tiles(&discovered);
@@ -413,7 +492,8 @@ fn print_help() {
          USAGE:\n\
          \tveilctl <COMMAND>\n\n\
          COMMANDS:\n\
-         \tstatus                            Show shell mode, theme, compositor, and daemon state\n\
+         \tstatus                            Show shell mode, theme, hardware, compositor, and daemon state\n\
+         \thw                                Show live Linux hardware telemetry & matched device profile\n\
          \tshow <pill|home|recents|shade|osk> Switch the running daemon's active surface\n\
          \tmode <auto|laptop|tablet|toggle>  Evaluate or apply the Laptop/Tablet mode policy\n\
          \twallpaper <PNG_PATH|clear>        Update or clear the GPU pre-blurred glass wallpaper\n\

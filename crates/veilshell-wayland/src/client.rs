@@ -73,6 +73,11 @@ pub enum DaemonCommand {
     SetVisible(bool),
     /// Replace the dynamic scene context (apps, windows, hardware state, clock).
     UpdateContext(Box<SceneContext>),
+    /// Push live hardware state deltas (keyboard presence, accelerometer orientation).
+    HardwareUpdate {
+        keyboard_attached: Option<bool>,
+        orientation: Option<Orientation>,
+    },
     /// Apply a freshly loaded color palette and redraw active surfaces.
     UpdatePalette(ThemePalette),
     /// Upload and pre-blur a new static wallpaper on the GPU (or `None` to clear).
@@ -124,6 +129,18 @@ pub enum ShellAction {
 pub trait ShellActionHandler {
     /// Respond to a [`ShellAction`], optionally mutating the live [`SceneContext`].
     fn on_action(&mut self, action: ShellAction, ctx: &mut SceneContext);
+
+    /// React to live hardware events (keyboard attach/detach or accelerometer orientation).
+    ///
+    /// Returning `Some(visible)` shows (`true`) or hides (`false`) the shell surfaces.
+    fn on_hardware_update(
+        &mut self,
+        _keyboard_attached: Option<bool>,
+        _orientation: Option<Orientation>,
+        _ctx: &mut SceneContext,
+    ) -> Option<bool> {
+        None
+    }
 
     /// Handle an IPC command routed through `veilctl`; returns `(reply_line, optional_visibility)`.
     fn on_custom_command(&mut self, _cmd: &str, _ctx: &mut SceneContext) -> (String, Option<bool>) {
@@ -423,8 +440,6 @@ impl LayerApp {
                     Ok(surf) => self.overlay = Some(surf),
                     Err(err) => eprintln!("veilshell: failed to create overlay surface: {err}"),
                 }
-            } else {
-                self.draw_overlay();
             }
         }
     }
@@ -438,7 +453,8 @@ impl LayerApp {
             );
         }
 
-        let changed = self.active_scene != scene;
+        let prev_scene = self.active_scene;
+        let changed = prev_scene != scene;
         self.active_scene = scene;
         self.renderer.context_mut().pill_drag_x = 0.0;
         self.renderer.context_mut().pill_drag_y = 0.0;
@@ -459,10 +475,12 @@ impl LayerApp {
             self.renderer.context_mut().overlay_progress = 1.0;
         }
 
-        // Recreate overlay role if switching directly between e.g. Home -> Shade -> Recents
+        // Only recreate the overlay LayerSurface when geometry role changes (TouchOsk vs full-screen).
         if changed && scene != SceneKind::Pill {
-            self.overlay = None;
             self.overlay_layout = None;
+            if (prev_scene == SceneKind::Osk) != (scene == SceneKind::Osk) {
+                self.overlay = None;
+            }
         }
 
         self.sync_surfaces();
@@ -576,15 +594,36 @@ impl LayerApp {
             DaemonCommand::SetVisible(vis) => self.set_visible(vis),
             DaemonCommand::UpdateContext(ctx) => {
                 *self.renderer.context_mut() = *ctx;
-                self.draw_pill();
-                self.draw_top_strip();
-                self.draw_overlay();
+                if self.visible {
+                    self.draw_pill();
+                    self.draw_top_strip();
+                    self.draw_overlay();
+                }
+            }
+            DaemonCommand::HardwareUpdate {
+                keyboard_attached,
+                orientation,
+            } => {
+                let next_vis = self.handler.on_hardware_update(
+                    keyboard_attached,
+                    orientation,
+                    self.renderer.context_mut(),
+                );
+                if let Some(vis) = next_vis {
+                    self.set_visible(vis);
+                } else if self.visible {
+                    self.draw_pill();
+                    self.draw_top_strip();
+                    self.draw_overlay();
+                }
             }
             DaemonCommand::UpdatePalette(palette) => {
                 self.palette = palette;
-                self.draw_pill();
-                self.draw_top_strip();
-                self.draw_overlay();
+                if self.visible {
+                    self.draw_pill();
+                    self.draw_top_strip();
+                    self.draw_overlay();
+                }
             }
             DaemonCommand::SetWallpaper(wallpaper) => {
                 if let Err(err) = self.renderer.set_wallpaper(wallpaper.as_ref()) {
@@ -608,7 +647,7 @@ impl LayerApp {
                     .on_custom_command(&cmd, self.renderer.context_mut());
                 if let Some(vis) = next_vis {
                     self.set_visible(vis);
-                } else {
+                } else if self.visible {
                     self.draw_pill();
                     self.draw_overlay();
                 }
@@ -893,7 +932,11 @@ impl LayerApp {
             HitTarget::ShadeToggle { id } => {
                 self.handler
                     .on_action(ShellAction::ToggleSetting(id), self.renderer.context_mut());
-                self.draw_overlay();
+                if id == "tablet_mode" && !self.renderer.context().tablet_mode {
+                    self.set_visible(false);
+                } else {
+                    self.draw_overlay();
+                }
             }
             HitTarget::ShadeSlider { id, rect } => {
                 let pct = slider_pct_for_x(x, rect);
@@ -995,7 +1038,7 @@ pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
         output_name: config.output_name.clone(),
         viewport_w: 1280,
         viewport_h: 853,
-        visible: true,
+        visible: config.initial_visible,
         active_scene: initial_scene,
         pill: None,
         top_strip: None,
@@ -1049,7 +1092,9 @@ pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
         )));
     }
 
-    app.show_scene(initial_scene, false);
+    if config.initial_visible {
+        app.show_scene(initial_scene, false);
+    }
 
     let mut event_loop: EventLoop<LayerApp> =
         EventLoop::try_new().map_err(|e| WaylandError::Runtime(e.to_string()))?;
@@ -1169,8 +1214,20 @@ impl OutputHandler for LayerApp {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
+        output: wl_output::WlOutput,
     ) {
+        if self.target_output.as_ref() == Some(&output) {
+            if let Some(info) = self.output_state.info(&output) {
+                if let Some((w, h)) = info.logical_size {
+                    if let (Ok(uw), Ok(uh)) = (u32::try_from(w), u32::try_from(h)) {
+                        if uw > 0 && uh > 0 {
+                            self.viewport_w = uw;
+                            self.viewport_h = uh;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn output_destroyed(
@@ -1208,20 +1265,37 @@ impl LayerShellHandler for LayerApp {
             SurfaceKind::TopStrip => self.top_strip.as_mut(),
             SurfaceKind::Overlay => self.overlay.as_mut(),
         };
+        let mut new_w = None;
+        let mut new_h = None;
         if let Some(target) = surf {
             if configure.new_size.0 > 0 {
                 target.width = configure.new_size.0;
+                new_w = Some(target.width);
             }
             if configure.new_size.1 > 0 {
                 target.height = configure.new_size.1;
+                new_h = Some(target.height);
             }
             target.configured = true;
         }
 
         match kind {
-            SurfaceKind::Pill => self.draw_pill(),
+            SurfaceKind::Pill => {
+                if let Some(w) = new_w {
+                    self.viewport_w = w;
+                }
+                self.draw_pill();
+            }
             SurfaceKind::TopStrip => self.draw_top_strip(),
-            SurfaceKind::Overlay => self.draw_overlay(),
+            SurfaceKind::Overlay => {
+                if let Some(w) = new_w {
+                    self.viewport_w = w;
+                }
+                if let Some(h) = new_h {
+                    self.viewport_h = h;
+                }
+                self.draw_overlay();
+            }
         }
     }
 }

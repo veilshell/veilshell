@@ -142,6 +142,30 @@ impl<C: CompositorBackend, H: HardwareBackend> ShellState<C, H> {
         );
         let _ = writeln!(
             out,
+            "  battery    : {}%{}",
+            snap.battery_pct,
+            if snap.charging { " (charging)" } else { "" }
+        );
+        let _ = writeln!(
+            out,
+            "  radios     : wifi={} bt={} lte={}",
+            snap.wifi_ssid
+                .as_deref()
+                .unwrap_or(if snap.wifi_connected { "on" } else { "off" }),
+            if snap.bluetooth_enabled { "on" } else { "off" },
+            snap.lte_signal_pct
+                .map_or_else(|| "off".to_owned(), |pct| format!("{pct}%")),
+        );
+        let _ = writeln!(
+            out,
+            "  controls   : brightness={}% volume={}%{} night_light={}",
+            snap.brightness_pct,
+            snap.volume_pct,
+            if snap.muted { " (muted)" } else { "" },
+            if snap.night_light { "on" } else { "off" },
+        );
+        let _ = writeln!(
+            out,
             "  theme      : {} (bg {}, fg {}, accent {}, WCAG AA: {})",
             self.palette.name,
             format_hex(self.palette.background),

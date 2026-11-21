@@ -63,7 +63,7 @@ print(added[-1] if added else "")
     sleep 0.4
 
     echo "[3/5] Starting persistent daemon pinned to $HEADLESS_NAME..."
-    "$VEILSHELL_BIN" --output "$HEADLESS_NAME" --socket "$TMP_SOCK" --scene pill >"$OUT_DIR/veilshell.log" 2>&1 &
+    "$VEILSHELL_BIN" --output "$HEADLESS_NAME" --socket "$TMP_SOCK" --policy tablet --no-watchers --scene pill >"$OUT_DIR/veilshell.log" 2>&1 &
     DAEMON_PID=$!
 
     for _ in $(seq 1 40); do
@@ -87,35 +87,44 @@ print(added[-1] if added else "")
     "$VEILCTL_BIN" status
 
     echo "[4/5] Driving live surface transitions via veilctl & capturing grim screenshots..."
+    PREV_PNG=""
     for scene in home shade recents pill; do
         "$VEILCTL_BIN" show "$scene"
         bytes=0
+        out_png="$OUT_DIR/hyprland-$scene.png"
         if [[ "$scene" == "pill" ]]; then
             # Two captures spaced apart ensure lazy headless screencopy flushes the dismissed overlay
             sleep 0.25
-            grim -o "$HEADLESS_NAME" "$OUT_DIR/hyprland-$scene.png"
+            grim -o "$HEADLESS_NAME" "$out_png"
             sleep 0.25
-            grim -o "$HEADLESS_NAME" "$OUT_DIR/hyprland-$scene.png"
-            bytes="$(stat -c%s "$OUT_DIR/hyprland-$scene.png")"
+            grim -o "$HEADLESS_NAME" "$out_png"
+            bytes="$(stat -c%s "$out_png")"
             min_bytes=1500
         else
             min_bytes=25000
-            for _ in $(seq 1 5); do
-                sleep 0.25
-                grim -o "$HEADLESS_NAME" "$OUT_DIR/hyprland-$scene.png"
-                bytes="$(stat -c%s "$OUT_DIR/hyprland-$scene.png")"
-                if (( bytes >= min_bytes )); then
+            stale=1
+            for _ in $(seq 1 6); do
+                sleep 0.3
+                grim -o "$HEADLESS_NAME" "$out_png"
+                bytes="$(stat -c%s "$out_png")"
+                if (( bytes >= min_bytes )) && { [[ -z "$PREV_PNG" ]] || ! cmp -s "$out_png" "$PREV_PNG"; }; then
+                    stale=0
                     break
                 fi
             done
+            if (( stale != 0 )); then
+                echo "ERROR: Screenshot $out_png stayed identical to previous capture $PREV_PNG!" >&2
+                exit 1
+            fi
         fi
-        echo "  -> Captured $OUT_DIR/hyprland-$scene.png ($bytes bytes)"
+        echo "  -> Captured $out_png ($bytes bytes)"
         if (( bytes < min_bytes )); then
-            echo "ERROR: Screenshot $OUT_DIR/hyprland-$scene.png ($bytes bytes < $min_bytes) looks blank!" >&2
+            echo "ERROR: Screenshot $out_png ($bytes bytes < $min_bytes) looks blank!" >&2
             hyprctl -j layers >&2 || true
             cat "$OUT_DIR/veilshell.log" >&2 || true
             exit 1
         fi
+        PREV_PNG="$out_png"
     done
 
     "$VEILCTL_BIN" mode laptop

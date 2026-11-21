@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Optional Omarchy Aether theme-set.d hook for live VeilShell palette updates.
+# Install to: ~/.config/omarchy/hooks/theme-set.d/30-veilshell-theme
+
+SOCK="${VEILSHELL_SOCKET:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/veilshell.sock}"
+if [[ ! -S "$SOCK" ]]; then
+    exit 0
+fi
+
+if command -v veilctl >/dev/null 2>&1; then
+    veilctl reload-theme >/dev/null 2>&1 || true
+elif [[ -x "$HOME/.cargo/bin/veilctl" ]]; then
+    "$HOME/.cargo/bin/veilctl" reload-theme >/dev/null 2>&1 || true
+fi

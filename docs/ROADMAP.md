@@ -42,12 +42,12 @@
 - [x] Live Unix control socket (`$XDG_RUNTIME_DIR/veilshell.sock`) powering `veilctl show`, `veilctl mode`, `veilctl status`, `veilctl reload-theme`, and `veilctl quit`
 - [x] Cached-backdrop fast SDF rasterizer & verified non-blank Tier 3 live Hyprland screenshots (`home`, `shade`, `recents`, `pill`)
 
-#### Sprint 2B — Live Hardware Intelligence & Omarchy Theme Auto-Reload (Next)
-- [ ] `veilshell-hw` live Linux backends (`zbus` D-Bus & sysfs/udev): detachable USB keyboard / `SW_TABLET_MODE` auto-switching (matching `hardware-profiles/*.toml`), `iio-sensor-proxy` auto-rotation + Rotation Lock
-- [ ] Live Quick Settings hardware actions: NetworkManager (Wi-Fi), BlueZ, ModemManager (LTE), UPower (battery/charging), PipeWire volume, Night Light, and sysfs backlight sliders
-- [ ] Live Aether `colors.toml` file watcher (`inotify`) + Omarchy `adapters/omarchy/hooks/30-veilshell-theme` reload hook + optional `systemd --user` unit
+#### Sprint 2B — Live Hardware Intelligence, Quick Settings Controls & Theme Auto-Reload (Complete)
+- [x] `veilshell-hw` zero-dep Linux `sysfs`/CLI backend (`LinuxHardware`, `SensorGuard`): detachable USB Type Cover auto-switching via DMI-matched `hardware-profiles/*.toml` (`detect_dmi_device`, `load_matching_profile`), `iio-sensor-proxy` auto-rotation via `monitor-sensor --accel` + Rotation Lock + `wl_output`/configure resize handling
+- [x] Live Quick Settings hardware telemetry & controls (`HardwareController`): `nmcli` Wi-Fi & WWAN/LTE, `bluetoothctl`/`rfkill` Bluetooth, `sysfs` battery (filtering peripheral `scope=Device` stylus batteries) & backlight slider (clamped >= 5%), `wpctl` PipeWire volume, Night Light (`/usr/share/omarchy/bin/omarchy-toggle-nightlight` with `hyprctl hyprsunset` fallback), and `veilctl hw` inspection
+- [x] Adaptive Laptop/Tablet startup (`veilshell --policy <auto|laptop|tablet>`, `initial_visible: false` in Laptop Mode), live Aether `colors.toml` mtime watcher, Omarchy `adapters/omarchy/hooks/30-veilshell-theme` reload hook, and optional `adapters/omarchy/systemd/veilshell.service` user unit
 
-### Phase 3 — GPU (`wgpu`) Acceleration & Built-In Touch OSK
+### Phase 3 — GPU (`wgpu`) Acceleration & Built-In Touch OSK (In Progress)
 - [x] `wgpu` Vulkan/GLES WGSL SDF renderer backend consuming the existing `DrawList` + pre-blurred static wallpaper glass cache (blur once on wallpaper change) + zero-copy `wgpu::Surface` Wayland presentation & automatic `SdfSoftwareRenderer` fallback
 - [ ] TrueType/FreeType font atlas (`swash` / `cosmic-text`) and app icon theme loader replacing the bitmap HUD font & initials badges
 - [ ] `zwp_input_method_v2` + `zwp_virtual_keyboard_v1` protocol integration in `veilshell-wayland` powering the multi-layout Touch OSK surface

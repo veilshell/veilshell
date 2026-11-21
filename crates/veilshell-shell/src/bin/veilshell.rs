@@ -4,22 +4,31 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, SystemTime};
 
 use veilshell_compositor::{
     CompositorBackend, CompositorError, HyprlandBackend, MockBackend, OutputInfo, WindowId,
     WindowInfo,
 };
-use veilshell_core::{ModeEvent, ModePolicy, ModeStateMachine, Orientation, ShellMode};
-use veilshell_hw::MockHardware;
+use veilshell_core::{
+    ModeEvent, ModePolicy, ModeStateMachine, Orientation, RotationLock, ShellMode,
+};
+use veilshell_hw::linux::{read_sysfs_backlight, read_sysfs_battery};
+use veilshell_hw::{HardwareBackend, HardwareController, LinuxHardware, SensorGuard};
 use veilshell_render::{
     ActiveRenderer, RecentsCard, RendererPreference, SceneContext, SceneKind, WallpaperImage,
 };
 use veilshell_shell::apps::{apps_to_tiles, current_clock_hhmm, discover_desktop_apps};
 use veilshell_shell::ipc::{default_socket_path, spawn_ipc_listener};
 use veilshell_shell::ShellState;
-use veilshell_theme::load_best_available;
-use veilshell_wayland::channel;
-use veilshell_wayland::{run_shell_daemon, ShellAction, ShellActionHandler, WaylandRuntimeConfig};
+use veilshell_theme::{load_best_available, OmarchyAetherProvider};
+use veilshell_wayland::channel::{self, Sender};
+use veilshell_wayland::{
+    run_shell_daemon, DaemonCommand, ShellAction, ShellActionHandler, WaylandRuntimeConfig,
+};
 
 enum ActiveCompositor {
     Hyprland(HyprlandBackend),
@@ -97,12 +106,70 @@ impl CompositorBackend for ActiveCompositor {
 
 struct LiveActionHandler {
     compositor: ActiveCompositor,
+    hw: LinuxHardware,
     mode_sm: ModeStateMachine,
+    rotation: RotationLock,
+    target_output: Option<String>,
+    auto_rotate: bool,
 }
 
 impl LiveActionHandler {
+    fn sync_hardware_snapshot(&self, ctx: &mut SceneContext) {
+        let snap = self.hw.snapshot();
+        ctx.battery_pct = snap.battery_pct;
+        ctx.wifi_connected = snap.wifi_connected;
+        ctx.bluetooth_enabled = snap.bluetooth_enabled;
+        ctx.lte_connected = snap.lte_signal_pct.is_some();
+        ctx.night_light = snap.night_light;
+        ctx.brightness_pct = snap.brightness_pct;
+        ctx.volume_pct = snap.volume_pct;
+        ctx.rotation_locked = self.rotation.is_locked();
+        ctx.tablet_mode = self.mode_sm.effective_mode() == ShellMode::Tablet;
+    }
+
+    fn sync_fast_sysfs(&self, ctx: &mut SceneContext) {
+        ctx.clock_text = current_clock_hhmm();
+        if let Some((pct, _)) = read_sysfs_battery() {
+            ctx.battery_pct = pct;
+        }
+        if let Some(bl) = read_sysfs_backlight() {
+            ctx.brightness_pct = bl;
+        }
+        ctx.rotation_locked = self.rotation.is_locked();
+        ctx.tablet_mode = self.mode_sm.effective_mode() == ShellMode::Tablet;
+    }
+
+    fn resolve_rotation_output(&self) -> Option<String> {
+        if let Some(name) = &self.target_output {
+            return Some(name.clone());
+        }
+        let outputs = self.compositor.list_outputs().ok()?;
+        if let Some(profile) = self.hw.profile() {
+            if let Some(found) = outputs
+                .iter()
+                .find(|o| o.name.starts_with(&profile.connector_prefix))
+            {
+                return Some(found.name.clone());
+            }
+        }
+        outputs.into_iter().next().map(|o| o.name)
+    }
+
+    fn apply_effective_orientation(&mut self, next: Orientation) {
+        if let Some(output) = self.resolve_rotation_output() {
+            if let Err(err) = self.compositor.set_output_orientation(&output, next) {
+                eprintln!("veilshell: set_output_orientation({output}) failed: {err}");
+            }
+        }
+    }
+
     fn refresh_context(&self, scene: SceneKind, ctx: &mut SceneContext) {
         ctx.clock_text = current_clock_hhmm();
+        if scene == SceneKind::Shade {
+            self.sync_hardware_snapshot(ctx);
+        } else {
+            self.sync_fast_sysfs(ctx);
+        }
         if scene == SceneKind::Recents {
             if let Ok(windows) = self.compositor.list_windows() {
                 ctx.recents_cards = windows
@@ -152,11 +219,48 @@ impl ShellActionHandler for LiveActionHandler {
                 }
             }
             ShellAction::ToggleSetting(id) => match id {
-                "wifi" => ctx.wifi_connected = !ctx.wifi_connected,
-                "bluetooth" => ctx.bluetooth_enabled = !ctx.bluetooth_enabled,
-                "lte" => ctx.lte_connected = !ctx.lte_connected,
-                "autorotate" => ctx.rotation_locked = !ctx.rotation_locked,
-                "night_light" => ctx.night_light = !ctx.night_light,
+                "wifi" => {
+                    let target = !ctx.wifi_connected;
+                    match self.hw.set_wifi(target) {
+                        Ok(()) => ctx.wifi_connected = target,
+                        Err(err) => eprintln!("veilshell: wifi toggle failed: {err}"),
+                    }
+                }
+                "bluetooth" => {
+                    let target = !ctx.bluetooth_enabled;
+                    match self.hw.set_bluetooth(target) {
+                        Ok(()) => ctx.bluetooth_enabled = target,
+                        Err(err) => eprintln!("veilshell: bluetooth toggle failed: {err}"),
+                    }
+                }
+                "lte" => {
+                    let target = !ctx.lte_connected;
+                    match self.hw.set_wwan(target) {
+                        Ok(()) => ctx.lte_connected = target,
+                        Err(err) => eprintln!("veilshell: wwan toggle failed: {err}"),
+                    }
+                }
+                "autorotate" => {
+                    let prev = self.rotation.effective();
+                    let next_locked = !self.rotation.is_locked();
+                    self.rotation.set_locked(next_locked);
+                    ctx.rotation_locked = self.rotation.is_locked();
+                    let next = self.rotation.effective();
+                    if self.auto_rotate
+                        && !next_locked
+                        && next != prev
+                        && self.mode_sm.effective_mode() == ShellMode::Tablet
+                    {
+                        self.apply_effective_orientation(next);
+                    }
+                }
+                "night_light" => {
+                    let target = !ctx.night_light;
+                    match self.hw.set_night_light(target) {
+                        Ok(()) => ctx.night_light = target,
+                        Err(err) => eprintln!("veilshell: night_light toggle failed: {err}"),
+                    }
+                }
                 "tablet_mode" => {
                     if let Some(next_mode) = self.mode_sm.handle(ModeEvent::ToggleManual) {
                         let _ = self.compositor.apply_shell_mode(next_mode);
@@ -166,8 +270,24 @@ impl ShellActionHandler for LiveActionHandler {
                 _ => {}
             },
             ShellAction::SetSlider { id, pct } => match id {
-                "brightness" => ctx.brightness_pct = pct.min(100),
-                "volume" => ctx.volume_pct = pct.min(100),
+                "brightness" => {
+                    let clamped = pct.clamp(5, 100);
+                    if clamped != ctx.brightness_pct {
+                        match self.hw.set_brightness(clamped) {
+                            Ok(()) => ctx.brightness_pct = clamped,
+                            Err(err) => eprintln!("veilshell: set_brightness failed: {err}"),
+                        }
+                    }
+                }
+                "volume" => {
+                    let clamped = pct.min(100);
+                    if clamped != ctx.volume_pct {
+                        match self.hw.set_volume(clamped) {
+                            Ok(()) => ctx.volume_pct = clamped,
+                            Err(err) => eprintln!("veilshell: set_volume failed: {err}"),
+                        }
+                    }
+                }
                 _ => {}
             },
             ShellAction::HomePageChanged(page) => {
@@ -176,13 +296,51 @@ impl ShellActionHandler for LiveActionHandler {
         }
     }
 
+    fn on_hardware_update(
+        &mut self,
+        keyboard_attached: Option<bool>,
+        orientation: Option<Orientation>,
+        ctx: &mut SceneContext,
+    ) -> Option<bool> {
+        let mut vis_override = None;
+        if let Some(attached) = keyboard_attached {
+            if let Some(next_mode) = self.mode_sm.handle(ModeEvent::KeyboardAttached(attached)) {
+                if let Err(err) = self.compositor.apply_shell_mode(next_mode) {
+                    eprintln!("veilshell: apply_shell_mode failed: {err}");
+                }
+                let tablet = next_mode == ShellMode::Tablet;
+                ctx.tablet_mode = tablet;
+                vis_override = Some(tablet);
+            }
+        }
+
+        if let Some(ori) = orientation {
+            let prev = self.rotation.effective();
+            self.rotation.observe(Some(ori));
+            let next = self.rotation.effective();
+            if self.auto_rotate
+                && next != prev
+                && self.mode_sm.effective_mode() == ShellMode::Tablet
+            {
+                self.apply_effective_orientation(next);
+            }
+        }
+
+        self.sync_fast_sysfs(ctx);
+        vis_override
+    }
+
     fn on_custom_command(&mut self, cmd: &str, ctx: &mut SceneContext) -> (String, Option<bool>) {
         let mut parts = cmd.split_whitespace();
         if parts.next() != Some("mode") {
             return (format!("err unknown command '{cmd}'"), None);
         }
         let event = match parts.next() {
-            Some("auto") => ModeEvent::SetPolicy(ModePolicy::Auto),
+            Some("auto") => {
+                let kbd = self.hw.detect_keyboard_attached();
+                let _ = self.mode_sm.handle(ModeEvent::KeyboardAttached(kbd));
+                ModeEvent::SetPolicy(ModePolicy::Auto)
+            }
             Some("laptop") => ModeEvent::SetPolicy(ModePolicy::ForceLaptop),
             Some("tablet") => ModeEvent::SetPolicy(ModePolicy::ForceTablet),
             Some("toggle") => ModeEvent::ToggleManual,
@@ -209,68 +367,202 @@ impl ShellActionHandler for LiveActionHandler {
     }
 }
 
+fn spawn_hardware_watchers(
+    cmd_tx: &Sender<DaemonCommand>,
+    stop: Arc<AtomicBool>,
+    hw: LinuxHardware,
+) -> (Option<SensorGuard>, Option<thread::JoinHandle<()>>) {
+    let sensor_tx = cmd_tx.clone();
+    let sensor_guard = SensorGuard::spawn(move |ori| {
+        let _ = sensor_tx.send(DaemonCommand::HardwareUpdate {
+            keyboard_attached: None,
+            orientation: Some(ori),
+        });
+    });
+
+    let poll_tx = cmd_tx.clone();
+    let handle = thread::Builder::new()
+        .name("veilshell-watchers".into())
+        .spawn(move || {
+            let mut last_kbd = hw.detect_keyboard_attached();
+            let theme_path = OmarchyAetherProvider::default_path();
+            let mut last_theme_mtime = read_mtime(theme_path.as_ref());
+            let mut last_bat = read_sysfs_battery().map(|(pct, _)| pct);
+
+            let mut ticks = 0_u8;
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(250));
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                ticks = ticks.wrapping_add(1);
+                // Check every ~1.5s while waking every 250ms for instant clean shutdown.
+                if ticks % 6 != 0 {
+                    continue;
+                }
+
+                let cur_kbd = hw.detect_keyboard_attached();
+                let cur_bat = read_sysfs_battery().map(|(pct, _)| pct);
+                if cur_kbd != last_kbd {
+                    last_kbd = cur_kbd;
+                    let _ = poll_tx.send(DaemonCommand::HardwareUpdate {
+                        keyboard_attached: Some(cur_kbd),
+                        orientation: None,
+                    });
+                } else if cur_bat != last_bat {
+                    last_bat = cur_bat;
+                    let _ = poll_tx.send(DaemonCommand::HardwareUpdate {
+                        keyboard_attached: None,
+                        orientation: None,
+                    });
+                }
+
+                let cur_mtime = read_mtime(theme_path.as_ref());
+                if cur_mtime.is_some() && cur_mtime != last_theme_mtime {
+                    last_theme_mtime = cur_mtime;
+                    let palette = load_best_available();
+                    let _ = poll_tx.send(DaemonCommand::UpdatePalette(palette));
+                }
+            }
+        })
+        .ok();
+
+    (sensor_guard, handle)
+}
+
+fn read_mtime(path: Option<&PathBuf>) -> Option<SystemTime> {
+    fs::metadata(path?).ok()?.modified().ok()
+}
+
+fn parse_policy_flag(raw: &str) -> Option<ModePolicy> {
+    match raw.to_ascii_lowercase().as_str() {
+        "auto" => Some(ModePolicy::Auto),
+        "laptop" => Some(ModePolicy::ForceLaptop),
+        "tablet" => Some(ModePolicy::ForceTablet),
+        _ => None,
+    }
+}
+
+struct CliOptions {
+    dry_run: bool,
+    no_watchers: bool,
+    scene: SceneKind,
+    policy: ModePolicy,
+    renderer: RendererPreference,
+    wallpaper: Option<WallpaperImage>,
+    output_name: Option<String>,
+    socket_path: PathBuf,
+    exit_after_ms: Option<u64>,
+}
+
+enum CliOutcome {
+    Run(CliOptions),
+    Exit(ExitCode),
+}
+
 #[allow(clippy::too_many_lines)]
-fn main() -> ExitCode {
-    let args: Vec<String> = env::args().skip(1).collect();
+fn parse_cli(args: &[String]) -> CliOutcome {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         print_help();
-        return ExitCode::SUCCESS;
+        return CliOutcome::Exit(ExitCode::SUCCESS);
     }
     if args.iter().any(|a| a == "-V" || a == "--version") {
         println!("veilshell {}", env!("CARGO_PKG_VERSION"));
-        return ExitCode::SUCCESS;
+        return CliOutcome::Exit(ExitCode::SUCCESS);
     }
 
     let dry_run = args.iter().any(|a| a == "--dry-run");
-    let scene = match parse_flag(&args, "--scene") {
+    let no_watchers = args.iter().any(|a| a == "--no-watchers");
+    let scene = match parse_flag(args, "--scene") {
         Some(raw) => {
             let Some(parsed) = SceneKind::parse_name(&raw) else {
                 eprintln!("invalid --scene '{raw}' (expected: pill, home, recents, shade, osk)");
-                return ExitCode::FAILURE;
+                return CliOutcome::Exit(ExitCode::FAILURE);
             };
             parsed
         }
         None => SceneKind::Pill,
     };
 
-    let output_name = parse_flag(&args, "--output");
-    let socket_path = parse_flag(&args, "--socket").map_or_else(default_socket_path, PathBuf::from);
-    let renderer_pref = match parse_flag(&args, "--renderer") {
+    let policy = match parse_flag(args, "--policy") {
+        Some(raw) => {
+            let Some(parsed) = parse_policy_flag(&raw) else {
+                eprintln!("invalid --policy '{raw}' (expected: auto, laptop, tablet)");
+                return CliOutcome::Exit(ExitCode::FAILURE);
+            };
+            parsed
+        }
+        None if scene != SceneKind::Pill => ModePolicy::ForceTablet,
+        None => ModePolicy::Auto,
+    };
+
+    let renderer = match parse_flag(args, "--renderer") {
         Some(raw) => {
             let Some(parsed) = RendererPreference::parse_name(&raw) else {
                 eprintln!("invalid --renderer '{raw}' (expected: auto, wgpu, software)");
-                return ExitCode::FAILURE;
+                return CliOutcome::Exit(ExitCode::FAILURE);
             };
             parsed
         }
         None => RendererPreference::Auto,
     };
-    let wallpaper = match parse_flag(&args, "--wallpaper") {
+    let wallpaper = match parse_flag(args, "--wallpaper") {
         Some(path) => match WallpaperImage::load_png(&path) {
             Ok(img) => Some(img),
             Err(err) => {
                 eprintln!("failed to load --wallpaper '{path}': {err}");
-                return ExitCode::FAILURE;
+                return CliOutcome::Exit(ExitCode::FAILURE);
             }
         },
         None => None,
     };
 
-    let exit_after_ms = match parse_flag(&args, "--exit-after-ms") {
+    let output_name = parse_flag(args, "--output");
+    let socket_path = parse_flag(args, "--socket").map_or_else(default_socket_path, PathBuf::from);
+    let exit_after_ms = match parse_flag(args, "--exit-after-ms") {
         Some(raw) => {
             let Ok(ms) = raw.parse::<u64>() else {
                 eprintln!("invalid --exit-after-ms '{raw}'");
-                return ExitCode::FAILURE;
+                return CliOutcome::Exit(ExitCode::FAILURE);
             };
             Some(ms)
         }
         None => None,
     };
 
+    CliOutcome::Run(CliOptions {
+        dry_run,
+        no_watchers,
+        scene,
+        policy,
+        renderer,
+        wallpaper,
+        output_name,
+        socket_path,
+        exit_after_ms,
+    })
+}
+
+fn main() -> ExitCode {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let opts = match parse_cli(&args) {
+        CliOutcome::Run(o) => o,
+        CliOutcome::Exit(code) => return code,
+    };
+
     let palette = load_best_available();
     let discovered = discover_desktop_apps();
+    let hw = LinuxHardware::auto_detect();
+    let preferred_scale = hw.profile().map_or(1.0, |p| p.preferred_scale);
+    let auto_rotate = hw.profile().is_none_or(|p| p.auto_rotate_in_tablet_mode);
+    let profile_id = hw.profile().map(|p| p.id.clone());
+    let mode_sm = ModeStateMachine::new(opts.policy, hw.detect_keyboard_attached());
+    let initial_visible =
+        mode_sm.effective_mode() == ShellMode::Tablet || opts.scene != SceneKind::Pill;
+
     let mut scene_ctx = SceneContext {
         clock_text: current_clock_hhmm(),
+        tablet_mode: initial_visible,
         ..SceneContext::default()
     };
     if !discovered.is_empty() {
@@ -284,46 +576,70 @@ fn main() -> ExitCode {
 
     let handler = LiveActionHandler {
         compositor,
-        mode_sm: ModeStateMachine::new(ModePolicy::ForceTablet, false),
+        hw: hw.clone(),
+        mode_sm,
+        rotation: RotationLock::default(),
+        target_output: opts.output_name.clone(),
+        auto_rotate,
     };
+    handler.sync_hardware_snapshot(&mut scene_ctx);
     handler.refresh_context(SceneKind::Recents, &mut scene_ctx);
 
-    if dry_run || env::var_os("WAYLAND_DISPLAY").is_none() {
-        let state = ShellState::new(MockBackend::default(), MockHardware::default(), palette);
+    if opts.dry_run || env::var_os("WAYLAND_DISPLAY").is_none() {
+        let state = ShellState::new(MockBackend::default(), hw, palette);
         print!("{}", state.status_report());
-        println!("  scene      : {}", scene.as_str());
-        match ActiveRenderer::new(renderer_pref, scene_ctx.clone()) {
+        if let Some(id) = profile_id {
+            println!("  profile    : {id}");
+        }
+        println!("  scene      : {}", opts.scene.as_str());
+        println!("  policy     : {:?}", opts.policy);
+        println!("  visible    : {initial_visible}");
+        match ActiveRenderer::new(opts.renderer, scene_ctx.clone()) {
             Ok(active) => println!("  renderer   : {}", active.backend_label()),
             Err(err) => println!("  renderer   : unavailable ({err})"),
         }
         println!("  apps       : {}", scene_ctx.home_apps.len());
         println!("  windows    : {}", scene_ctx.recents_cards.len());
-        println!("  socket     : {}", socket_path.display());
-        if !dry_run {
+        println!("  socket     : {}", opts.socket_path.display());
+        if !opts.dry_run {
             println!("  wayland    : WAYLAND_DISPLAY not set (use inside a Wayland session)");
         }
         return ExitCode::SUCCESS;
     }
 
     let (cmd_tx, cmd_rx) = channel::channel();
-    if let Err(err) = spawn_ipc_listener(&socket_path, cmd_tx) {
+    if let Err(err) = spawn_ipc_listener(&opts.socket_path, cmd_tx.clone()) {
         eprintln!(
             "veilshell: warning — could not bind IPC socket {}: {err}",
-            socket_path.display()
+            opts.socket_path.display()
         );
     }
 
-    let config = WaylandRuntimeConfig {
-        display_override: None,
-        output_name,
-        preferred_scale: 1.0,
-        exit_after_ms,
-        renderer: renderer_pref,
-        wallpaper,
+    let stop_watchers = Arc::new(AtomicBool::new(false));
+    let (sensor_guard, watcher_handle) = if opts.no_watchers {
+        (None, None)
+    } else {
+        spawn_hardware_watchers(&cmd_tx, Arc::clone(&stop_watchers), hw)
     };
 
-    let result = run_shell_daemon(&config, scene, palette, scene_ctx, cmd_rx, handler);
-    let _ = fs::remove_file(&socket_path);
+    let config = WaylandRuntimeConfig {
+        display_override: None,
+        output_name: opts.output_name,
+        preferred_scale,
+        exit_after_ms: opts.exit_after_ms,
+        initial_visible,
+        renderer: opts.renderer,
+        wallpaper: opts.wallpaper,
+    };
+
+    let result = run_shell_daemon(&config, opts.scene, palette, scene_ctx, cmd_rx, handler);
+
+    stop_watchers.store(true, Ordering::Relaxed);
+    drop(sensor_guard);
+    if let Some(handle) = watcher_handle {
+        let _ = handle.join();
+    }
+    let _ = fs::remove_file(&opts.socket_path);
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -347,11 +663,13 @@ fn print_help() {
          USAGE:\n\
          \tveilshell [OPTIONS]\n\n\
          OPTIONS:\n\
+         \t--policy <auto|laptop|tablet>          Initial Laptop/Tablet mode policy (default: auto)\n\
          \t--scene <pill|home|recents|shade|osk>  Initial surface scene (default: pill)\n\
          \t--renderer <auto|wgpu|software>        Rendering backend (default: auto)\n\
          \t--wallpaper <PNG_PATH>                 Static PNG wallpaper for pre-blurred GPU glass\n\
          \t--output <NAME>                        Bind surfaces to a specific Wayland output\n\
          \t--socket <PATH>                        Override Unix control socket path\n\
+         \t--no-watchers                          Disable background sensor/theme polling (for tests)\n\
          \t--exit-after-ms <MS>                   Exit cleanly after MS milliseconds (for CI tests)\n\
          \t--dry-run                              Print status without opening Wayland surfaces\n\
          \t-h, --help                             Print this help message\n\

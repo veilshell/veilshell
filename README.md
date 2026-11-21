@@ -33,9 +33,9 @@ keybindings, or desktop workflow — engineered specifically for **older 5W /
 | [`veilshell-theme`](crates/veilshell-theme) | `ThemeProvider` trait + live Omarchy Aether `colors.toml` loader + WCAG AA dark fallback | Phase 0 (Done) |
 | [`veilshell-compositor`](crates/veilshell-compositor) | `CompositorBackend` trait + live Hyprland Unix-socket IPC (Lua `eval` + legacy `keyword` fallback, recency-sorted `j/clients`, `j/monitors`, workspace switch, app launch) + `MockBackend` | Sprint 2A (Done) |
 | [`veilshell-render`](crates/veilshell-render) | Renderer-agnostic glassmorphic `DrawList` + `SceneOutput` hit-testing for all 5 scenes, `wgpu` Vulkan/GLES WGSL SDF backend + blur-once GPU wallpaper glass cache, CPU SDF fallback, `ARGB8888` encoder, and `PNG` exporter | Phase 3 (`wgpu` Done) |
-| [`veilshell-wayland`](crates/veilshell-wayland) | Event-driven `calloop` + `smithay-client-toolkit` multi-surface `wlr-layer-shell` runtime (`BottomPill`, `TopStrip`, lazy `Overlay`), zero-copy `wgpu::Surface` Vulkan/GLES presentation + `wl_shm` fallback, output pinning (`--output`), `wl_touch`/`wl_pointer` gestures & hit routing | Phase 3 (`wgpu` Done) |
-| [`veilshell-hw`](crates/veilshell-hw) | `HardwareSnapshot`, `HardwareBackend` trait, and declarative `hardware-profiles/*.toml` parser (live `zbus` D-Bus backends in Sprint 2B) | Phase 0–1 (In Progress) |
-| [`veilshell-shell`](crates/veilshell-shell) | `ShellState` orchestration, `.desktop` discovery, `veilctl` Unix IPC socket, `veilshell` daemon & `veilctl` CLI | Sprint 2A (Done) |
+| [`veilshell-wayland`](crates/veilshell-wayland) | Event-driven `calloop` + `smithay-client-toolkit` multi-surface `wlr-layer-shell` runtime (`BottomPill`, `TopStrip`, reused `Overlay`), zero-copy `wgpu::Surface` Vulkan/GLES presentation + `wl_shm` fallback, output pinning (`--output`), `wl_touch`/`wl_pointer` gestures & hit routing | Phase 3 (`wgpu` Done) |
+| [`veilshell-hw`](crates/veilshell-hw) | `HardwareSnapshot`, `HardwareBackend` + `HardwareController` traits, pure zero-dep Linux `sysfs`/CLI telemetry (`LinuxHardware`, `SensorGuard`), DMI matcher, and declarative `hardware-profiles/*.toml` parser | Sprint 2B (Done) |
+| [`veilshell-shell`](crates/veilshell-shell) | `ShellState` orchestration, `.desktop` discovery, `veilctl` Unix IPC socket, live hardware/theme watcher, `veilshell` daemon & `veilctl` CLI | Sprint 2B (Done) |
 
 Distro integration glue lives under [`adapters/`](adapters/omarchy/README.md),
 and device quirk profiles live under [`hardware-profiles/`](hardware-profiles/microsoft-surface-go-3.toml).
@@ -50,16 +50,19 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 
-# Inspect active theme (Omarchy Aether colors.toml when present), compositor, & apps
+# Inspect active theme (Omarchy Aether colors.toml when present), live hardware, compositor, & apps
 cargo run -p veilshell-shell --bin veilctl -- status
+cargo run -p veilshell-shell --bin veilctl -- hw
 cargo run -p veilshell-shell --bin veilctl -- theme
 cargo run -p veilshell-shell --bin veilctl -- apps
 
 # Generate Tier 2 offscreen glassmorphic PNG snapshots (landscape + portrait)
 ./scripts/test-snapshots.sh /tmp/veilshell-snapshots
 
-# Launch the interactive multi-surface daemon (optional --output selects a monitor)
-cargo run -p veilshell-shell --bin veilshell -- --scene pill
+# Launch the adaptive daemon (--policy auto hides in Laptop Mode & wakes on keyboard detach)
+cargo run -p veilshell-shell --bin veilshell -- --policy auto
+# Or force visible tablet UI for testing (--scene pill|home|recents|shade)
+cargo run -p veilshell-shell --bin veilshell -- --policy tablet --scene pill
 
 # Control the running daemon via veilctl Unix socket IPC
 veilctl show home        # Open paged .desktop app launcher
@@ -73,6 +76,9 @@ veilctl quit             # Stop the daemon cleanly
 # Run Tier 3 live Hyprland virtual-output + grim visual verification (inside Hyprland)
 ./scripts/test-headless-hyprland.sh /tmp/veilshell-hypr-test
 ```
+
+For Omarchy users, optional instant theme-hook (`adapters/omarchy/hooks/30-veilshell-theme`)
+and `systemd --user` (`adapters/omarchy/systemd/veilshell.service`) integration guides live in [`adapters/omarchy/README.md`](adapters/omarchy/README.md).
 
 ## Documentation
 

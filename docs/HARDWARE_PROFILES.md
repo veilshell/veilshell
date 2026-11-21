@@ -1,6 +1,20 @@
 # Hardware Profiles
 
-VeilShell stays device-agnostic in its core crates and loads per-tablet defaults from declarative TOML files under `hardware-profiles/`.
+VeilShell stays device-agnostic in its core crates and loads per-tablet defaults from declarative TOML files under `hardware-profiles/` (embedded at build time and overridable at runtime).
+
+## Runtime DMI Matching & Overrides
+
+On startup (`LinuxHardware::auto_detect()`), VeilShell reads `/sys/class/dmi/id/sys_vendor` and `/sys/class/dmi/id/product_name`:
+
+1. Scans user override files first in `$HOME/.config/veilshell/hardware-profiles/*.toml` (letting users tune a tablet without recompiling).
+2. Falls back to the built-in embedded profiles (`hardware-profiles/*.toml`).
+3. Applies the matched `[display]` scale, `[mode_switch]` detachable USB keyboard `(usb_vendor_id, usb_product_id)` polling, and `[sensors].auto_rotate_in_tablet_mode` behavior automatically.
+
+You can verify which profile and live hardware telemetry matched on your machine at any time:
+
+```bash
+veilctl hw
+```
 
 ## Schema
 
@@ -36,5 +50,5 @@ swap_left_right = false
 ## Contributing a Profile
 
 1. Copy `hardware-profiles/microsoft-surface-go-3.toml` to `hardware-profiles/<vendor>-<model>.toml`.
-2. Fill in your `libinput list-devices`, `lsusb`, and output connector details.
-3. Add a unit test in `crates/veilshell-hw/src/lib.rs` (or run `cargo test -p veilshell-hw`) to validate your TOML file.
+2. Fill in your `/sys/class/dmi/id/{sys_vendor,product_name}`, `lsusb`, `libinput list-devices`, and output connector details.
+3. Register it in `HardwareProfile::built_in_profiles()` in `crates/veilshell-hw/src/lib.rs` and add a matching unit test (`cargo test -p veilshell-hw`).
