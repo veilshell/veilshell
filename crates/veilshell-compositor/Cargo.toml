@@ -10,6 +10,8 @@ homepage.workspace = true
 authors.workspace = true
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
 veilshell-core.workspace = true
 
 [lints]

@@ -1,6 +1,6 @@
 [package]
 name = "veilshell-wayland"
-description = "Wayland wlr-layer-shell surface descriptors and touch input models for VeilShell"
+description = "Wayland wlr-layer-shell surface runtime and touch input client for VeilShell"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,9 @@ homepage.workspace = true
 authors.workspace = true
 
 [dependencies]
+smithay-client-toolkit.workspace = true
 veilshell-core.workspace = true
+veilshell-render.workspace = true
 
 [lints]
 workspace = true

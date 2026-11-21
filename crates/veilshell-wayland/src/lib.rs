@@ -1,4 +1,8 @@
-//! `Wayland` `wlr-layer-shell` surface descriptors and normalized touch events.
+//! `Wayland` `wlr-layer-shell` surface descriptors, touch models, and live client runtime.
+
+pub mod client;
+
+pub use client::{run_layer_surface, WaylandError};
 
 /// Logical role of a `VeilShell` `wlr-layer-shell` surface.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -13,6 +17,32 @@ pub enum LayerRole {
     QuickSettings,
     /// Touch on-screen keyboard overlay.
     TouchOsk,
+}
+
+impl LayerRole {
+    /// Map a [`veilshell_render::SceneKind`] to its corresponding `wlr-layer-shell` [`LayerRole`].
+    #[must_use]
+    pub const fn from_scene(scene: veilshell_render::SceneKind) -> Self {
+        match scene {
+            veilshell_render::SceneKind::Pill => Self::BottomPill,
+            veilshell_render::SceneKind::Home => Self::HomeGrid,
+            veilshell_render::SceneKind::Recents => Self::RecentsDeck,
+            veilshell_render::SceneKind::Shade => Self::QuickSettings,
+            veilshell_render::SceneKind::Osk => Self::TouchOsk,
+        }
+    }
+
+    /// Map this [`LayerRole`] back to its rendered [`veilshell_render::SceneKind`].
+    #[must_use]
+    pub const fn to_scene(self) -> veilshell_render::SceneKind {
+        match self {
+            Self::BottomPill => veilshell_render::SceneKind::Pill,
+            Self::HomeGrid => veilshell_render::SceneKind::Home,
+            Self::RecentsDeck => veilshell_render::SceneKind::Recents,
+            Self::QuickSettings => veilshell_render::SceneKind::Shade,
+            Self::TouchOsk => veilshell_render::SceneKind::Osk,
+        }
+    }
 }
 
 /// Edge anchoring flags matching `zwlr_layer_surface_v1`.
@@ -120,6 +150,7 @@ pub struct TouchEvent {
 pub struct WaylandRuntimeConfig {
     pub display_override: Option<String>,
     pub preferred_scale: f32,
+    pub exit_after_ms: Option<u64>,
 }
 
 impl Default for WaylandRuntimeConfig {
@@ -127,6 +158,7 @@ impl Default for WaylandRuntimeConfig {
         Self {
             display_override: None,
             preferred_scale: 1.0,
+            exit_after_ms: None,
         }
     }
 }

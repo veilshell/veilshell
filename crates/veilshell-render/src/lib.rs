@@ -1,8 +1,17 @@
-//! Rendering scene models and snapshot traits (`wgpu` backend arrives in Phase 1).
+//! Rendering scene models, analytic SDF glassmorphic renderer, and `PNG` snapshot export.
+
+pub mod font;
+pub mod primitives;
+pub mod scene;
+pub mod software;
 
 use std::fmt;
 
-use veilshell_core::{Orientation, Rgba, ThemePalette};
+use veilshell_core::{Orientation, ThemePalette};
+
+pub use primitives::{DrawCommand, DrawList, RoundedRect, TextAlign, TextLabel};
+pub use scene::{build_scene, SceneContext};
+pub use software::SdfSoftwareRenderer;
 
 /// High-level shell scene rendered either live on `Wayland` or offscreen to a snapshot.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -77,10 +86,14 @@ pub struct RenderFrame {
 }
 
 /// Errors returned during rendering or offscreen snapshot capture.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum RenderError {
     /// Requested viewport had a zero dimension or invalid scale.
     InvalidViewport,
+    /// Underlying filesystem error while saving a snapshot.
+    Io(std::io::Error),
+    /// Image encoding error.
+    Encode(String),
 }
 
 impl fmt::Display for RenderError {
@@ -89,13 +102,28 @@ impl fmt::Display for RenderError {
             Self::InvalidViewport => {
                 write!(f, "viewport width, height, and scale must be positive")
             }
+            Self::Io(err) => write!(f, "snapshot I/O error: {err}"),
+            Self::Encode(msg) => write!(f, "snapshot encode error: {msg}"),
         }
     }
 }
 
-impl std::error::Error for RenderError {}
+impl std::error::Error for RenderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            _ => None,
+        }
+    }
+}
 
-/// Trait implemented by rendering backends (`StubRenderer` in Phase 0, `WgpuRenderer` in Phase 1).
+impl From<std::io::Error> for RenderError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+/// Trait implemented by rendering backends (`SdfSoftwareRenderer`, and `WgpuRenderer` next).
 pub trait RendererBackend {
     /// Human-readable renderer backend name.
     fn name(&self) -> &'static str;
@@ -111,86 +139,47 @@ pub trait RendererBackend {
     ) -> Result<RenderFrame, RenderError>;
 }
 
-/// Zero-dependency deterministic CPU stub renderer used for Phase 0 tests.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct StubRenderer;
-
-impl RendererBackend for StubRenderer {
-    fn name(&self) -> &'static str {
-        "stub-cpu"
-    }
-
-    fn render_snapshot(
-        &mut self,
-        spec: &SnapshotSpec,
-        palette: &ThemePalette,
-    ) -> Result<RenderFrame, RenderError> {
-        let (w, h) = spec.viewport.physical_pixels();
-        if w == 0 || h == 0 || !spec.viewport.scale.is_finite() || spec.viewport.scale <= 0.0 {
-            return Err(RenderError::InvalidViewport);
-        }
-
-        let bg = to_rgba8(palette.background);
-        let accent = to_rgba8(palette.accent);
-        let total_pixels = (w as usize) * (h as usize);
-        let mut rgba = Vec::with_capacity(total_pixels * 4);
-
-        let pill_top = h.saturating_sub(h / 16).max(1);
-        let pill_left = w / 3;
-        let pill_right = w.saturating_sub(w / 3);
-
-        for y in 0..h {
-            for x in 0..w {
-                let in_pill = y >= pill_top && x >= pill_left && x <= pill_right;
-                let px = if in_pill { accent } else { bg };
-                rgba.extend_from_slice(&px);
-            }
-        }
-
-        Ok(RenderFrame {
-            width: w,
-            height: h,
-            rgba,
-        })
-    }
-}
-
-fn to_rgba8(c: Rgba) -> [u8; 4] {
-    [
-        (c.r.clamp(0.0, 1.0) * 255.0).round() as u8,
-        (c.g.clamp(0.0, 1.0) * 255.0).round() as u8,
-        (c.b.clamp(0.0, 1.0) * 255.0).round() as u8,
-        (c.a.clamp(0.0, 1.0) * 255.0).round() as u8,
-    ]
-}
+/// Backwards-compatible alias for [`SdfSoftwareRenderer`].
+pub type StubRenderer = SdfSoftwareRenderer;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn stub_renderer_produces_expected_rgba_dimensions() {
-        let mut renderer = StubRenderer;
-        let spec = SnapshotSpec {
-            scene: SceneKind::Pill,
-            viewport: ViewportSize {
-                width: 64,
-                height: 32,
-                scale: 1.0,
-            },
-            orientation: Orientation::Normal,
-        };
-        let frame = renderer
-            .render_snapshot(&spec, &ThemePalette::default_dark())
-            .expect("frame rendered");
-        assert_eq!(frame.width, 64);
-        assert_eq!(frame.height, 32);
-        assert_eq!(frame.rgba.len(), 64 * 32 * 4);
+    fn renders_all_five_scenes_with_non_empty_pixels() {
+        let mut renderer = SdfSoftwareRenderer::default();
+        let palette = ThemePalette::default_dark();
+        for scene in [
+            SceneKind::Pill,
+            SceneKind::Home,
+            SceneKind::Recents,
+            SceneKind::Shade,
+            SceneKind::Osk,
+        ] {
+            let spec = SnapshotSpec {
+                scene,
+                viewport: ViewportSize {
+                    width: 320,
+                    height: if scene == SceneKind::Pill { 28 } else { 220 },
+                    scale: 1.0,
+                },
+                orientation: Orientation::Normal,
+            };
+            let frame = renderer
+                .render_snapshot(&spec, &palette)
+                .expect("scene renders");
+            assert_eq!(frame.rgba.len(), (frame.width * frame.height * 4) as usize);
+            assert!(
+                frame.rgba.chunks_exact(4).any(|px| px[3] > 0),
+                "scene {scene:?} produced fully transparent buffer"
+            );
+        }
     }
 
     #[test]
     fn rejects_zero_viewport() {
-        let mut renderer = StubRenderer;
+        let mut renderer = SdfSoftwareRenderer::default();
         let spec = SnapshotSpec {
             scene: SceneKind::Home,
             viewport: ViewportSize {
@@ -200,9 +189,34 @@ mod tests {
             },
             orientation: Orientation::Normal,
         };
-        assert_eq!(
+        assert!(matches!(
             renderer.render_snapshot(&spec, &ThemePalette::default_dark()),
             Err(RenderError::InvalidViewport)
-        );
+        ));
+    }
+
+    #[test]
+    fn saves_valid_png_file_and_premultiplies_argb() {
+        let mut renderer = SdfSoftwareRenderer::default();
+        let spec = SnapshotSpec {
+            scene: SceneKind::Pill,
+            viewport: ViewportSize {
+                width: 240,
+                height: 28,
+                scale: 1.0,
+            },
+            orientation: Orientation::Normal,
+        };
+        let frame = renderer
+            .render_snapshot(&spec, &ThemePalette::default_dark())
+            .expect("pill renders");
+        let argb = frame.to_argb8888_premultiplied();
+        assert_eq!(argb.len(), frame.rgba.len());
+
+        let out = std::env::temp_dir().join("veilshell_unit_test_pill.png");
+        frame.save_png(&out).expect("png saved");
+        let bytes = std::fs::read(&out).expect("png readable");
+        assert_eq!(&bytes[0..8], b"\x89PNG\r\n\x1a\n");
+        let _ = std::fs::remove_file(out);
     }
 }

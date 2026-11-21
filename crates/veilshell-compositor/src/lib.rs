@@ -1,8 +1,12 @@
-//! Compositor-agnostic traits plus reference `Hyprland` and mock backends.
+//! Compositor-agnostic traits plus live `Hyprland` Unix-socket IPC and mock backends.
 
 use std::fmt;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use serde::Deserialize;
 use veilshell_core::{Orientation, ShellMode};
 
 /// Opaque compositor window identifier.
@@ -39,6 +43,8 @@ pub enum CompositorError {
     NotFound(String),
     /// Feature is not implemented yet for this backend.
     Unsupported(&'static str),
+    /// Compositor returned an error reply or invalid JSON.
+    Protocol(String),
     /// Low-level transport error.
     Io(std::io::Error),
 }
@@ -49,6 +55,7 @@ impl fmt::Display for CompositorError {
             Self::NotConnected => write!(f, "compositor backend is not connected"),
             Self::NotFound(id) => write!(f, "compositor target not found: {id}"),
             Self::Unsupported(op) => write!(f, "operation not supported by backend: {op}"),
+            Self::Protocol(msg) => write!(f, "compositor protocol error: {msg}"),
             Self::Io(err) => write!(f, "compositor I/O error: {err}"),
         }
     }
@@ -129,7 +136,7 @@ impl Default for MockBackend {
             windows: vec![
                 WindowInfo {
                     id: WindowId("0x1".into()),
-                    title: "Terminal".into(),
+                    title: "Terminal — zsh".into(),
                     app_id: "foot".into(),
                     workspace: "1".into(),
                     focused: true,
@@ -137,9 +144,17 @@ impl Default for MockBackend {
                 },
                 WindowInfo {
                     id: WindowId("0x2".into()),
-                    title: "Browser".into(),
+                    title: "VeilShell Architecture".into(),
                     app_id: "chromium".into(),
                     workspace: "2".into(),
+                    focused: false,
+                    floating: false,
+                },
+                WindowInfo {
+                    id: WindowId("0x3".into()),
+                    title: "Notes — Surface Go 3".into(),
+                    app_id: "obsidian".into(),
+                    workspace: "3".into(),
                     focused: false,
                     floating: false,
                 },
@@ -214,10 +229,11 @@ impl CompositorBackend for MockBackend {
     }
 }
 
-/// `Hyprland` IPC backend (Phase 0 socket discovery; Phase 1 implements live IPC).
+/// Live `Hyprland` Unix-socket IPC backend.
 #[derive(Clone, Debug)]
 pub struct HyprlandBackend {
     socket_path: PathBuf,
+    timeout: Duration,
 }
 
 impl HyprlandBackend {
@@ -229,7 +245,10 @@ impl HyprlandBackend {
             .join("hypr")
             .join(signature)
             .join(".socket.sock");
-        Self { socket_path }
+        Self {
+            socket_path,
+            timeout: Duration::from_secs(2),
+        }
     }
 
     /// Discover a running `Hyprland` instance from the process environment.
@@ -254,6 +273,120 @@ impl HyprlandBackend {
     pub fn is_available(&self) -> bool {
         self.socket_path.exists()
     }
+
+    /// Send a raw IPC request to `Hyprland`'s control socket and read the full reply.
+    ///
+    /// # Errors
+    /// Returns [`CompositorError::NotConnected`] if the socket is missing, or [`CompositorError::Io`] on transport failure.
+    pub fn send_request(&self, payload: &str) -> Result<String, CompositorError> {
+        if !self.is_available() {
+            return Err(CompositorError::NotConnected);
+        }
+        let mut stream = UnixStream::connect(&self.socket_path)?;
+        stream.set_read_timeout(Some(self.timeout))?;
+        stream.set_write_timeout(Some(self.timeout))?;
+        stream.write_all(payload.as_bytes())?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        Ok(response)
+    }
+
+    fn dispatch(&self, cmd: &str) -> Result<(), CompositorError> {
+        let reply = self.send_request(&format!("dispatch {cmd}"))?;
+        if reply.trim() == "ok" {
+            Ok(())
+        } else {
+            Err(CompositorError::Protocol(reply.trim().to_owned()))
+        }
+    }
+
+    fn keyword(&self, key: &str, value: &str) -> Result<(), CompositorError> {
+        let reply = self.send_request(&format!("keyword {key} {value}"))?;
+        if reply.trim() == "ok" {
+            Ok(())
+        } else {
+            Err(CompositorError::Protocol(reply.trim().to_owned()))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct HyprWorkspaceRef {
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HyprClient {
+    address: String,
+    title: String,
+    class: String,
+    workspace: HyprWorkspaceRef,
+    floating: bool,
+    #[serde(rename = "focusHistoryID", default = "default_focus_history")]
+    focus_history_id: i32,
+}
+
+const fn default_focus_history() -> i32 {
+    -1
+}
+
+#[derive(Deserialize)]
+struct HyprMonitor {
+    name: String,
+    width: u32,
+    height: u32,
+    scale: f32,
+    #[serde(default)]
+    transform: u8,
+}
+
+/// Parse `hyprctl -j clients` JSON output into [`WindowInfo`] records.
+///
+/// # Errors
+/// Returns [`CompositorError::Protocol`] if the JSON payload is invalid.
+pub fn parse_hyprland_clients_json(raw: &str) -> Result<Vec<WindowInfo>, CompositorError> {
+    let clients: Vec<HyprClient> =
+        serde_json::from_str(raw).map_err(|e| CompositorError::Protocol(e.to_string()))?;
+    Ok(clients
+        .into_iter()
+        .map(|c| WindowInfo {
+            id: WindowId(c.address),
+            title: c.title,
+            app_id: c.class,
+            workspace: c.workspace.name,
+            focused: c.focus_history_id == 0,
+            floating: c.floating,
+        })
+        .collect())
+}
+
+/// Parse `hyprctl -j monitors` JSON output into [`OutputInfo`] records.
+///
+/// # Errors
+/// Returns [`CompositorError::Protocol`] if the JSON payload is invalid.
+pub fn parse_hyprland_monitors_json(raw: &str) -> Result<Vec<OutputInfo>, CompositorError> {
+    let monitors: Vec<HyprMonitor> =
+        serde_json::from_str(raw).map_err(|e| CompositorError::Protocol(e.to_string()))?;
+    Ok(monitors
+        .into_iter()
+        .map(|m| OutputInfo {
+            name: m.name,
+            width: m.width,
+            height: m.height,
+            scale: m.scale,
+            orientation: orientation_from_hypr_transform(m.transform),
+        })
+        .collect())
+}
+
+const fn orientation_from_hypr_transform(transform: u8) -> Orientation {
+    match transform % 4 {
+        1 => Orientation::Rotate90,
+        2 => Orientation::Rotate180,
+        3 => Orientation::Rotate270,
+        _ => Orientation::Normal,
+    }
 }
 
 impl CompositorBackend for HyprlandBackend {
@@ -262,43 +395,55 @@ impl CompositorBackend for HyprlandBackend {
     }
 
     fn list_windows(&self) -> Result<Vec<WindowInfo>, CompositorError> {
-        Err(CompositorError::Unsupported(
-            "hyprland IPC list_windows arrives in Phase 1",
-        ))
+        let raw = self.send_request("j/clients")?;
+        parse_hyprland_clients_json(&raw)
     }
 
-    fn focus_window(&mut self, _id: &WindowId) -> Result<(), CompositorError> {
-        Err(CompositorError::Unsupported(
-            "hyprland IPC focus_window arrives in Phase 1",
-        ))
+    fn focus_window(&mut self, id: &WindowId) -> Result<(), CompositorError> {
+        self.dispatch(&format!("focuswindow address:{}", id.0))
     }
 
-    fn close_window(&mut self, _id: &WindowId) -> Result<(), CompositorError> {
-        Err(CompositorError::Unsupported(
-            "hyprland IPC close_window arrives in Phase 1",
-        ))
+    fn close_window(&mut self, id: &WindowId) -> Result<(), CompositorError> {
+        self.dispatch(&format!("closewindow address:{}", id.0))
     }
 
     fn list_outputs(&self) -> Result<Vec<OutputInfo>, CompositorError> {
-        Err(CompositorError::Unsupported(
-            "hyprland IPC list_outputs arrives in Phase 1",
-        ))
+        let raw = self.send_request("j/monitors")?;
+        parse_hyprland_monitors_json(&raw)
     }
 
     fn set_output_orientation(
         &mut self,
-        _output: &str,
-        _orientation: Orientation,
+        output: &str,
+        orientation: Orientation,
     ) -> Result<(), CompositorError> {
-        Err(CompositorError::Unsupported(
-            "hyprland IPC set_output_orientation arrives in Phase 1",
-        ))
+        let outputs = self.list_outputs()?;
+        let Some(mon) = outputs.into_iter().find(|o| o.name == output) else {
+            return Err(CompositorError::NotFound(output.to_owned()));
+        };
+        let transform = orientation.hyprland_transform();
+        let rule = format!(
+            "{output},preferred,auto,{:.2},transform,{transform}",
+            mon.scale.max(0.5)
+        );
+        self.keyword("monitor", &rule)
     }
 
-    fn apply_shell_mode(&mut self, _mode: ShellMode) -> Result<(), CompositorError> {
-        Err(CompositorError::Unsupported(
-            "hyprland IPC apply_shell_mode arrives in Phase 1",
-        ))
+    fn apply_shell_mode(&mut self, mode: ShellMode) -> Result<(), CompositorError> {
+        let batch = match mode {
+            ShellMode::Tablet => {
+                "[[BATCH]]keyword general:gaps_in 6;keyword general:gaps_out 10;keyword decoration:rounding 14"
+            }
+            ShellMode::Laptop => {
+                "[[BATCH]]keyword general:gaps_in 4;keyword general:gaps_out 8;keyword decoration:rounding 8"
+            }
+        };
+        let reply = self.send_request(batch)?;
+        if reply.contains("ok") {
+            Ok(())
+        } else {
+            Err(CompositorError::Protocol(reply.trim().to_owned()))
+        }
     }
 }
 
@@ -309,7 +454,7 @@ mod tests {
     #[test]
     fn mock_backend_manages_windows_outputs_and_mode() {
         let mut backend = MockBackend::default();
-        assert_eq!(backend.list_windows().expect("windows").len(), 2);
+        assert_eq!(backend.list_windows().expect("windows").len(), 3);
 
         backend
             .focus_window(&WindowId("0x2".into()))
@@ -325,7 +470,7 @@ mod tests {
         backend
             .close_window(&WindowId("0x1".into()))
             .expect("close 0x1");
-        assert_eq!(backend.list_windows().expect("windows").len(), 1);
+        assert_eq!(backend.list_windows().expect("windows").len(), 2);
 
         backend
             .set_output_orientation("eDP-1", Orientation::Rotate90)
@@ -348,5 +493,48 @@ mod tests {
             backend.socket_path(),
             Path::new("/run/user/1000/hypr/abc123/.socket.sock")
         );
+    }
+
+    #[test]
+    fn parses_hyprland_clients_and_monitors_json() {
+        let clients_json = r#"[
+            {
+                "address": "0x55a1bc",
+                "title": "foot",
+                "class": "foot",
+                "workspace": { "id": 1, "name": "1" },
+                "floating": false,
+                "focusHistoryID": 0
+            },
+            {
+                "address": "0x55a1ff",
+                "title": "Chromium",
+                "class": "chromium",
+                "workspace": { "id": 2, "name": "2" },
+                "floating": true,
+                "focusHistoryID": 1
+            }
+        ]"#;
+        let windows = parse_hyprland_clients_json(clients_json).expect("clients parsed");
+        assert_eq!(windows.len(), 2);
+        assert!(windows[0].focused);
+        assert!(!windows[1].focused);
+        assert!(windows[1].floating);
+        assert_eq!(windows[1].app_id, "chromium");
+
+        let monitors_json = r#"[
+            {
+                "name": "HEADLESS-2",
+                "width": 1280,
+                "height": 853,
+                "scale": 1.5,
+                "transform": 1
+            }
+        ]"#;
+        let outputs = parse_hyprland_monitors_json(monitors_json).expect("monitors parsed");
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].name, "HEADLESS-2");
+        assert_eq!(outputs[0].orientation, Orientation::Rotate90);
+        assert!((outputs[0].scale - 1.5).abs() < 1e-4);
     }
 }

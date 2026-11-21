@@ -1,6 +1,6 @@
 [package]
 name = "veilshell-render"
-description = "Scene descriptors and GPU/offscreen rendering backends for VeilShell"
+description = "Glassmorphic SDF scene renderer and offscreen PNG snapshot engine for VeilShell"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,7 @@ homepage.workspace = true
 authors.workspace = true
 
 [dependencies]
+png.workspace = true
 veilshell-core.workspace = true
 
 [lints]
