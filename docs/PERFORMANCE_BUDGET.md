@@ -22,5 +22,6 @@ hardware — not just flagship laptops and smartphones.
 | Mode transition (Laptop <-> Tablet) | `< 150 ms` | Instant feedback when detaching a keyboard |
 | Cold startup time | `< 200 ms` | Snappy SDDM / session launch |
 
-Every PR touching `veilshell-render` or `veilshell-shell` should keep these
-budgets green in the Tier 3 headless Hyprland benchmark harness.
+Every PR touching `veilshell-render`, `veilshell-wayland`, or `veilshell-shell`
+should keep these budgets green and verify visual regressions via
+`./scripts/test-snapshots.sh` and `./scripts/test-headless-hyprland.sh`.
