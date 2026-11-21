@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/veilshell-core",
+    "crates/veilshell-compositor",
+    "crates/veilshell-hw",
+    "crates/veilshell-theme",
+    "crates/veilshell-wayland",
+    "crates/veilshell-render",
+    "crates/veilshell-shell",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/veilshell/veilshell"
+homepage = "https://github.com/veilshell/veilshell"
+authors = ["VeilShell Contributors"]
+keywords = ["wayland", "tablet", "touch", "shell", "hyprland"]
+categories = ["gui", "os::linux-apis"]
+
+[workspace.dependencies]
+veilshell-core = { path = "crates/veilshell-core" }
+veilshell-compositor = { path = "crates/veilshell-compositor" }
+veilshell-hw = { path = "crates/veilshell-hw" }
+veilshell-theme = { path = "crates/veilshell-theme" }
+veilshell-wayland = { path = "crates/veilshell-wayland" }
+veilshell-render = { path = "crates/veilshell-render" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = "s"

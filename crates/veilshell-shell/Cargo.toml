@@ -1,0 +1,29 @@
+[package]
+name = "veilshell-shell"
+description = "VeilShell Wayland touch/tablet shell daemon and veilctl CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "veilshell"
+path = "src/bin/veilshell.rs"
+
+[[bin]]
+name = "veilctl"
+path = "src/bin/veilctl.rs"
+
+[dependencies]
+veilshell-compositor.workspace = true
+veilshell-core.workspace = true
+veilshell-hw.workspace = true
+veilshell-render.workspace = true
+veilshell-theme.workspace = true
+veilshell-wayland.workspace = true
+
+[lints]
+workspace = true

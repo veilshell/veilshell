@@ -1,0 +1,155 @@
+//! `Wayland` `wlr-layer-shell` surface descriptors and normalized touch events.
+
+/// Logical role of a `VeilShell` `wlr-layer-shell` surface.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum LayerRole {
+    /// Thin bottom gesture indicator bar.
+    BottomPill,
+    /// Full-screen spring-animated app launcher grid.
+    HomeGrid,
+    /// Horizontal recents card switcher.
+    RecentsDeck,
+    /// Top-pull quick settings and status shade.
+    QuickSettings,
+    /// Touch on-screen keyboard overlay.
+    TouchOsk,
+}
+
+/// Edge anchoring flags matching `zwlr_layer_surface_v1`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct Anchor {
+    pub top: bool,
+    pub bottom: bool,
+    pub left: bool,
+    pub right: bool,
+}
+
+impl Anchor {
+    /// Anchor to all four edges (full-screen overlay).
+    #[must_use]
+    pub const fn all() -> Self {
+        Self {
+            top: true,
+            bottom: true,
+            left: true,
+            right: true,
+        }
+    }
+
+    /// Anchor to the bottom edge across the full width.
+    #[must_use]
+    pub const fn bottom_bar() -> Self {
+        Self {
+            top: false,
+            bottom: true,
+            left: true,
+            right: true,
+        }
+    }
+}
+
+/// Declarative geometry and interactivity spec for a layer surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LayerSurfaceSpec {
+    pub role: LayerRole,
+    pub anchor: Anchor,
+    pub width: u32,
+    pub height: u32,
+    pub exclusive_zone: i32,
+    pub keyboard_interactivity: bool,
+}
+
+impl LayerSurfaceSpec {
+    /// Compute the default surface specification for a given [`LayerRole`] and logical viewport.
+    #[must_use]
+    pub fn for_role(role: LayerRole, viewport_w: u32, viewport_h: u32) -> Self {
+        match role {
+            LayerRole::BottomPill => Self {
+                role,
+                anchor: Anchor::bottom_bar(),
+                width: viewport_w,
+                height: 28,
+                exclusive_zone: 0,
+                keyboard_interactivity: false,
+            },
+            LayerRole::TouchOsk => {
+                let height = viewport_h / 3;
+                Self {
+                    role,
+                    anchor: Anchor::bottom_bar(),
+                    width: viewport_w,
+                    height,
+                    exclusive_zone: i32::try_from(height).unwrap_or(i32::MAX),
+                    keyboard_interactivity: false,
+                }
+            }
+            LayerRole::HomeGrid | LayerRole::RecentsDeck | LayerRole::QuickSettings => Self {
+                role,
+                anchor: Anchor::all(),
+                width: viewport_w,
+                height: viewport_h,
+                exclusive_zone: -1,
+                keyboard_interactivity: true,
+            },
+        }
+    }
+}
+
+/// Lifecycle phase of a multi-touch contact point.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TouchPhase {
+    Down,
+    Move,
+    Up,
+    Cancel,
+}
+
+/// Normalized touch event delivered from `wl_touch`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TouchEvent {
+    pub id: i32,
+    pub phase: TouchPhase,
+    pub x: f32,
+    pub y: f32,
+    pub timestamp_ms: u32,
+}
+
+/// Runtime options for connecting to a `Wayland` display server.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WaylandRuntimeConfig {
+    pub display_override: Option<String>,
+    pub preferred_scale: f32,
+}
+
+impl Default for WaylandRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            display_override: None,
+            preferred_scale: 1.0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bottom_pill_is_non_exclusive_bottom_bar() {
+        let spec = LayerSurfaceSpec::for_role(LayerRole::BottomPill, 1280, 853);
+        assert_eq!(spec.anchor, Anchor::bottom_bar());
+        assert_eq!(spec.height, 28);
+        assert_eq!(spec.exclusive_zone, 0);
+        assert!(!spec.keyboard_interactivity);
+    }
+
+    #[test]
+    fn quick_settings_covers_full_viewport() {
+        let spec = LayerSurfaceSpec::for_role(LayerRole::QuickSettings, 1280, 853);
+        assert_eq!(spec.anchor, Anchor::all());
+        assert_eq!(spec.width, 1280);
+        assert_eq!(spec.height, 853);
+        assert!(spec.keyboard_interactivity);
+    }
+}

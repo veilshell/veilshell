@@ -1,0 +1,27 @@
+# Reference hardware profile: Microsoft Surface Go 3
+[device]
+id = "microsoft-surface-go-3"
+vendor = "Microsoft Corporation"
+product = "Surface Go 3"
+architecture = "x86_64"
+
+[display]
+connector_prefix = "eDP-"
+preferred_scale = 1.5
+refresh_hz = 60
+
+[touch]
+device_name = "ELAN9038:00 04F3:2A1C"
+stylus_name = "ELAN9038:00 04F3:2A1C Stylus"
+double_tap_wake_dpms = true
+
+[mode_switch]
+# Automatically enter Tablet Mode when the Type Cover detaches
+strategy = "usb_keyboard_presence"
+usb_vendor_id = "045e"
+usb_product_id = "09b5"
+
+[sensors]
+backend = "iio-sensor-proxy"
+auto_rotate_in_tablet_mode = true
+swap_left_right = false

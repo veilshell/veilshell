@@ -1,0 +1,9 @@
+/target
+Cargo.lock
+*.png
+!tests/visual_snapshots/golden/*.png
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/

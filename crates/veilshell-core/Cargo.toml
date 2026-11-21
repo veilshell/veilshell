@@ -1,0 +1,11 @@
+[package]
+name = "veilshell-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core state machine, spring physics, gesture classifier, and theme math for VeilShell"
+
+[lints]
+workspace = true
