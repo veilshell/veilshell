@@ -9,8 +9,14 @@ use std::fmt;
 
 use veilshell_core::{Orientation, ThemePalette};
 
-pub use primitives::{DrawCommand, DrawList, RoundedRect, TextAlign, TextLabel};
-pub use scene::{build_scene, SceneContext};
+pub use primitives::{
+    DrawCommand, DrawList, HitRect, HitRegion, HitTarget, RoundedRect, SceneOutput, TextAlign,
+    TextLabel,
+};
+pub use scene::{
+    build_scene, build_scene_layout, build_top_strip_scene, default_demo_apps, home_page_count,
+    AppTile, RecentsCard, SceneContext, HOME_APPS_PER_PAGE,
+};
 pub use software::SdfSoftwareRenderer;
 
 /// High-level shell scene rendered either live on `Wayland` or offscreen to a snapshot.
@@ -218,5 +224,128 @@ mod tests {
         let bytes = std::fs::read(&out).expect("png readable");
         assert_eq!(&bytes[0..8], b"\x89PNG\r\n\x1a\n");
         let _ = std::fs::remove_file(out);
+    }
+
+    #[test]
+    fn recents_hit_test_prioritizes_close_badge_over_card_focus() {
+        let ctx = SceneContext::default();
+        let out = build_scene_layout(
+            SceneKind::Recents,
+            1280.0,
+            853.0,
+            &ThemePalette::default_dark(),
+            &ctx,
+        );
+        let close_region = out
+            .hit_regions
+            .iter()
+            .find(|r| matches!(r.target, HitTarget::CloseWindow { .. }))
+            .expect("close region exists");
+        let cx = close_region.rect.x + close_region.rect.w * 0.5;
+        let cy = close_region.rect.y + close_region.rect.h * 0.5;
+        assert!(matches!(
+            out.hit_test(cx, cy),
+            Some(HitTarget::CloseWindow { ref id }) if id == "0x1"
+        ));
+
+        let card_region = out
+            .hit_regions
+            .iter()
+            .find(|r| matches!(r.target, HitTarget::FocusWindow { .. }))
+            .expect("focus region exists");
+        assert!(matches!(
+            out.hit_test(
+                card_region.rect.x + card_region.rect.w * 0.5,
+                card_region.rect.y + card_region.rect.h * 0.5,
+            ),
+            Some(HitTarget::FocusWindow { ref id }) if id == "0x1"
+        ));
+    }
+
+    #[test]
+    fn home_hit_test_resolves_app_tiles_and_pager_dots() {
+        let mut ctx = SceneContext::default();
+        let mut extra = ctx.home_apps.clone();
+        ctx.home_apps.append(&mut extra);
+        let out = build_scene_layout(
+            SceneKind::Home,
+            1280.0,
+            853.0,
+            &ThemePalette::default_dark(),
+            &ctx,
+        );
+        let tile = out
+            .hit_regions
+            .iter()
+            .find(|r| matches!(r.target, HitTarget::LaunchApp { index: 0 }))
+            .expect("first tile");
+        assert_eq!(
+            out.hit_test(
+                tile.rect.x + tile.rect.w * 0.5,
+                tile.rect.y + tile.rect.h * 0.5
+            ),
+            Some(&HitTarget::LaunchApp { index: 0 })
+        );
+
+        let page1 = out
+            .hit_regions
+            .iter()
+            .find(|r| matches!(r.target, HitTarget::HomePage { page: 1 }))
+            .expect("page 1 dot");
+        assert_eq!(
+            out.hit_test(
+                page1.rect.x + page1.rect.w * 0.5,
+                page1.rect.y + page1.rect.h * 0.5,
+            ),
+            Some(&HitTarget::HomePage { page: 1 })
+        );
+    }
+
+    #[test]
+    fn shade_hit_test_resolves_toggles_and_sliders() {
+        let ctx = SceneContext::default();
+        let out = build_scene_layout(
+            SceneKind::Shade,
+            1280.0,
+            853.0,
+            &ThemePalette::default_dark(),
+            &ctx,
+        );
+        let wifi = out
+            .hit_regions
+            .iter()
+            .find(|r| matches!(r.target, HitTarget::ShadeToggle { id: "wifi" }))
+            .expect("wifi toggle");
+        assert_eq!(
+            out.hit_test(
+                wifi.rect.x + wifi.rect.w * 0.5,
+                wifi.rect.y + wifi.rect.h * 0.5
+            ),
+            Some(&HitTarget::ShadeToggle { id: "wifi" })
+        );
+
+        let brightness = out
+            .hit_regions
+            .iter()
+            .find(|r| {
+                matches!(
+                    r.target,
+                    HitTarget::ShadeSlider {
+                        id: "brightness",
+                        ..
+                    }
+                )
+            })
+            .expect("brightness slider");
+        assert!(matches!(
+            out.hit_test(
+                brightness.rect.x + brightness.rect.w * 0.5,
+                brightness.rect.y + brightness.rect.h * 0.5,
+            ),
+            Some(HitTarget::ShadeSlider {
+                id: "brightness",
+                ..
+            })
+        ));
     }
 }

@@ -1,9 +1,86 @@
-//! Renderer-agnostic 2D glassmorphic drawing primitives (`DrawList`).
+//! Renderer-agnostic 2D glassmorphic drawing primitives (`DrawList`) and hit-testing regions.
 //!
 //! Both the analytic CPU SDF renderer and the future `wgpu` WGSL shader consume
 //! the exact same [`DrawList`] so live frames and headless snapshots match.
 
 use veilshell_core::Rgba;
+
+/// Axis-aligned logical-pixel hit-test rectangle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HitRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl HitRect {
+    /// Construct a new [`HitRect`].
+    #[must_use]
+    pub const fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
+        Self { x, y, w, h }
+    }
+
+    /// Return `true` if logical coordinate `(px, py)` falls inside this rectangle.
+    #[must_use]
+    pub fn contains(self, px: f32, py: f32) -> bool {
+        px >= self.x && px <= self.x + self.w && py >= self.y && py <= self.y + self.h
+    }
+}
+
+/// Interactive action associated with a clickable/tappable UI region.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HitTarget {
+    /// Tapping empty backdrop area closes the active full-screen overlay.
+    DismissOverlay,
+    /// Tapping an application icon launches `home_apps[index]`.
+    LaunchApp { index: usize },
+    /// Tapping a pagination dot switches the Home grid page.
+    HomePage { page: usize },
+    /// Tapping a recents card focuses the window with identifier `id`.
+    FocusWindow { id: String },
+    /// Tapping a recents close badge closes the window with identifier `id`.
+    CloseWindow { id: String },
+    /// Tapping a Quick Settings tile toggles `id` (`wifi`, `bluetooth`, etc.).
+    ShadeToggle { id: &'static str },
+    /// Tapping or dragging inside a Quick Settings slider updates `id`.
+    ShadeSlider { id: &'static str, rect: HitRect },
+    /// Tapping an OSK key emits the labeled key press.
+    OskKey { label: &'static str },
+    /// Bottom gesture pill region.
+    BottomPill,
+}
+
+/// Positioned hit-test entry emitted back-to-front during scene layout.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HitRegion {
+    pub rect: HitRect,
+    pub target: HitTarget,
+}
+
+/// Complete scene output combining draw commands with interactive hit-test regions.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SceneOutput {
+    pub draw_list: DrawList,
+    pub hit_regions: Vec<HitRegion>,
+}
+
+impl SceneOutput {
+    /// Register an interactive hit-test region (later regions take precedence).
+    pub fn push_hit(&mut self, rect: HitRect, target: HitTarget) {
+        self.hit_regions.push(HitRegion { rect, target });
+    }
+
+    /// Resolve the topmost [`HitTarget`] containing `(x, y)`.
+    #[must_use]
+    pub fn hit_test(&self, x: f32, y: f32) -> Option<&HitTarget> {
+        self.hit_regions
+            .iter()
+            .rev()
+            .find(|region| region.rect.contains(x, y))
+            .map(|region| &region.target)
+    }
+}
 
 /// Styling parameters for an antialiased rounded rectangle primitive.
 #[derive(Clone, Copy, Debug, PartialEq)]

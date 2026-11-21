@@ -1,10 +1,15 @@
-//! Live `wlr-layer-shell` `Wayland` client using `smithay-client-toolkit` and `wl_shm`.
+//! Multi-surface event-driven `wlr-layer-shell` `Wayland` runtime powered by `calloop`.
 
 use std::fmt;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
+use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, FrameCallbackData};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
+use smithay_client_toolkit::reexports::calloop::channel::{self, Channel, Event as ChannelEvent};
+use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
+use smithay_client_toolkit::reexports::calloop::{EventLoop, LoopHandle};
+use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::{
     wl_output, wl_pointer, wl_seat, wl_shm, wl_surface, wl_touch,
@@ -24,11 +29,12 @@ use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
 
 use veilshell_core::{
-    classify_bottom_pill, GestureAction, GestureSample, GestureThresholds, Orientation,
-    ThemePalette,
+    classify_bottom_pill, GestureAction, GestureSample, GestureThresholds, Orientation, Spring,
+    SpringParams, ThemePalette,
 };
 use veilshell_render::{
-    RendererBackend, SceneContext, SdfSoftwareRenderer, SnapshotSpec, ViewportSize,
+    HitTarget, RendererBackend, SceneContext, SceneKind, SceneOutput, SdfSoftwareRenderer,
+    SnapshotSpec, ViewportSize,
 };
 
 use crate::{LayerRole, LayerSurfaceSpec, WaylandRuntimeConfig};
@@ -40,7 +46,7 @@ pub enum WaylandError {
     Connect(String),
     /// Required `Wayland` protocol global (`zwlr_layer_shell_v1`, `wl_shm`, etc.) is unavailable.
     MissingGlobal(String),
-    /// Error during event dispatch or buffer allocation.
+    /// Error during event dispatch, output selection, or buffer allocation.
     Runtime(String),
 }
 
@@ -56,60 +62,188 @@ impl fmt::Display for WaylandError {
 
 impl std::error::Error for WaylandError {}
 
+/// Commands sent asynchronously into the running `Wayland` daemon event loop.
+#[derive(Debug)]
+pub enum DaemonCommand {
+    /// Switch the presented shell scene (`Pill` dismisses full-screen overlays).
+    ShowScene(SceneKind),
+    /// Show (`true`, Tablet Mode) or completely hide (`false`, Laptop Mode) all surfaces.
+    SetVisible(bool),
+    /// Replace the dynamic scene context (apps, windows, hardware state, clock).
+    UpdateContext(Box<SceneContext>),
+    /// Apply a freshly loaded color palette and redraw active surfaces.
+    UpdatePalette(ThemePalette),
+    /// Query live daemon runtime status for `veilctl status`.
+    QueryStatus(mpsc::Sender<RuntimeStatus>),
+    /// Forward a domain command (such as `mode ...`) to [`ShellActionHandler::on_custom_command`].
+    Custom {
+        cmd: String,
+        reply: mpsc::Sender<String>,
+    },
+    /// Exit the event loop cleanly.
+    Quit,
+}
+
+/// Live snapshot of the running `Wayland` shell surfaces.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeStatus {
+    pub active_scene: SceneKind,
+    pub visible: bool,
+    pub output_name: Option<String>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Interactive UI events emitted by the `Wayland` shell surfaces.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ShellAction {
+    /// Sent immediately before opening a scene so state (e.g. Hyprland windows) can refresh.
+    RequestRefresh(SceneKind),
+    /// Focus and raise a compositor window.
+    FocusWindow(String),
+    /// Request closing a compositor window.
+    CloseWindow(String),
+    /// Launch a desktop application command.
+    LaunchApp { exec: String },
+    /// Switch to the adjacent workspace (`+1` next, `-1` prev).
+    SwitchWorkspace(i32),
+    /// Toggle a Quick Settings tile (`wifi`, `bluetooth`, `lte`, `autorotate`, `tablet_mode`, `night_light`).
+    ToggleSetting(&'static str),
+    /// Update a Quick Settings slider (`brightness`, `volume`) to `0..=100`.
+    SetSlider { id: &'static str, pct: u8 },
+    /// Notify that the active Home grid page changed.
+    HomePageChanged(usize),
+}
+
+/// Callback interface handling UI interactions in `veilshell-shell`.
+pub trait ShellActionHandler {
+    /// Respond to a [`ShellAction`], optionally mutating the live [`SceneContext`].
+    fn on_action(&mut self, action: ShellAction, ctx: &mut SceneContext);
+
+    /// Handle an IPC command routed through `veilctl`; returns `(reply_line, optional_visibility)`.
+    fn on_custom_command(&mut self, _cmd: &str, _ctx: &mut SceneContext) -> (String, Option<bool>) {
+        ("unsupported".to_owned(), None)
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct NoopActionHandler;
+
+impl ShellActionHandler for NoopActionHandler {
+    fn on_action(&mut self, _action: ShellAction, _ctx: &mut SceneContext) {}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SurfaceKind {
+    Pill,
+    TopStrip,
+    Overlay,
+}
+
 struct ActiveDrag {
     touch_id: Option<i32>,
+    surface: SurfaceKind,
     start_x: f32,
     start_y: f32,
     last_x: f32,
     last_y: f32,
+    active_slider: Option<(&'static str, veilshell_render::HitRect)>,
     start_time: Instant,
 }
 
-struct LayerApp {
-    registry_state: RegistryState,
-    seat_state: SeatState,
-    output_state: OutputState,
-    shm: Shm,
-    pool: SlotPool,
+struct ManagedSurface {
     layer: LayerSurface,
-    role: LayerRole,
+    pool: SlotPool,
     width: u32,
     height: u32,
     configured: bool,
-    exit: bool,
-    palette: ThemePalette,
-    renderer: SdfSoftwareRenderer,
-    pointer: Option<wl_pointer::WlPointer>,
-    touch: Option<wl_touch::WlTouch>,
-    drag: Option<ActiveDrag>,
 }
 
-impl LayerApp {
-    fn draw(&mut self, _qh: &QueueHandle<Self>) {
+impl ManagedSurface {
+    fn create(app: &LayerApp, role: LayerRole) -> Result<Self, WaylandError> {
+        let spec = LayerSurfaceSpec::for_role(role, app.viewport_w, app.viewport_h);
+        let wl_surface = app.compositor.create_surface(&app.qh);
+        let layer = app.layer_shell.create_layer_surface(
+            &app.qh,
+            wl_surface,
+            Layer::Overlay,
+            Some("veilshell"),
+            app.target_output.as_ref(),
+        );
+
+        let mut anchor = WlrAnchor::empty();
+        if spec.anchor.top {
+            anchor |= WlrAnchor::TOP;
+        }
+        if spec.anchor.bottom {
+            anchor |= WlrAnchor::BOTTOM;
+        }
+        if spec.anchor.left {
+            anchor |= WlrAnchor::LEFT;
+        }
+        if spec.anchor.right {
+            anchor |= WlrAnchor::RIGHT;
+        }
+
+        layer.set_anchor(anchor);
+        layer.set_exclusive_zone(spec.exclusive_zone);
+        layer.set_keyboard_interactivity(if spec.keyboard_interactivity {
+            KeyboardInteractivity::OnDemand
+        } else {
+            KeyboardInteractivity::None
+        });
+
+        let req_w = if spec.anchor.left && spec.anchor.right {
+            0
+        } else {
+            spec.width
+        };
+        let req_h = if spec.anchor.top && spec.anchor.bottom {
+            0
+        } else {
+            spec.height
+        };
+        layer.set_size(req_w, req_h);
+        layer.commit();
+
+        let initial_bytes = (spec.width.max(1) as usize) * (spec.height.max(1) as usize) * 4;
+        let pool = SlotPool::new((initial_bytes * 2).max(1024 * 64), &app.shm)
+            .map_err(|e| WaylandError::Runtime(format!("shm slot pool: {e}")))?;
+
+        Ok(Self {
+            layer,
+            pool,
+            width: spec.width,
+            height: spec.height,
+            configured: false,
+        })
+    }
+
+    fn commit_frame(
+        &mut self,
+        qh: &QueueHandle<LayerApp>,
+        frame: &veilshell_render::RenderFrame,
+        request_frame_callback: bool,
+    ) {
         if !self.configured || self.width == 0 || self.height == 0 {
             return;
         }
-        let spec = SnapshotSpec {
-            scene: self.role.to_scene(),
-            viewport: ViewportSize {
-                width: self.width,
-                height: self.height,
-                scale: 1.0,
-            },
-            orientation: Orientation::Normal,
-        };
-        let Ok(frame) = self.renderer.render_snapshot(&spec, &self.palette) else {
-            return;
-        };
         let argb = frame.to_argb8888_premultiplied();
         let stride = i32::try_from(self.width * 4).unwrap_or(i32::MAX);
-        let Ok((buffer, canvas)) = self.pool.create_buffer(
+        let (buffer, canvas) = match self.pool.create_buffer(
             i32::try_from(self.width).unwrap_or(1),
             i32::try_from(self.height).unwrap_or(1),
             stride,
             wl_shm::Format::Argb8888,
-        ) else {
-            return;
+        ) {
+            Ok(pair) => pair,
+            Err(err) => {
+                eprintln!(
+                    "veilshell: shm create_buffer({}x{}) failed: {err}",
+                    self.width, self.height
+                );
+                return;
+            }
         };
 
         let copy_len = canvas.len().min(argb.len());
@@ -122,55 +256,602 @@ impl LayerApp {
             i32::try_from(self.width).unwrap_or(1),
             i32::try_from(self.height).unwrap_or(1),
         );
-        if buffer.attach_to(surface).is_ok() {
-            surface.commit();
+        if request_frame_callback {
+            surface.frame(qh, FrameCallbackData(surface.clone()));
         }
-    }
-
-    fn finish_drag(&mut self, qh: &QueueHandle<Self>) {
-        let Some(drag) = self.drag.take() else {
-            return;
-        };
-        let elapsed = drag.start_time.elapsed().as_secs_f32().max(0.016);
-        let dx = drag.last_x - drag.start_x;
-        let dy = drag.last_y - drag.start_y;
-        let sample = GestureSample {
-            dx,
-            dy,
-            vx: dx / elapsed,
-            vy: dy / elapsed,
-            viewport_height: (self.height as f32).max(600.0),
-            has_foreground: self.role == LayerRole::BottomPill,
-        };
-        let action = classify_bottom_pill(sample, GestureThresholds::default());
-        self.renderer.context.pill_drag_x = 0.0;
-        self.renderer.context.pill_drag_y = 0.0;
-        if action != GestureAction::None {
-            eprintln!("veilshell: recognized gesture {action:?}");
+        match buffer.attach_to(surface) {
+            Ok(()) => surface.commit(),
+            Err(err) => eprintln!("veilshell: buffer.attach_to failed: {err}"),
         }
-        self.draw(qh);
     }
 }
 
-/// Connect to the active `Wayland` compositor and present a `wlr-layer-shell` surface.
+struct LayerApp {
+    qh: QueueHandle<Self>,
+    registry_state: RegistryState,
+    compositor: CompositorState,
+    layer_shell: LayerShell,
+    seat_state: SeatState,
+    output_state: OutputState,
+    shm: Shm,
+    target_output: Option<wl_output::WlOutput>,
+    output_name: Option<String>,
+    viewport_w: u32,
+    viewport_h: u32,
+    visible: bool,
+    active_scene: SceneKind,
+    pill: Option<ManagedSurface>,
+    top_strip: Option<ManagedSurface>,
+    overlay: Option<ManagedSurface>,
+    overlay_layout: Option<SceneOutput>,
+    overlay_spring: Spring,
+    last_anim_tick: Instant,
+    palette: ThemePalette,
+    renderer: SdfSoftwareRenderer,
+    pointer: Option<wl_pointer::WlPointer>,
+    touch: Option<wl_touch::WlTouch>,
+    drag: Option<ActiveDrag>,
+    handler: Box<dyn ShellActionHandler>,
+    exit: bool,
+}
+
+impl LayerApp {
+    fn sync_surfaces(&mut self) {
+        if !self.visible {
+            self.overlay = None;
+            self.overlay_layout = None;
+            self.top_strip = None;
+            self.pill = None;
+            return;
+        }
+
+        if self.pill.is_none() {
+            match ManagedSurface::create(self, LayerRole::BottomPill) {
+                Ok(surf) => self.pill = Some(surf),
+                Err(err) => eprintln!("veilshell: failed to create bottom pill surface: {err}"),
+            }
+        }
+
+        if self.active_scene == SceneKind::Pill {
+            self.overlay = None;
+            self.overlay_layout = None;
+            if self.top_strip.is_none() {
+                if let Ok(surf) = ManagedSurface::create(self, LayerRole::TopStrip) {
+                    self.top_strip = Some(surf);
+                }
+            }
+        } else {
+            self.top_strip = None;
+            if self.overlay.is_none() {
+                let role = LayerRole::from_scene(self.active_scene);
+                match ManagedSurface::create(self, role) {
+                    Ok(surf) => self.overlay = Some(surf),
+                    Err(err) => eprintln!("veilshell: failed to create overlay surface: {err}"),
+                }
+            } else {
+                self.draw_overlay();
+            }
+        }
+    }
+
+    fn show_scene(&mut self, scene: SceneKind, animate: bool) {
+        if scene != SceneKind::Pill {
+            self.visible = true;
+            self.handler.on_action(
+                ShellAction::RequestRefresh(scene),
+                &mut self.renderer.context,
+            );
+        }
+
+        let changed = self.active_scene != scene;
+        self.active_scene = scene;
+        self.renderer.context.pill_drag_x = 0.0;
+        self.renderer.context.pill_drag_y = 0.0;
+        self.renderer.context.top_drag_y = 0.0;
+
+        if scene == SceneKind::Pill {
+            self.overlay_spring = Spring::new(0.0, SpringParams::snappy());
+            self.renderer.context.overlay_progress = 0.0;
+        } else if animate && changed {
+            self.overlay_spring = Spring::new(0.25, SpringParams::snappy());
+            self.overlay_spring.set_target(1.0);
+            self.last_anim_tick = Instant::now();
+            self.renderer.context.overlay_progress = 0.25;
+        } else {
+            let mut settled = Spring::new(1.0, SpringParams::snappy());
+            settled.set_target(1.0);
+            self.overlay_spring = settled;
+            self.renderer.context.overlay_progress = 1.0;
+        }
+
+        // Recreate overlay role if switching directly between e.g. Home -> Shade -> Recents
+        if changed && scene != SceneKind::Pill {
+            self.overlay = None;
+            self.overlay_layout = None;
+        }
+
+        self.sync_surfaces();
+        self.draw_pill();
+        self.draw_top_strip();
+        self.draw_overlay();
+    }
+
+    fn set_visible(&mut self, visible: bool) {
+        self.visible = visible;
+        if !visible {
+            self.active_scene = SceneKind::Pill;
+        }
+        self.sync_surfaces();
+        if visible {
+            self.draw_pill();
+            self.draw_top_strip();
+        }
+    }
+
+    fn draw_pill(&mut self) {
+        let Some(surf) = &mut self.pill else {
+            return;
+        };
+        if !surf.configured || surf.width == 0 || surf.height == 0 {
+            return;
+        }
+        let spec = SnapshotSpec {
+            scene: SceneKind::Pill,
+            viewport: ViewportSize {
+                width: surf.width,
+                height: surf.height,
+                scale: 1.0,
+            },
+            orientation: Orientation::Normal,
+        };
+        if let Ok(frame) = self.renderer.render_snapshot(&spec, &self.palette) {
+            surf.commit_frame(&self.qh, &frame, false);
+        }
+    }
+
+    fn draw_top_strip(&mut self) {
+        let Some(surf) = &mut self.top_strip else {
+            return;
+        };
+        if !surf.configured || surf.width == 0 || surf.height == 0 {
+            return;
+        }
+        if let Ok(frame) = self
+            .renderer
+            .render_top_strip(surf.width, surf.height, &self.palette)
+        {
+            surf.commit_frame(&self.qh, &frame, false);
+        }
+    }
+
+    fn draw_overlay(&mut self) {
+        let Some(surf) = &mut self.overlay else {
+            return;
+        };
+        if !surf.configured || surf.width == 0 || surf.height == 0 {
+            return;
+        }
+        self.renderer.context.overlay_progress = if self.overlay_spring.is_settled() {
+            1.0
+        } else {
+            self.overlay_spring.value.clamp(0.0, 1.0)
+        };
+        if let Ok((frame, layout)) = self.renderer.render_interactive(
+            self.active_scene,
+            surf.width,
+            surf.height,
+            &self.palette,
+        ) {
+            let animating = !self.overlay_spring.is_settled();
+            surf.commit_frame(&self.qh, &frame, animating);
+            self.overlay_layout = Some(layout);
+        }
+    }
+
+    fn surface_kind(&self, surface: &wl_surface::WlSurface) -> Option<SurfaceKind> {
+        if self
+            .pill
+            .as_ref()
+            .is_some_and(|s| s.layer.wl_surface() == surface)
+        {
+            Some(SurfaceKind::Pill)
+        } else if self
+            .top_strip
+            .as_ref()
+            .is_some_and(|s| s.layer.wl_surface() == surface)
+        {
+            Some(SurfaceKind::TopStrip)
+        } else if self
+            .overlay
+            .as_ref()
+            .is_some_and(|s| s.layer.wl_surface() == surface)
+        {
+            Some(SurfaceKind::Overlay)
+        } else {
+            None
+        }
+    }
+
+    fn handle_daemon_command(&mut self, cmd: DaemonCommand) {
+        match cmd {
+            DaemonCommand::ShowScene(scene) => self.show_scene(scene, false),
+            DaemonCommand::SetVisible(vis) => self.set_visible(vis),
+            DaemonCommand::UpdateContext(ctx) => {
+                self.renderer.context = *ctx;
+                self.draw_pill();
+                self.draw_top_strip();
+                self.draw_overlay();
+            }
+            DaemonCommand::UpdatePalette(palette) => {
+                self.palette = palette;
+                self.draw_pill();
+                self.draw_top_strip();
+                self.draw_overlay();
+            }
+            DaemonCommand::QueryStatus(reply) => {
+                let _ = reply.send(RuntimeStatus {
+                    active_scene: self.active_scene,
+                    visible: self.visible,
+                    output_name: self.output_name.clone(),
+                    width: self.viewport_w,
+                    height: self.viewport_h,
+                });
+            }
+            DaemonCommand::Custom { cmd, reply } => {
+                let (msg, next_vis) = self
+                    .handler
+                    .on_custom_command(&cmd, &mut self.renderer.context);
+                if let Some(vis) = next_vis {
+                    self.set_visible(vis);
+                } else {
+                    self.draw_pill();
+                    self.draw_overlay();
+                }
+                let _ = reply.send(msg);
+            }
+            DaemonCommand::Quit => self.exit = true,
+        }
+    }
+
+    fn begin_drag(&mut self, touch_id: Option<i32>, kind: SurfaceKind, x: f32, y: f32) {
+        let mut active_slider = None;
+        if kind == SurfaceKind::Overlay && self.active_scene == SceneKind::Shade {
+            if let Some(layout) = &self.overlay_layout {
+                if let Some(HitTarget::ShadeSlider { id, rect }) = layout.hit_test(x, y) {
+                    active_slider = Some((*id, *rect));
+                    let pct = slider_pct_for_x(x, *rect);
+                    self.handler.on_action(
+                        ShellAction::SetSlider { id, pct },
+                        &mut self.renderer.context,
+                    );
+                    self.draw_overlay();
+                }
+            }
+        }
+
+        self.drag = Some(ActiveDrag {
+            touch_id,
+            surface: kind,
+            start_x: x,
+            start_y: y,
+            last_x: x,
+            last_y: y,
+            active_slider,
+            start_time: Instant::now(),
+        });
+    }
+
+    fn update_drag(&mut self, touch_id: Option<i32>, x: f32, y: f32) {
+        let Some(drag) = &mut self.drag else {
+            return;
+        };
+        if drag.touch_id != touch_id {
+            return;
+        }
+        drag.last_x = x;
+        drag.last_y = y;
+
+        match drag.surface {
+            SurfaceKind::Pill => {
+                self.renderer.context.pill_drag_x = x - drag.start_x;
+                self.renderer.context.pill_drag_y = y - drag.start_y;
+                self.draw_pill();
+            }
+            SurfaceKind::TopStrip => {
+                self.renderer.context.top_drag_y = (y - drag.start_y).max(0.0);
+                self.draw_top_strip();
+            }
+            SurfaceKind::Overlay => {
+                if let Some((id, rect)) = drag.active_slider {
+                    let pct = slider_pct_for_x(x, rect);
+                    self.handler.on_action(
+                        ShellAction::SetSlider { id, pct },
+                        &mut self.renderer.context,
+                    );
+                    self.draw_overlay();
+                } else if drag.start_y >= (self.viewport_h as f32 - 52.0) {
+                    self.renderer.context.pill_drag_x = x - drag.start_x;
+                    self.renderer.context.pill_drag_y = y - drag.start_y;
+                    self.draw_overlay();
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn finish_drag(&mut self, touch_id: Option<i32>) {
+        let Some(drag) = self.drag.take() else {
+            return;
+        };
+        if drag.touch_id != touch_id {
+            self.drag = Some(drag);
+            return;
+        }
+
+        self.renderer.context.pill_drag_x = 0.0;
+        self.renderer.context.pill_drag_y = 0.0;
+        self.renderer.context.top_drag_y = 0.0;
+
+        let elapsed = drag.start_time.elapsed().as_secs_f32().max(0.016);
+        let dx = drag.last_x - drag.start_x;
+        let dy = drag.last_y - drag.start_y;
+        let vx = dx / elapsed;
+        let vy = dy / elapsed;
+        let dist = dx.hypot(dy);
+
+        match drag.surface {
+            SurfaceKind::Pill => {
+                let sample = GestureSample {
+                    dx,
+                    dy,
+                    vx,
+                    vy,
+                    viewport_height: (self.viewport_h as f32).max(600.0),
+                    has_foreground: self.active_scene == SceneKind::Pill,
+                };
+                match classify_bottom_pill(sample, GestureThresholds::default()) {
+                    GestureAction::Home => {
+                        let target = if self.active_scene == SceneKind::Home {
+                            SceneKind::Pill
+                        } else {
+                            SceneKind::Home
+                        };
+                        self.show_scene(target, true);
+                    }
+                    GestureAction::Recents => self.show_scene(SceneKind::Recents, true),
+                    GestureAction::SwitchNext => {
+                        self.handler
+                            .on_action(ShellAction::SwitchWorkspace(1), &mut self.renderer.context);
+                        self.draw_pill();
+                    }
+                    GestureAction::SwitchPrev => {
+                        self.handler.on_action(
+                            ShellAction::SwitchWorkspace(-1),
+                            &mut self.renderer.context,
+                        );
+                        self.draw_pill();
+                    }
+                    _ => {
+                        if dist < 16.0 {
+                            let target = if self.active_scene == SceneKind::Pill {
+                                SceneKind::Home
+                            } else {
+                                SceneKind::Pill
+                            };
+                            self.show_scene(target, true);
+                        } else {
+                            self.draw_pill();
+                        }
+                    }
+                }
+            }
+            SurfaceKind::TopStrip => {
+                if dy >= 20.0 || vy >= 250.0 || dist < 16.0 {
+                    self.show_scene(SceneKind::Shade, true);
+                } else {
+                    self.draw_top_strip();
+                }
+            }
+            SurfaceKind::Overlay => {
+                if drag.active_slider.is_some() {
+                    self.draw_overlay();
+                    return;
+                }
+
+                // Bottom pill swipe inside overlay behaves identically to the bottom pill
+                if drag.start_y >= (self.viewport_h as f32 - 52.0) && dist >= 20.0 {
+                    let sample = GestureSample {
+                        dx,
+                        dy,
+                        vx,
+                        vy,
+                        viewport_height: (self.viewport_h as f32).max(600.0),
+                        has_foreground: false,
+                    };
+                    match classify_bottom_pill(sample, GestureThresholds::default()) {
+                        GestureAction::Home | GestureAction::Recents => {
+                            let next = if dy < -70.0 && vy < -450.0 {
+                                SceneKind::Pill
+                            } else {
+                                SceneKind::Recents
+                            };
+                            self.show_scene(next, true);
+                            return;
+                        }
+                        GestureAction::SwitchNext => {
+                            self.handler.on_action(
+                                ShellAction::SwitchWorkspace(1),
+                                &mut self.renderer.context,
+                            );
+                            self.draw_overlay();
+                            return;
+                        }
+                        GestureAction::SwitchPrev => {
+                            self.handler.on_action(
+                                ShellAction::SwitchWorkspace(-1),
+                                &mut self.renderer.context,
+                            );
+                            self.draw_overlay();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Horizontal swipe on Home flips pages
+                if self.active_scene == SceneKind::Home && dx.abs() >= 72.0 && dx.abs() > dy.abs() {
+                    let total = veilshell_render::home_page_count(&self.renderer.context.home_apps);
+                    if dx < 0.0 && self.renderer.context.home_page + 1 < total {
+                        self.renderer.context.home_page += 1;
+                    } else if dx > 0.0 && self.renderer.context.home_page > 0 {
+                        self.renderer.context.home_page -= 1;
+                    }
+                    let page = self.renderer.context.home_page;
+                    self.handler.on_action(
+                        ShellAction::HomePageChanged(page),
+                        &mut self.renderer.context,
+                    );
+                    self.draw_overlay();
+                    return;
+                }
+
+                // Upward flick closes open overlay back to the active app
+                if dy <= -72.0 && vy <= -350.0 {
+                    self.show_scene(SceneKind::Pill, false);
+                    return;
+                }
+
+                // Short tap -> hit-test UI targets
+                if dist < 18.0 {
+                    self.handle_overlay_tap(drag.last_x, drag.last_y);
+                } else {
+                    self.draw_overlay();
+                }
+            }
+        }
+    }
+
+    fn handle_overlay_tap(&mut self, x: f32, y: f32) {
+        let target = self
+            .overlay_layout
+            .as_ref()
+            .and_then(|layout| layout.hit_test(x, y))
+            .cloned();
+
+        let Some(hit) = target else {
+            self.draw_overlay();
+            return;
+        };
+
+        match hit {
+            HitTarget::DismissOverlay | HitTarget::BottomPill => {
+                self.show_scene(SceneKind::Pill, false);
+            }
+            HitTarget::LaunchApp { index } => {
+                let apps = if self.renderer.context.home_apps.is_empty() {
+                    veilshell_render::default_demo_apps()
+                } else {
+                    self.renderer.context.home_apps.clone()
+                };
+                if let Some(app) = apps.get(index) {
+                    let exec = app.exec.clone();
+                    self.handler
+                        .on_action(ShellAction::LaunchApp { exec }, &mut self.renderer.context);
+                    self.show_scene(SceneKind::Pill, false);
+                }
+            }
+            HitTarget::HomePage { page } => {
+                self.renderer.context.home_page = page;
+                self.handler.on_action(
+                    ShellAction::HomePageChanged(page),
+                    &mut self.renderer.context,
+                );
+                self.draw_overlay();
+            }
+            HitTarget::FocusWindow { id } => {
+                self.handler
+                    .on_action(ShellAction::FocusWindow(id), &mut self.renderer.context);
+                self.show_scene(SceneKind::Pill, false);
+            }
+            HitTarget::CloseWindow { id } => {
+                self.handler
+                    .on_action(ShellAction::CloseWindow(id), &mut self.renderer.context);
+                self.handler.on_action(
+                    ShellAction::RequestRefresh(SceneKind::Recents),
+                    &mut self.renderer.context,
+                );
+                self.draw_overlay();
+            }
+            HitTarget::ShadeToggle { id } => {
+                self.handler
+                    .on_action(ShellAction::ToggleSetting(id), &mut self.renderer.context);
+                self.draw_overlay();
+            }
+            HitTarget::ShadeSlider { id, rect } => {
+                let pct = slider_pct_for_x(x, rect);
+                self.handler.on_action(
+                    ShellAction::SetSlider { id, pct },
+                    &mut self.renderer.context,
+                );
+                self.draw_overlay();
+            }
+            HitTarget::OskKey { label } => {
+                eprintln!("veilshell: osk key {label} (Phase 3 input-method-v2)");
+            }
+        }
+    }
+}
+
+fn slider_pct_for_x(x: f32, rect: veilshell_render::HitRect) -> u8 {
+    if rect.w <= 1.0 {
+        return 50;
+    }
+    let ratio = ((x - rect.x) / rect.w).clamp(0.0, 1.0);
+    (ratio * 100.0).round() as u8
+}
+
+/// Start the single-surface compatibility wrapper around [`run_shell_daemon`].
 ///
 /// # Errors
-/// Returns [`WaylandError`] if the `Wayland` socket or `zwlr_layer_shell_v1` global is unavailable.
-#[allow(clippy::too_many_lines)]
+/// Returns [`WaylandError`] if the `Wayland` connection or globals fail.
 pub fn run_layer_surface(
     config: &WaylandRuntimeConfig,
     role: LayerRole,
     palette: ThemePalette,
     scene_ctx: SceneContext,
 ) -> Result<(), WaylandError> {
-    let conn = if let Some(display) = &config.display_override {
-        std::env::set_var("WAYLAND_DISPLAY", display);
-        Connection::connect_to_env()
-    } else {
-        Connection::connect_to_env()
-    }
-    .map_err(|e| WaylandError::Connect(e.to_string()))?;
+    let (_tx, rx) = channel::channel();
+    run_shell_daemon(
+        config,
+        role.to_scene(),
+        palette,
+        scene_ctx,
+        rx,
+        NoopActionHandler,
+    )
+}
 
+/// Run the full multi-surface `calloop` + `wlr-layer-shell` shell daemon.
+///
+/// Allocates surfaces lazily: only the compact `BottomPill` + `TopStrip` exist while dormant
+/// over apps (`< 1 MiB` SHM), and full-screen overlays are dropped cleanly upon dismissal.
+///
+/// # Errors
+/// Returns [`WaylandError`] if connecting to `Wayland`, binding required globals, or selecting the
+/// requested output fails.
+#[allow(clippy::too_many_lines)]
+pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
+    config: &WaylandRuntimeConfig,
+    initial_scene: SceneKind,
+    palette: ThemePalette,
+    mut initial_ctx: SceneContext,
+    cmd_rx: Channel<DaemonCommand>,
+    handler: H,
+) -> Result<(), WaylandError> {
+    if let Some(display) = &config.display_override {
+        std::env::set_var("WAYLAND_DISPLAY", display);
+    }
+    let conn = Connection::connect_to_env().map_err(|e| WaylandError::Connect(e.to_string()))?;
     let (globals, mut event_queue) =
         registry_queue_init(&conn).map_err(|e| WaylandError::Runtime(e.to_string()))?;
     let qh = event_queue.handle();
@@ -182,94 +863,109 @@ pub fn run_layer_surface(
     let shm = Shm::bind(&globals, &qh)
         .map_err(|e| WaylandError::MissingGlobal(format!("wl_shm: {e}")))?;
 
-    let spec = LayerSurfaceSpec::for_role(role, 1280, 853);
-    let wlr_layer = match role {
-        LayerRole::BottomPill | LayerRole::QuickSettings => Layer::Overlay,
-        LayerRole::HomeGrid | LayerRole::RecentsDeck | LayerRole::TouchOsk => Layer::Top,
-    };
-
-    let wl_surface = compositor.create_surface(&qh);
-    let layer =
-        layer_shell.create_layer_surface(&qh, wl_surface, wlr_layer, Some("veilshell"), None);
-
-    let mut anchor = WlrAnchor::empty();
-    if spec.anchor.top {
-        anchor |= WlrAnchor::TOP;
-    }
-    if spec.anchor.bottom {
-        anchor |= WlrAnchor::BOTTOM;
-    }
-    if spec.anchor.left {
-        anchor |= WlrAnchor::LEFT;
-    }
-    if spec.anchor.right {
-        anchor |= WlrAnchor::RIGHT;
-    }
-
-    layer.set_anchor(anchor);
-    layer.set_exclusive_zone(spec.exclusive_zone);
-    layer.set_keyboard_interactivity(if spec.keyboard_interactivity {
-        KeyboardInteractivity::OnDemand
-    } else {
-        KeyboardInteractivity::None
-    });
-
-    // When anchored to both opposing edges, pass 0 so the compositor fills the output dimension.
-    let req_w = if spec.anchor.left && spec.anchor.right {
-        0
-    } else {
-        spec.width
-    };
-    let req_h = if spec.anchor.top && spec.anchor.bottom {
-        0
-    } else {
-        spec.height
-    };
-    layer.set_size(req_w, req_h);
-    layer.commit();
-
-    let initial_bytes = (spec.width as usize) * (spec.height as usize) * 4;
-    let pool = SlotPool::new(initial_bytes.max(1024 * 64), &shm)
-        .map_err(|e| WaylandError::Runtime(format!("shm slot pool: {e}")))?;
+    initial_ctx.overlay_progress = 1.0;
+    let mut settled_spring = Spring::new(1.0, SpringParams::snappy());
+    settled_spring.set_target(1.0);
 
     let mut app = LayerApp {
+        qh: qh.clone(),
         registry_state: RegistryState::new(&globals),
+        compositor,
+        layer_shell,
         seat_state: SeatState::new(&globals, &qh),
         output_state: OutputState::new(&globals, &qh),
         shm,
-        pool,
-        layer,
-        role,
-        width: spec.width,
-        height: spec.height,
-        configured: false,
-        exit: false,
+        target_output: None,
+        output_name: config.output_name.clone(),
+        viewport_w: 1280,
+        viewport_h: 853,
+        visible: true,
+        active_scene: initial_scene,
+        pill: None,
+        top_strip: None,
+        overlay: None,
+        overlay_layout: None,
+        overlay_spring: settled_spring,
+        last_anim_tick: Instant::now(),
         palette,
-        renderer: SdfSoftwareRenderer::with_context(scene_ctx),
+        renderer: SdfSoftwareRenderer::with_context(initial_ctx),
         pointer: None,
         touch: None,
         drag: None,
+        handler: Box::new(handler),
+        exit: false,
     };
 
-    let deadline = config
-        .exit_after_ms
-        .map(|ms| Instant::now() + Duration::from_millis(ms));
+    // Perform two quick roundtrips so OutputState populates `xdg_output` names & logical sizes.
+    event_queue
+        .roundtrip(&mut app)
+        .map_err(|e| WaylandError::Runtime(e.to_string()))?;
+    event_queue
+        .roundtrip(&mut app)
+        .map_err(|e| WaylandError::Runtime(e.to_string()))?;
+
+    let matched = app.output_state.outputs().find_map(|out| {
+        let info = app.output_state.info(&out)?;
+        if let Some(wanted) = &config.output_name {
+            if info.name.as_deref() == Some(wanted.as_str()) {
+                return Some((out, info));
+            }
+            return None;
+        }
+        Some((out, info))
+    });
+
+    if let Some((out, info)) = matched {
+        if let Some((w, h)) = info.logical_size {
+            if w > 0 && h > 0 {
+                app.viewport_w = w as u32;
+                app.viewport_h = h as u32;
+            }
+        }
+        if app.output_name.is_none() {
+            app.output_name = info.name;
+        }
+        app.target_output = Some(out);
+    } else if let Some(wanted) = &config.output_name {
+        return Err(WaylandError::Runtime(format!(
+            "requested Wayland output '{wanted}' was not found"
+        )));
+    }
+
+    app.show_scene(initial_scene, false);
+
+    let mut event_loop: EventLoop<LayerApp> =
+        EventLoop::try_new().map_err(|e| WaylandError::Runtime(e.to_string()))?;
+    let loop_handle: LoopHandle<'static, LayerApp> = event_loop.handle();
+
+    WaylandSource::new(conn, event_queue)
+        .insert(loop_handle.clone())
+        .map_err(|e| WaylandError::Runtime(e.to_string()))?;
+
+    loop_handle
+        .insert_source(cmd_rx, |event, (), state| {
+            if let ChannelEvent::Msg(cmd) = event {
+                state.handle_daemon_command(cmd);
+            }
+        })
+        .map_err(|e| WaylandError::Runtime(e.to_string()))?;
+
+    if let Some(ms) = config.exit_after_ms {
+        loop_handle
+            .insert_source(
+                Timer::from_duration(Duration::from_millis(ms)),
+                |_, (), state| {
+                    state.exit = true;
+                    TimeoutAction::Drop
+                },
+            )
+            .map_err(|e| WaylandError::Runtime(e.to_string()))?;
+    }
 
     while !app.exit {
-        event_queue
-            .roundtrip(&mut app)
+        event_loop
+            .dispatch(None, &mut app)
             .map_err(|e| WaylandError::Runtime(e.to_string()))?;
-
-        if let Some(limit) = deadline {
-            if Instant::now() >= limit {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(16));
-        } else {
-            event_queue
-                .blocking_dispatch(&mut app)
-                .map_err(|e| WaylandError::Runtime(e.to_string()))?;
-        }
     }
 
     Ok(())
@@ -297,11 +993,22 @@ impl CompositorHandler for LayerApp {
     fn frame(
         &mut self,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
+        _qh: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
-        self.draw(qh);
+        if self.surface_kind(surface) == Some(SurfaceKind::Overlay)
+            && !self.overlay_spring.is_settled()
+        {
+            let dt = self
+                .last_anim_tick
+                .elapsed()
+                .as_secs_f32()
+                .clamp(0.001, 0.16);
+            self.last_anim_tick = Instant::now();
+            self.overlay_spring.step(dt);
+            self.draw_overlay();
+        }
     }
 
     fn surface_enter(
@@ -354,26 +1061,46 @@ impl OutputHandler for LayerApp {
 }
 
 impl LayerShellHandler for LayerApp {
-    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
-        self.exit = true;
+    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
+        match self.surface_kind(layer.wl_surface()) {
+            Some(SurfaceKind::Overlay) => self.show_scene(SceneKind::Pill, false),
+            Some(SurfaceKind::Pill) => self.exit = true,
+            Some(SurfaceKind::TopStrip) | None => {}
+        }
     }
 
     fn configure(
         &mut self,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
-        _layer: &LayerSurface,
+        _qh: &QueueHandle<Self>,
+        layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        if configure.new_size.0 > 0 {
-            self.width = configure.new_size.0;
+        let Some(kind) = self.surface_kind(layer.wl_surface()) else {
+            return;
+        };
+
+        let surf = match kind {
+            SurfaceKind::Pill => self.pill.as_mut(),
+            SurfaceKind::TopStrip => self.top_strip.as_mut(),
+            SurfaceKind::Overlay => self.overlay.as_mut(),
+        };
+        if let Some(target) = surf {
+            if configure.new_size.0 > 0 {
+                target.width = configure.new_size.0;
+            }
+            if configure.new_size.1 > 0 {
+                target.height = configure.new_size.1;
+            }
+            target.configured = true;
         }
-        if configure.new_size.1 > 0 {
-            self.height = configure.new_size.1;
+
+        match kind {
+            SurfaceKind::Pill => self.draw_pill(),
+            SurfaceKind::TopStrip => self.draw_top_strip(),
+            SurfaceKind::Overlay => self.draw_overlay(),
         }
-        self.configured = true;
-        self.draw(qh);
     }
 }
 
@@ -430,37 +1157,19 @@ impl PointerHandler for LayerApp {
     fn pointer_frame(
         &mut self,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
         _pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
         for event in events {
+            let Some(kind) = self.surface_kind(&event.surface) else {
+                continue;
+            };
             let (x, y) = (event.position.0 as f32, event.position.1 as f32);
             match event.kind {
-                PointerEventKind::Press { .. } => {
-                    self.drag = Some(ActiveDrag {
-                        touch_id: None,
-                        start_x: x,
-                        start_y: y,
-                        last_x: x,
-                        last_y: y,
-                        start_time: Instant::now(),
-                    });
-                }
-                PointerEventKind::Motion { .. } => {
-                    if let Some(drag) = &mut self.drag {
-                        if drag.touch_id.is_none() {
-                            drag.last_x = x;
-                            drag.last_y = y;
-                            self.renderer.context.pill_drag_x = x - drag.start_x;
-                            self.renderer.context.pill_drag_y = y - drag.start_y;
-                            self.draw(qh);
-                        }
-                    }
-                }
-                PointerEventKind::Release { .. } => {
-                    self.finish_drag(qh);
-                }
+                PointerEventKind::Press { .. } => self.begin_drag(None, kind, x, y),
+                PointerEventKind::Motion { .. } => self.update_drag(None, x, y),
+                PointerEventKind::Release { .. } => self.finish_drag(None),
                 _ => {}
             }
         }
@@ -475,55 +1184,39 @@ impl TouchHandler for LayerApp {
         _touch: &wl_touch::WlTouch,
         _serial: u32,
         _time: u32,
-        _surface: wl_surface::WlSurface,
+        surface: wl_surface::WlSurface,
         id: i32,
         position: (f64, f64),
     ) {
         if self.drag.is_none() {
-            let (x, y) = (position.0 as f32, position.1 as f32);
-            self.drag = Some(ActiveDrag {
-                touch_id: Some(id),
-                start_x: x,
-                start_y: y,
-                last_x: x,
-                last_y: y,
-                start_time: Instant::now(),
-            });
+            if let Some(kind) = self.surface_kind(&surface) {
+                self.begin_drag(Some(id), kind, position.0 as f32, position.1 as f32);
+            }
         }
     }
 
     fn up(
         &mut self,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
         _touch: &wl_touch::WlTouch,
         _serial: u32,
         _time: u32,
         id: i32,
     ) {
-        if self.drag.as_ref().is_some_and(|d| d.touch_id == Some(id)) {
-            self.finish_drag(qh);
-        }
+        self.finish_drag(Some(id));
     }
 
     fn motion(
         &mut self,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
         _touch: &wl_touch::WlTouch,
         _time: u32,
         id: i32,
         position: (f64, f64),
     ) {
-        if let Some(drag) = &mut self.drag {
-            if drag.touch_id == Some(id) {
-                drag.last_x = position.0 as f32;
-                drag.last_y = position.1 as f32;
-                self.renderer.context.pill_drag_x = drag.last_x - drag.start_x;
-                self.renderer.context.pill_drag_y = drag.last_y - drag.start_y;
-                self.draw(qh);
-            }
-        }
+        self.update_drag(Some(id), position.0 as f32, position.1 as f32);
     }
 
     fn shape(
@@ -547,11 +1240,14 @@ impl TouchHandler for LayerApp {
     ) {
     }
 
-    fn cancel(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, _touch: &wl_touch::WlTouch) {
+    fn cancel(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _touch: &wl_touch::WlTouch) {
         self.drag = None;
         self.renderer.context.pill_drag_x = 0.0;
         self.renderer.context.pill_drag_y = 0.0;
-        self.draw(qh);
+        self.renderer.context.top_drag_y = 0.0;
+        self.draw_pill();
+        self.draw_top_strip();
+        self.draw_overlay();
     }
 }
 

@@ -1,5 +1,6 @@
-//! Fast analytic SDF CPU rasterizer and `PNG` / `Wayland` `ARGB8888` encoders.
+//! Fast analytic SDF CPU rasterizer, cached backdrop, and `PNG` / `Wayland` `ARGB8888` encoders.
 
+use std::cell::RefCell;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
@@ -7,24 +8,77 @@ use std::path::Path;
 use veilshell_core::{Rgba, ThemePalette};
 
 use crate::font::{glyph_rows, measure_text_width, GLYPH_ADVANCE, GLYPH_H, GLYPH_W};
-use crate::primitives::{DrawCommand, DrawList, RoundedRect, TextAlign, TextLabel};
-use crate::scene::{build_scene, SceneContext};
-use crate::{RenderError, RenderFrame, RendererBackend, SnapshotSpec};
+use crate::primitives::{DrawCommand, DrawList, RoundedRect, SceneOutput, TextAlign, TextLabel};
+use crate::scene::{build_scene, build_scene_layout, build_top_strip_scene, SceneContext};
+use crate::{RenderError, RenderFrame, RendererBackend, SceneKind, SnapshotSpec};
+
+#[derive(Clone, Debug)]
+struct BackdropCache {
+    width: u32,
+    height: u32,
+    prefix: Vec<DrawCommand>,
+    rgba: Vec<u8>,
+}
 
 /// Analytic SDF rounded-rectangle rasterizer (zero `unsafe`, crisp antialiased edges).
 #[derive(Clone, Debug, Default)]
 pub struct SdfSoftwareRenderer {
     pub context: SceneContext,
+    backdrop_cache: RefCell<Option<BackdropCache>>,
 }
 
 impl SdfSoftwareRenderer {
     /// Construct a software SDF renderer with custom dynamic [`SceneContext`].
     #[must_use]
     pub const fn with_context(context: SceneContext) -> Self {
-        Self { context }
+        Self {
+            context,
+            backdrop_cache: RefCell::new(None),
+        }
+    }
+
+    /// Build layout (for hit-testing) and rasterize an interactive shell scene in one call.
+    ///
+    /// # Errors
+    /// Returns [`RenderError::InvalidViewport`] if `width` or `height` is zero.
+    pub fn render_interactive(
+        &self,
+        scene: SceneKind,
+        width: u32,
+        height: u32,
+        palette: &ThemePalette,
+    ) -> Result<(RenderFrame, SceneOutput), RenderError> {
+        if width == 0 || height == 0 {
+            return Err(RenderError::InvalidViewport);
+        }
+        let layout = build_scene_layout(scene, width as f32, height as f32, palette, &self.context);
+        let frame = self.rasterize(width, height, &layout.draw_list)?;
+        Ok((frame, layout))
+    }
+
+    /// Render the subtle top pull handle strip (`LayerRole::TopStrip`).
+    ///
+    /// # Errors
+    /// Returns [`RenderError::InvalidViewport`] if `width` or `height` is zero.
+    pub fn render_top_strip(
+        &self,
+        width: u32,
+        height: u32,
+        palette: &ThemePalette,
+    ) -> Result<RenderFrame, RenderError> {
+        let list = build_top_strip_scene(
+            width as f32,
+            height as f32,
+            palette,
+            self.context.top_drag_y,
+        );
+        self.rasterize(width, height, &list)
     }
 
     /// Rasterize an arbitrary [`DrawList`] into an `RGBA8` [`RenderFrame`].
+    ///
+    /// Reuses a cached backdrop buffer whenever the leading gradient & radial glow prefix
+    /// matches the previous frame dimensions and theme.
     ///
     /// # Errors
     /// Returns [`RenderError::InvalidViewport`] if `width` or `height` is zero.
@@ -37,27 +91,73 @@ impl SdfSoftwareRenderer {
         if width == 0 || height == 0 {
             return Err(RenderError::InvalidViewport);
         }
-        let mut rgba = vec![0_u8; (width as usize) * (height as usize) * 4];
-        for cmd in &list.commands {
-            match cmd {
-                DrawCommand::BackdropGradient { top, bottom } => {
-                    draw_backdrop_gradient(&mut rgba, width, height, *top, *bottom);
+
+        let prefix_len = list
+            .commands
+            .iter()
+            .take_while(|cmd| {
+                matches!(
+                    cmd,
+                    DrawCommand::BackdropGradient { .. } | DrawCommand::RadialGlow { .. }
+                )
+            })
+            .count();
+
+        let total_bytes = (width as usize) * (height as usize) * 4;
+        let mut rgba = if prefix_len > 0 {
+            let prefix = &list.commands[..prefix_len];
+            let cached = {
+                let borrow = self.backdrop_cache.borrow();
+                borrow.as_ref().and_then(|c| {
+                    (c.width == width && c.height == height && c.prefix.as_slice() == prefix)
+                        .then(|| c.rgba.clone())
+                })
+            };
+
+            if let Some(buf) = cached {
+                buf
+            } else {
+                let mut buf = vec![0_u8; total_bytes];
+                for cmd in prefix {
+                    execute_command(&mut buf, width, height, cmd);
                 }
-                DrawCommand::RadialGlow {
-                    cx,
-                    cy,
-                    radius,
-                    color,
-                } => draw_radial_glow(&mut rgba, width, height, *cx, *cy, *radius, *color),
-                DrawCommand::Rect(rect) => draw_rounded_rect(&mut rgba, width, height, *rect),
-                DrawCommand::Text(label) => draw_text(&mut rgba, width, height, label),
+                *self.backdrop_cache.borrow_mut() = Some(BackdropCache {
+                    width,
+                    height,
+                    prefix: prefix.to_vec(),
+                    rgba: buf.clone(),
+                });
+                buf
             }
+        } else {
+            vec![0_u8; total_bytes]
+        };
+
+        for cmd in &list.commands[prefix_len..] {
+            execute_command(&mut rgba, width, height, cmd);
         }
+
         Ok(RenderFrame {
             width,
             height,
             rgba,
         })
+    }
+}
+
+fn execute_command(rgba: &mut [u8], width: u32, height: u32, cmd: &DrawCommand) {
+    match cmd {
+        DrawCommand::BackdropGradient { top, bottom } => {
+            draw_backdrop_gradient(rgba, width, height, *top, *bottom);
+        }
+        DrawCommand::RadialGlow {
+            cx,
+            cy,
+            radius,
+            color,
+        } => draw_radial_glow(rgba, width, height, *cx, *cy, *radius, *color),
+        DrawCommand::Rect(rect) => draw_rounded_rect(rgba, width, height, *rect),
+        DrawCommand::Text(label) => draw_text(rgba, width, height, label),
     }
 }
 
@@ -118,6 +218,7 @@ impl RenderFrame {
     }
 }
 
+#[inline]
 fn blend_pixel(buf: &mut [u8], idx: usize, src: Rgba) {
     let sa = src.a.clamp(0.0, 1.0);
     if sa <= 0.001 {
@@ -127,7 +228,27 @@ fn blend_pixel(buf: &mut [u8], idx: usize, src: Rgba) {
     let sg = src.g.clamp(0.0, 1.0);
     let sb = src.b.clamp(0.0, 1.0);
 
-    let da = f32::from(buf[idx + 3]) / 255.0;
+    let dst_a_u8 = buf[idx + 3];
+    if sa >= 0.999 || dst_a_u8 == 0 {
+        buf[idx] = (sr * 255.0).round() as u8;
+        buf[idx + 1] = (sg * 255.0).round() as u8;
+        buf[idx + 2] = (sb * 255.0).round() as u8;
+        buf[idx + 3] = (sa * 255.0).round() as u8;
+        return;
+    }
+
+    if dst_a_u8 == 255 {
+        let inv = 1.0 - sa;
+        let dr = f32::from(buf[idx]) / 255.0;
+        let dg = f32::from(buf[idx + 1]) / 255.0;
+        let db = f32::from(buf[idx + 2]) / 255.0;
+        buf[idx] = ((sr * sa + dr * inv) * 255.0).round() as u8;
+        buf[idx + 1] = ((sg * sa + dg * inv) * 255.0).round() as u8;
+        buf[idx + 2] = ((sb * sa + db * inv) * 255.0).round() as u8;
+        return;
+    }
+
+    let da = f32::from(dst_a_u8) / 255.0;
     let out_a = sa + da * (1.0 - sa);
     if out_a <= 0.0001 {
         buf[idx..idx + 4].fill(0);
@@ -200,12 +321,15 @@ fn draw_radial_glow(buf: &mut [u8], w: u32, h: u32, cx: f32, cy: f32, radius: f3
     }
 }
 
+#[inline]
 fn sdf_rounded_box(px: f32, py: f32, half_w: f32, half_h: f32, r: f32) -> f32 {
     let qx = px.abs() - (half_w - r);
     let qy = py.abs() - (half_h - r);
-    let outside = (qx.max(0.0).hypot(qy.max(0.0))) - r;
-    let inside = qx.max(qy).min(0.0);
-    outside + inside
+    if qx > 0.0 && qy > 0.0 {
+        (qx * qx + qy * qy).sqrt() - r
+    } else {
+        qx.max(qy) - r
+    }
 }
 
 fn draw_rounded_rect(buf: &mut [u8], w: u32, h: u32, rect: RoundedRect) {
@@ -218,16 +342,31 @@ fn draw_rounded_rect(buf: &mut [u8], w: u32, h: u32, rect: RoundedRect) {
     let cy = rect.y + half_h;
     let r = rect.radius.min(half_w).min(half_h).max(0.0);
 
-    let pad = rect.shadow_radius + rect.shadow_offset_y.abs() + 2.0;
+    let pad = if rect.shadow_alpha > 0.001 && rect.shadow_radius > 0.5 {
+        rect.shadow_radius + rect.shadow_offset_y.abs() + 2.0
+    } else {
+        2.0
+    };
     let min_x = ((rect.x - pad).floor().max(0.0) as u32).min(w);
     let max_x = ((rect.x + rect.w + pad).ceil().max(0.0) as u32).min(w);
     let min_y = ((rect.y - pad).floor().max(0.0) as u32).min(h);
     let max_y = ((rect.y + rect.h + pad).ceil().max(0.0) as u32).min(h);
 
+    let has_shadow = rect.shadow_alpha > 0.001 && rect.shadow_radius > 0.5;
+    let has_border = rect.border_width > 0.01 && rect.border_color.a > 0.001;
+    let has_sheen = rect.top_highlight_alpha > 0.001;
+
     for y in min_y..max_y {
         let py = y as f32 + 0.5;
         let rel_y = py - cy;
         let row_off = (y as usize) * (w as usize);
+        let norm_y = ((py - rect.y) / rect.h).clamp(0.0, 1.0);
+        let sheen_row = if has_sheen && norm_y < 0.35 {
+            (1.0 - norm_y / 0.35) * rect.top_highlight_alpha
+        } else {
+            0.0
+        };
+
         for x in min_x..max_x {
             let px = x as f32 + 0.5;
             let rel_x = px - cx;
@@ -235,8 +374,7 @@ fn draw_rounded_rect(buf: &mut [u8], w: u32, h: u32, rect: RoundedRect) {
 
             let dist = sdf_rounded_box(rel_x, rel_y, half_w, half_h, r);
 
-            // Soft drop shadow outside the shape
-            if rect.shadow_alpha > 0.001 && rect.shadow_radius > 0.5 && dist > -1.0 {
+            if has_shadow && dist > -1.0 {
                 let sdist = sdf_rounded_box(rel_x, rel_y - rect.shadow_offset_y, half_w, half_h, r);
                 if sdist < rect.shadow_radius {
                     let norm = (sdist.max(0.0) / rect.shadow_radius).clamp(0.0, 1.0);
@@ -255,31 +393,24 @@ fn draw_rounded_rect(buf: &mut [u8], w: u32, h: u32, rect: RoundedRect) {
                 }
             }
 
-            // Main antialiased fill
             let fill_cov = (0.5 - dist).clamp(0.0, 1.0);
             if fill_cov > 0.001 {
                 blend_pixel(buf, idx, rect.fill.with_alpha(rect.fill.a * fill_cov));
 
-                // Subtle vertical top specular glass sheen
-                if rect.top_highlight_alpha > 0.001 {
-                    let norm_y = ((py - rect.y) / rect.h).clamp(0.0, 1.0);
-                    if norm_y < 0.35 {
-                        let sheen = (1.0 - norm_y / 0.35) * rect.top_highlight_alpha * fill_cov;
-                        blend_pixel(
-                            buf,
-                            idx,
-                            Rgba {
-                                r: 1.0,
-                                g: 1.0,
-                                b: 1.0,
-                                a: sheen,
-                            },
-                        );
-                    }
+                if sheen_row > 0.001 {
+                    blend_pixel(
+                        buf,
+                        idx,
+                        Rgba {
+                            r: 1.0,
+                            g: 1.0,
+                            b: 1.0,
+                            a: sheen_row * fill_cov,
+                        },
+                    );
                 }
 
-                // Crisp inner glass border
-                if rect.border_width > 0.01 && rect.border_color.a > 0.001 {
+                if has_border {
                     let inner_cov = (dist + rect.border_width + 0.5).clamp(0.0, 1.0);
                     let border_cov = fill_cov * inner_cov;
                     if border_cov > 0.001 {

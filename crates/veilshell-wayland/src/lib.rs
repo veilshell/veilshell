@@ -1,14 +1,20 @@
-//! `Wayland` `wlr-layer-shell` surface descriptors, touch models, and live client runtime.
+//! `Wayland` `wlr-layer-shell` surface descriptors, touch models, and multi-surface daemon runtime.
 
 pub mod client;
 
-pub use client::{run_layer_surface, WaylandError};
+pub use client::{
+    run_layer_surface, run_shell_daemon, DaemonCommand, RuntimeStatus, ShellAction,
+    ShellActionHandler, WaylandError,
+};
+pub use smithay_client_toolkit::reexports::calloop::channel;
 
 /// Logical role of a `VeilShell` `wlr-layer-shell` surface.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum LayerRole {
     /// Thin bottom gesture indicator bar.
     BottomPill,
+    /// Subtle top-center pull handle for Quick Settings.
+    TopStrip,
     /// Full-screen spring-animated app launcher grid.
     HomeGrid,
     /// Horizontal recents card switcher.
@@ -33,10 +39,12 @@ impl LayerRole {
     }
 
     /// Map this [`LayerRole`] back to its rendered [`veilshell_render::SceneKind`].
+    ///
+    /// [`LayerRole::TopStrip`] maps to [`veilshell_render::SceneKind::Pill`] as a passive bar role.
     #[must_use]
     pub const fn to_scene(self) -> veilshell_render::SceneKind {
         match self {
-            Self::BottomPill => veilshell_render::SceneKind::Pill,
+            Self::BottomPill | Self::TopStrip => veilshell_render::SceneKind::Pill,
             Self::HomeGrid => veilshell_render::SceneKind::Home,
             Self::RecentsDeck => veilshell_render::SceneKind::Recents,
             Self::QuickSettings => veilshell_render::SceneKind::Shade,
@@ -77,6 +85,17 @@ impl Anchor {
             right: true,
         }
     }
+
+    /// Anchor to the top edge centered horizontally.
+    #[must_use]
+    pub const fn top_center() -> Self {
+        Self {
+            top: true,
+            bottom: false,
+            left: false,
+            right: false,
+        }
+    }
 }
 
 /// Declarative geometry and interactivity spec for a layer surface.
@@ -100,6 +119,14 @@ impl LayerSurfaceSpec {
                 anchor: Anchor::bottom_bar(),
                 width: viewport_w,
                 height: 28,
+                exclusive_zone: 0,
+                keyboard_interactivity: false,
+            },
+            LayerRole::TopStrip => Self {
+                role,
+                anchor: Anchor::top_center(),
+                width: 220,
+                height: 16,
                 exclusive_zone: 0,
                 keyboard_interactivity: false,
             },
@@ -149,6 +176,7 @@ pub struct TouchEvent {
 #[derive(Clone, Debug, PartialEq)]
 pub struct WaylandRuntimeConfig {
     pub display_override: Option<String>,
+    pub output_name: Option<String>,
     pub preferred_scale: f32,
     pub exit_after_ms: Option<u64>,
 }
@@ -157,6 +185,7 @@ impl Default for WaylandRuntimeConfig {
     fn default() -> Self {
         Self {
             display_override: None,
+            output_name: None,
             preferred_scale: 1.0,
             exit_after_ms: None,
         }
@@ -172,6 +201,16 @@ mod tests {
         let spec = LayerSurfaceSpec::for_role(LayerRole::BottomPill, 1280, 853);
         assert_eq!(spec.anchor, Anchor::bottom_bar());
         assert_eq!(spec.height, 28);
+        assert_eq!(spec.exclusive_zone, 0);
+        assert!(!spec.keyboard_interactivity);
+    }
+
+    #[test]
+    fn top_strip_is_compact_centered_handle() {
+        let spec = LayerSurfaceSpec::for_role(LayerRole::TopStrip, 1280, 853);
+        assert_eq!(spec.anchor, Anchor::top_center());
+        assert_eq!(spec.width, 220);
+        assert_eq!(spec.height, 16);
         assert_eq!(spec.exclusive_zone, 0);
         assert!(!spec.keyboard_interactivity);
     }

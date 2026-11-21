@@ -4,6 +4,7 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -120,6 +121,18 @@ pub trait CompositorBackend {
     /// # Errors
     /// Returns [`CompositorError`] if the mode transition fails.
     fn apply_shell_mode(&mut self, mode: ShellMode) -> Result<(), CompositorError>;
+
+    /// Switch to the next (`delta > 0`) or previous (`delta < 0`) workspace.
+    ///
+    /// # Errors
+    /// Returns [`CompositorError`] if the compositor rejects the workspace switch.
+    fn switch_workspace_relative(&mut self, delta: i32) -> Result<(), CompositorError>;
+
+    /// Ask the compositor to launch an application command in the active session environment.
+    ///
+    /// # Errors
+    /// Returns [`CompositorError`] if launching fails.
+    fn launch_command(&self, command: &str) -> Result<(), CompositorError>;
 }
 
 /// Deterministic in-memory backend used by unit tests and offline previews.
@@ -128,6 +141,8 @@ pub struct MockBackend {
     windows: Vec<WindowInfo>,
     outputs: Vec<OutputInfo>,
     mode: ShellMode,
+    last_workspace_delta: i32,
+    launched_commands: Arc<Mutex<Vec<String>>>,
 }
 
 impl Default for MockBackend {
@@ -167,6 +182,8 @@ impl Default for MockBackend {
                 orientation: Orientation::Normal,
             }],
             mode: ShellMode::Laptop,
+            last_workspace_delta: 0,
+            launched_commands: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -176,6 +193,21 @@ impl MockBackend {
     #[must_use]
     pub const fn applied_mode(&self) -> ShellMode {
         self.mode
+    }
+
+    /// Last relative workspace delta applied to this mock compositor.
+    #[must_use]
+    pub const fn last_workspace_delta(&self) -> i32 {
+        self.last_workspace_delta
+    }
+
+    /// Commands dispatched to [`CompositorBackend::launch_command`].
+    #[must_use]
+    pub fn launched_commands(&self) -> Vec<String> {
+        self.launched_commands
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -225,6 +257,18 @@ impl CompositorBackend for MockBackend {
 
     fn apply_shell_mode(&mut self, mode: ShellMode) -> Result<(), CompositorError> {
         self.mode = mode;
+        Ok(())
+    }
+
+    fn switch_workspace_relative(&mut self, delta: i32) -> Result<(), CompositorError> {
+        self.last_workspace_delta = delta;
+        Ok(())
+    }
+
+    fn launch_command(&self, command: &str) -> Result<(), CompositorError> {
+        if let Ok(mut guard) = self.launched_commands.lock() {
+            guard.push(command.to_owned());
+        }
         Ok(())
     }
 }
@@ -300,6 +344,15 @@ impl HyprlandBackend {
         }
     }
 
+    fn eval_lua(&self, lua: &str) -> Result<(), CompositorError> {
+        let reply = self.send_request(&format!("eval {lua}"))?;
+        if reply.trim() == "ok" {
+            Ok(())
+        } else {
+            Err(CompositorError::Protocol(reply.trim().to_owned()))
+        }
+    }
+
     fn keyword(&self, key: &str, value: &str) -> Result<(), CompositorError> {
         let reply = self.send_request(&format!("keyword {key} {value}"))?;
         if reply.trim() == "ok" {
@@ -323,8 +376,14 @@ struct HyprClient {
     class: String,
     workspace: HyprWorkspaceRef,
     floating: bool,
+    #[serde(default = "default_mapped")]
+    mapped: bool,
     #[serde(rename = "focusHistoryID", default = "default_focus_history")]
     focus_history_id: i32,
+}
+
+const fn default_mapped() -> bool {
+    true
 }
 
 const fn default_focus_history() -> i32 {
@@ -341,13 +400,24 @@ struct HyprMonitor {
     transform: u8,
 }
 
-/// Parse `hyprctl -j clients` JSON output into [`WindowInfo`] records.
+/// Parse `hyprctl -j clients` JSON output into [`WindowInfo`] records sorted by recency.
+///
+/// Unmapped helper surfaces are filtered out and negative `focusHistoryID` values are
+/// ordered after recently focused windows.
 ///
 /// # Errors
 /// Returns [`CompositorError::Protocol`] if the JSON payload is invalid.
 pub fn parse_hyprland_clients_json(raw: &str) -> Result<Vec<WindowInfo>, CompositorError> {
-    let clients: Vec<HyprClient> =
+    let mut clients: Vec<HyprClient> =
         serde_json::from_str(raw).map_err(|e| CompositorError::Protocol(e.to_string()))?;
+    clients.retain(|c| c.mapped);
+    clients.sort_by_key(|c| {
+        if c.focus_history_id < 0 {
+            i32::MAX
+        } else {
+            c.focus_history_id
+        }
+    });
     Ok(clients
         .into_iter()
         .map(|c| WindowInfo {
@@ -417,19 +487,40 @@ impl CompositorBackend for HyprlandBackend {
         output: &str,
         orientation: Orientation,
     ) -> Result<(), CompositorError> {
+        if !output
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        {
+            return Err(CompositorError::Protocol("unsafe output name".into()));
+        }
         let outputs = self.list_outputs()?;
         let Some(mon) = outputs.into_iter().find(|o| o.name == output) else {
             return Err(CompositorError::NotFound(output.to_owned()));
         };
         let transform = orientation.hyprland_transform();
-        let rule = format!(
-            "{output},preferred,auto,{:.2},transform,{transform}",
-            mon.scale.max(0.5)
+        let scale = mon.scale.max(0.5);
+        let lua = format!(
+            "hl.monitor({{ output = \"{output}\", mode = \"preferred\", position = \"auto\", scale = {scale:.2}, transform = {transform} }})"
         );
+        if self.eval_lua(&lua).is_ok() {
+            return Ok(());
+        }
+        let rule = format!("{output},preferred,auto,{scale:.2},transform,{transform}");
         self.keyword("monitor", &rule)
     }
 
     fn apply_shell_mode(&mut self, mode: ShellMode) -> Result<(), CompositorError> {
+        let lua = match mode {
+            ShellMode::Tablet => {
+                "hl.config({ general = { gaps_in = 6, gaps_out = 10 }, decoration = { rounding = 14 } })"
+            }
+            ShellMode::Laptop => {
+                "hl.config({ general = { gaps_in = 4, gaps_out = 8 }, decoration = { rounding = 8 } })"
+            }
+        };
+        if self.eval_lua(lua).is_ok() {
+            return Ok(());
+        }
         let batch = match mode {
             ShellMode::Tablet => {
                 "[[BATCH]]keyword general:gaps_in 6;keyword general:gaps_out 10;keyword decoration:rounding 14"
@@ -444,6 +535,18 @@ impl CompositorBackend for HyprlandBackend {
         } else {
             Err(CompositorError::Protocol(reply.trim().to_owned()))
         }
+    }
+
+    fn switch_workspace_relative(&mut self, delta: i32) -> Result<(), CompositorError> {
+        match delta.cmp(&0) {
+            std::cmp::Ordering::Greater => self.dispatch("workspace e+1"),
+            std::cmp::Ordering::Less => self.dispatch("workspace e-1"),
+            std::cmp::Ordering::Equal => Ok(()),
+        }
+    }
+
+    fn launch_command(&self, command: &str) -> Result<(), CompositorError> {
+        self.dispatch(&format!("exec {command}"))
     }
 }
 
@@ -484,6 +587,11 @@ mod tests {
             .apply_shell_mode(ShellMode::Tablet)
             .expect("tablet mode");
         assert_eq!(backend.applied_mode(), ShellMode::Tablet);
+
+        backend.switch_workspace_relative(1).expect("ws next");
+        assert_eq!(backend.last_workspace_delta(), 1);
+        backend.launch_command("foot").expect("launch");
+        assert_eq!(backend.launched_commands(), vec!["foot".to_owned()]);
     }
 
     #[test]
@@ -499,24 +607,36 @@ mod tests {
     fn parses_hyprland_clients_and_monitors_json() {
         let clients_json = r#"[
             {
-                "address": "0x55a1bc",
-                "title": "foot",
-                "class": "foot",
-                "workspace": { "id": 1, "name": "1" },
-                "floating": false,
-                "focusHistoryID": 0
-            },
-            {
                 "address": "0x55a1ff",
                 "title": "Chromium",
                 "class": "chromium",
                 "workspace": { "id": 2, "name": "2" },
                 "floating": true,
+                "mapped": true,
+                "focusHistoryID": 2
+            },
+            {
+                "address": "0x55a100",
+                "title": "HiddenHelper",
+                "class": "helper",
+                "workspace": { "id": 1, "name": "1" },
+                "floating": true,
+                "mapped": false,
                 "focusHistoryID": 1
+            },
+            {
+                "address": "0x55a1bc",
+                "title": "foot",
+                "class": "foot",
+                "workspace": { "id": 1, "name": "1" },
+                "floating": false,
+                "mapped": true,
+                "focusHistoryID": 0
             }
         ]"#;
         let windows = parse_hyprland_clients_json(clients_json).expect("clients parsed");
         assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].id.0, "0x55a1bc");
         assert!(windows[0].focused);
         assert!(!windows[1].focused);
         assert!(windows[1].floating);

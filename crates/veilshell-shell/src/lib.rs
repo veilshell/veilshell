@@ -1,5 +1,8 @@
 //! Top-level shell state orchestration combining core logic, compositor, hardware, and theme crates.
 
+pub mod apps;
+pub mod ipc;
+
 use std::fmt::Write as _;
 
 use veilshell_compositor::{CompositorBackend, CompositorError};

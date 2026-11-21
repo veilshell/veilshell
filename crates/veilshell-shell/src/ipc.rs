@@ -1,0 +1,153 @@
+//! Lightweight Unix-domain control socket bridging `veilctl` and the running `veilshell` daemon.
+
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
+use veilshell_render::SceneKind;
+use veilshell_theme::load_best_available;
+use veilshell_wayland::channel::Sender;
+use veilshell_wayland::DaemonCommand;
+
+/// Resolve the active IPC socket path (`VEILSHELL_SOCKET`, else `$XDG_RUNTIME_DIR/veilshell.sock`).
+#[must_use]
+pub fn default_socket_path() -> PathBuf {
+    if let Some(custom) = std::env::var_os("VEILSHELL_SOCKET") {
+        if !custom.is_empty() {
+            return PathBuf::from(custom);
+        }
+    }
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return PathBuf::from(runtime).join("veilshell.sock");
+    }
+    PathBuf::from("/tmp/veilshell.sock")
+}
+
+/// Send a single-line control command to a running `veilshell` daemon.
+///
+/// # Errors
+/// Returns an `std::io::Error` if no daemon is listening or the socket fails.
+pub fn send_daemon_command(socket_path: &Path, line: &str) -> std::io::Result<String> {
+    let mut stream = UnixStream::connect(socket_path)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    stream.write_all(line.trim().as_bytes())?;
+    stream.write_all(b"\n")?;
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply)?;
+    Ok(reply)
+}
+
+/// Bind `socket_path` and spawn a background thread forwarding client lines into `cmd_tx`.
+///
+/// # Errors
+/// Returns an `std::io::Error` if binding the Unix socket fails.
+pub fn spawn_ipc_listener(
+    socket_path: &Path,
+    cmd_tx: Sender<DaemonCommand>,
+) -> std::io::Result<()> {
+    if socket_path.exists() {
+        let _ = fs::remove_file(socket_path);
+    }
+    let listener = UnixListener::bind(socket_path)?;
+
+    thread::Builder::new()
+        .name("veilshell-ipc".into())
+        .spawn(move || {
+            for incoming in listener.incoming() {
+                let Ok(stream) = incoming else {
+                    break;
+                };
+                if handle_client(stream, &cmd_tx) {
+                    break;
+                }
+            }
+        })
+        .map(|_| ())
+}
+
+fn handle_client(mut stream: UnixStream, cmd_tx: &Sender<DaemonCommand>) -> bool {
+    let mut reader = BufReader::new(match stream.try_clone() {
+        Ok(cloned) => cloned,
+        Err(_) => return false,
+    });
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() {
+        return false;
+    }
+    let trimmed = line.trim();
+    let mut parts = trimmed.split_whitespace();
+    let Some(verb) = parts.next() else {
+        let _ = writeln!(stream, "err empty command");
+        return false;
+    };
+
+    match verb {
+        "show" => {
+            let Some(scene_str) = parts.next() else {
+                let _ = writeln!(stream, "err usage: show <pill|home|recents|shade|osk>");
+                return false;
+            };
+            let Some(scene) = SceneKind::parse_name(scene_str) else {
+                let _ = writeln!(stream, "err unknown scene '{scene_str}'");
+                return false;
+            };
+            let _ = cmd_tx.send(DaemonCommand::ShowScene(scene));
+            let _ = writeln!(stream, "ok scene {}", scene.as_str());
+        }
+        "reload-theme" => {
+            let palette = load_best_available();
+            let name = palette.name.clone();
+            let _ = cmd_tx.send(DaemonCommand::UpdatePalette(palette));
+            let _ = writeln!(stream, "ok theme {name}");
+        }
+        "status" => {
+            let (tx, rx) = mpsc::channel();
+            if cmd_tx.send(DaemonCommand::QueryStatus(tx)).is_ok() {
+                if let Ok(st) = rx.recv_timeout(Duration::from_secs(1)) {
+                    let _ = writeln!(
+                        stream,
+                        "daemon     : running (scene: {}, visible: {}, output: {} {}x{})",
+                        st.active_scene.as_str(),
+                        st.visible,
+                        st.output_name.as_deref().unwrap_or("default"),
+                        st.width,
+                        st.height
+                    );
+                } else {
+                    let _ = writeln!(stream, "err status timeout");
+                }
+            }
+        }
+        "mode" => {
+            let (tx, rx) = mpsc::channel();
+            if cmd_tx
+                .send(DaemonCommand::Custom {
+                    cmd: trimmed.to_owned(),
+                    reply: tx,
+                })
+                .is_ok()
+            {
+                if let Ok(msg) = rx.recv_timeout(Duration::from_secs(2)) {
+                    let _ = writeln!(stream, "{msg}");
+                } else {
+                    let _ = writeln!(stream, "err mode timeout");
+                }
+            }
+        }
+        "quit" => {
+            let _ = cmd_tx.send(DaemonCommand::Quit);
+            let _ = writeln!(stream, "ok quitting");
+            return true;
+        }
+        other => {
+            let _ = writeln!(stream, "err unknown command '{other}'");
+        }
+    }
+    false
+}

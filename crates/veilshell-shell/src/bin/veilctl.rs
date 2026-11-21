@@ -1,6 +1,7 @@
-//! `veilctl` control, inspection, and offscreen PNG snapshot CLI for `VeilShell`.
+//! `veilctl` control, inspection, `.desktop` app browser, and offscreen PNG snapshot CLI.
 
 use std::env;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -10,6 +11,8 @@ use veilshell_hw::MockHardware;
 use veilshell_render::{
     RendererBackend, SceneContext, SceneKind, SdfSoftwareRenderer, SnapshotSpec, ViewportSize,
 };
+use veilshell_shell::apps::{apps_to_tiles, current_clock_hhmm, discover_desktop_apps};
+use veilshell_shell::ipc::{default_socket_path, send_daemon_command};
 use veilshell_shell::ShellState;
 use veilshell_theme::{format_hex, load_best_available, OmarchyAetherProvider};
 
@@ -33,6 +36,13 @@ fn main() -> ExitCode {
             cmd_status();
             ExitCode::SUCCESS
         }
+        "show" => cmd_show(args.get(1).map(String::as_str)),
+        "reload-theme" => cmd_daemon_simple("reload-theme"),
+        "quit" => cmd_daemon_simple("quit"),
+        "apps" => {
+            cmd_apps();
+            ExitCode::SUCCESS
+        }
         "theme" => {
             cmd_theme();
             ExitCode::SUCCESS
@@ -42,6 +52,65 @@ fn main() -> ExitCode {
         other => {
             eprintln!("unknown subcommand: {other}\nRun `veilctl --help` for usage.");
             ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_daemon_simple(verb: &str) -> ExitCode {
+    let sock = default_socket_path();
+    match send_daemon_command(&sock, verb) {
+        Ok(reply) => {
+            print!("{reply}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!(
+                "veilshell daemon is not reachable at {}: {err}",
+                sock.display()
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_show(arg: Option<&str>) -> ExitCode {
+    let Some(raw) = arg else {
+        eprintln!("usage: veilctl show <pill|home|recents|shade|osk>");
+        return ExitCode::FAILURE;
+    };
+    let Some(scene) = SceneKind::parse_name(raw) else {
+        eprintln!("invalid scene '{raw}' (expected: pill, home, recents, shade, osk)");
+        return ExitCode::FAILURE;
+    };
+    let sock = default_socket_path();
+    match send_daemon_command(&sock, &format!("show {}", scene.as_str())) {
+        Ok(reply) => {
+            print!("{reply}");
+            if reply.starts_with("err") {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "veilshell daemon is not running at {}: {err}",
+                sock.display()
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_apps() {
+    let apps = discover_desktop_apps();
+    let mut out = std::io::stdout().lock();
+    if writeln!(out, "Discovered {} desktop applications:", apps.len()).is_err() {
+        return;
+    }
+    for app in &apps {
+        if writeln!(out, "  {:<34} {:<24} -> {}", app.id, app.name, app.exec).is_err() {
+            return;
         }
     }
 }
@@ -61,12 +130,18 @@ fn cmd_status() {
             );
         }
         println!("  windows    : {}", windows.len());
-        return;
+    } else {
+        let state = ShellState::new(MockBackend::default(), MockHardware::default(), palette);
+        print!("{}", state.status_report());
+        println!("  hyprland   : not active in current session");
     }
 
-    let state = ShellState::new(MockBackend::default(), MockHardware::default(), palette);
-    print!("{}", state.status_report());
-    println!("  hyprland   : not active in current session");
+    let sock = default_socket_path();
+    if let Ok(reply) = send_daemon_command(&sock, "status") {
+        print!("  {}", reply.trim_start());
+    } else {
+        println!("  daemon     : not running ({})", sock.display());
+    }
 }
 
 fn cmd_theme() {
@@ -105,23 +180,36 @@ fn cmd_theme() {
 }
 
 fn cmd_mode(arg: Option<&str>) -> ExitCode {
-    let policy_action = match arg {
-        Some("auto") => Ok(Some(ModePolicy::Auto)),
-        Some("laptop") => Ok(Some(ModePolicy::ForceLaptop)),
-        Some("tablet") => Ok(Some(ModePolicy::ForceTablet)),
-        Some("toggle") => Ok(None),
-        _ => Err("usage: veilctl mode <auto|laptop|tablet|toggle>"),
-    };
-
-    let Ok(action) = policy_action else {
+    let Some(mode_arg) = arg else {
         eprintln!("usage: veilctl mode <auto|laptop|tablet|toggle>");
         return ExitCode::FAILURE;
     };
+    let policy_action = match mode_arg {
+        "auto" => Some(ModePolicy::Auto),
+        "laptop" => Some(ModePolicy::ForceLaptop),
+        "tablet" => Some(ModePolicy::ForceTablet),
+        "toggle" => None,
+        _ => {
+            eprintln!("usage: veilctl mode <auto|laptop|tablet|toggle>");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Route through the running daemon first so UI surfaces show/hide in sync with compositor mode.
+    let sock = default_socket_path();
+    if let Ok(reply) = send_daemon_command(&sock, &format!("mode {mode_arg}")) {
+        print!("{reply}");
+        return if reply.starts_with("err") {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        };
+    }
 
     let palette = load_best_available();
     if let Some(hypr) = HyprlandBackend::from_env().filter(HyprlandBackend::is_available) {
         let mut state = ShellState::new(hypr, MockHardware::default(), palette);
-        let result = match action {
+        let result = match policy_action {
             Some(p) => state.set_policy(p),
             None => state.toggle_mode(),
         };
@@ -142,7 +230,7 @@ fn cmd_mode(arg: Option<&str>) -> ExitCode {
     }
 
     let mut state = ShellState::new(MockBackend::default(), MockHardware::default(), palette);
-    let result = match action {
+    let result = match policy_action {
         Some(p) => state.set_policy(p),
         None => state.toggle_mode(),
     };
@@ -159,6 +247,7 @@ fn cmd_mode(arg: Option<&str>) -> ExitCode {
 }
 
 fn cmd_snapshot(args: &[String]) -> ExitCode {
+    let demo = args.iter().any(|a| a == "--demo");
     let scene_name = parse_flag(args, "--scene").unwrap_or_else(|| "home".to_owned());
     let Some(scene) = SceneKind::parse_name(&scene_name) else {
         eprintln!("invalid --scene '{scene_name}' (expected: pill, home, recents, shade, osk)");
@@ -207,7 +296,16 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
     );
 
     let palette = load_best_available();
-    let mut renderer = SdfSoftwareRenderer::with_context(SceneContext::default());
+    let mut ctx = SceneContext::default();
+    if !demo {
+        ctx.clock_text = current_clock_hhmm();
+        let discovered = discover_desktop_apps();
+        if !discovered.is_empty() {
+            ctx.home_apps = apps_to_tiles(&discovered);
+        }
+    }
+
+    let mut renderer = SdfSoftwareRenderer::with_context(ctx);
     let spec = SnapshotSpec {
         scene,
         viewport: ViewportSize {
@@ -253,12 +351,15 @@ fn print_help() {
          USAGE:\n\
          \tveilctl <COMMAND>\n\n\
          COMMANDS:\n\
-         \tstatus                            Show shell mode, theme, and live compositor status\n\
-         \ttheme                             Inspect the resolved color palette and WCAG contrast\n\
+         \tstatus                            Show shell mode, theme, compositor, and daemon state\n\
+         \tshow <pill|home|recents|shade|osk> Switch the running daemon's active surface\n\
          \tmode <auto|laptop|tablet|toggle>  Evaluate or apply the Laptop/Tablet mode policy\n\
+         \treload-theme                      Reload colors.toml in the running daemon\n\
+         \tquit                              Stop the running daemon cleanly\n\
+         \tapps                              List discovered .desktop applications\n\
+         \ttheme                             Inspect the resolved color palette and WCAG contrast\n\
          \tsnapshot [OPTIONS]                Render an offscreen glassmorphic PNG snapshot\n\
-         \t  --scene <pill|home|recents|shade|osk>\n\
-         \t  --width <PX> --height <PX> --scale <F32> --out <PATH>\n\
+         \t  --scene <pill|home|recents|shade|osk> --width <PX> --height <PX> --out <PATH> [--demo]\n\
          \thelp                              Print this help message",
         env!("CARGO_PKG_VERSION")
     );
