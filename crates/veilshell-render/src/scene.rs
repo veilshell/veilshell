@@ -344,11 +344,12 @@ pub fn build_top_strip_scene(
     let fill = if active {
         palette.accent.with_alpha(0.92)
     } else {
-        palette.foreground.with_alpha(0.65)
+        palette.foreground.with_alpha(0.40)
     };
+    let border_alpha = if active { 0.20 } else { 0.12 };
     list.push_rect(
         RoundedRect::filled(hx, hy, handle_w, handle_h, handle_h * 0.5, fill).with_glass_border(
-            Rgba::from_rgb_u8(255, 255, 255).with_alpha(0.20),
+            Rgba::from_rgb_u8(255, 255, 255).with_alpha(border_alpha),
             0.8,
             0.14,
         ),
@@ -387,7 +388,7 @@ pub(crate) fn push_bottom_pill_bar(
     let fill = if active {
         palette.accent.with_alpha(0.95)
     } else {
-        Rgba::from_rgb_u8(138, 138, 138)
+        Rgba::from_rgb_u8(138, 138, 138).with_alpha(0.55)
     };
     list.push_rect(RoundedRect::filled(
         cx - pill_w * 0.5,

@@ -555,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn both_handles_grow_on_contact_without_any_drag() {
+    fn both_handles_grow_and_become_more_opaque_on_contact() {
         fn rect(list: &DrawList) -> RoundedRect {
             match list.commands.as_slice() {
                 [DrawCommand::Rect(rect)] => *rect,
@@ -569,9 +569,11 @@ mod tests {
         ctx.pill_pressed = true;
         let pressed = rect(&build_scene(SceneKind::Pill, 960.0, 48.0, &palette, &ctx));
         assert!(pressed.w > bottom.w && pressed.h > bottom.h);
+        assert!(bottom.fill.a < 0.6 && pressed.fill.a > 0.9);
         let top = rect(&build_top_strip_scene(220.0, 48.0, &palette, 0.0, false));
         let pressed = rect(&build_top_strip_scene(220.0, 48.0, &palette, 0.0, true));
         assert!(pressed.w > top.w && pressed.h > top.h);
+        assert!(top.fill.a < 0.5 && pressed.fill.a > 0.9);
     }
 
     #[test]
