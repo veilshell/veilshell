@@ -49,6 +49,10 @@ impl RenderTarget {
         self.physical
     }
 
+    pub(crate) const fn logical_size(self) -> (u32, u32) {
+        self.logical
+    }
+
     pub(crate) fn pixel_scale(self) -> PixelScale {
         PixelScale {
             x: self.physical.0 as f32 / self.logical.0 as f32,

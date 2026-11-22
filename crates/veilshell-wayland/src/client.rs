@@ -549,6 +549,9 @@ impl LayerApp {
     fn show_scene_at(&mut self, scene: SceneKind, spring: Spring, refresh: bool) {
         if scene != self.active_scene {
             self.cancel_osk_drag();
+            if self.active_scene == SceneKind::Recents {
+                self.capture.invalidate();
+            }
         }
         if scene != SceneKind::Shade {
             if let Some(menu) = &mut self.renderer.context_mut().power_menu {
@@ -567,7 +570,7 @@ impl LayerApp {
             }
             if scene == SceneKind::Recents {
                 self.renderer.context_mut().recents_index = 0;
-                self.capture_recents();
+                self.capture.invalidate();
             }
         }
 
@@ -601,6 +604,9 @@ impl LayerApp {
     fn set_visible(&mut self, visible: bool) {
         self.visible = visible;
         if !visible {
+            if self.active_scene == SceneKind::Recents {
+                self.capture.invalidate();
+            }
             self.drag = None;
             self.home_spring = None;
             self.renderer.context_mut().recents_throw = None;
@@ -658,9 +664,26 @@ impl LayerApp {
             surf.redraw_pending = true;
             return;
         }
+        let (width, height) = (surf.width, surf.height);
+        if self.active_scene == SceneKind::Recents {
+            if let Some(frame) = surf.scaling.frame((width, height)) {
+                if self.capture.needs_capture(frame.target) {
+                    let ctx = self.renderer.context_mut();
+                    ctx.recents_index = ctx
+                        .recents_index
+                        .min(ctx.recents_cards.len().saturating_sub(1));
+                    self.capture.apply_cached_and_capture(
+                        &mut ctx.recents_cards,
+                        ctx.recents_index,
+                        frame.target,
+                        &self.qh,
+                    );
+                }
+            }
+        }
         if self.active_scene == SceneKind::Home {
             let ctx = self.renderer.context_mut();
-            let total = home_page_count(&ctx.home_apps, surf.width as f32, surf.height as f32);
+            let total = home_page_count(&ctx.home_apps, width as f32, height as f32);
             ctx.home_page = ctx.home_page.min(total - 1);
         }
         let ctx = self.renderer.context_mut();
@@ -677,8 +700,8 @@ impl LayerApp {
         };
         let layout = build_scene_layout(
             self.active_scene,
-            surf.width as f32,
-            surf.height as f32,
+            width as f32,
+            height as f32,
             &self.palette,
             self.renderer.context(),
         );
@@ -844,6 +867,9 @@ impl LayerApp {
             DaemonCommand::SetVisible(vis) => self.set_visible(vis),
             DaemonCommand::UpdateContext(ctx) => {
                 *self.renderer.context_mut() = *ctx;
+                if self.active_scene == SceneKind::Recents {
+                    self.capture.invalidate();
+                }
                 if self.visible {
                     self.draw_pill();
                     self.draw_top_strip();
@@ -999,15 +1025,6 @@ impl LayerApp {
         }
     }
 
-    fn capture_recents(&mut self) {
-        let ctx = self.renderer.context_mut();
-        ctx.recents_index = ctx
-            .recents_index
-            .min(ctx.recents_cards.len().saturating_sub(1));
-        self.capture
-            .apply_cached_and_capture(&mut ctx.recents_cards, ctx.recents_index, &self.qh);
-    }
-
     fn has_gesture_overlay(&self) -> bool {
         self.active_scene == SceneKind::Home
             || (self.active_scene == SceneKind::Shade
@@ -1148,7 +1165,7 @@ impl LayerApp {
                 if self.active_scene == SceneKind::Recents {
                     if self.renderer.context().recents_index != page {
                         self.renderer.context_mut().recents_index = page;
-                        self.capture_recents();
+                        self.capture.invalidate();
                     }
                 } else if self.renderer.context().home_page != page {
                     self.renderer.context_mut().home_page = page;
@@ -1302,7 +1319,7 @@ impl LayerApp {
             if offset <= -96.0 || (offset <= -32.0 && vy <= -650.0) {
                 self.handler
                     .on_action(ShellAction::CloseWindow(id), self.renderer.context_mut());
-                self.capture_recents();
+                self.capture.invalidate();
             }
             self.draw_overlay();
             return;

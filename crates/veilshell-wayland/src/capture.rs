@@ -29,16 +29,36 @@ use smithay_client_toolkit::reexports::protocols::ext::image_copy_capture::v1::c
 use smithay_client_toolkit::shm::slot::{Buffer, SlotPool};
 use smithay_client_toolkit::shm::Shm;
 
-use veilshell_render::{RecentsCard, RgbaImage, SceneKind, ShmPixelFormat};
+use veilshell_render::{
+    recents_preview_pixels, RecentsCard, RenderTarget, RgbaImage, SceneKind, ShmPixelFormat,
+};
 
 use crate::client::LayerApp;
 
 const MAX_RECENT_THUMBNAILS: usize = 3;
-// The centered card is 63% of the output rather than a tiny tile. Preserve
-// enough source detail to avoid upscaling the old 360×260 previews.
-// Bounded so three neighboring previews still fit in the GPU's 2048² atlas.
-const THUMB_MAX_W: u32 = 960;
-const THUMB_MAX_H: u32 = 640;
+// Up to 4 MiB of cached RGBA per window, or 12 MiB for the deck. Limit either
+// dimension too, so very wide or tall previews still fit the GPU atlas.
+const MAX_PREVIEW_PIXELS: u32 = 1024 * 1024;
+const MAX_PREVIEW_EDGE: u32 = 1536;
+
+fn preview_cache_bounds((w, h): (u32, u32)) -> (u32, u32) {
+    let (w, h) = (f64::from(w.max(1)), f64::from(h.max(1)));
+    let edge_scale = f64::from(MAX_PREVIEW_EDGE) / w.max(h);
+    let area_scale = (f64::from(MAX_PREVIEW_PIXELS) / (w * h)).sqrt();
+    let scale = 1.0_f64.min(edge_scale).min(area_scale);
+    ((w * scale).max(1.0) as u32, (h * scale).max(1.0) as u32)
+}
+
+fn cache_preview(raw: RgbaImage, displayed: (u32, u32)) -> RgbaImage {
+    let (w, h) = preview_cache_bounds(displayed);
+    // Only downsample the compositor's image. If its buffer is smaller
+    // than the card, pre-upscaling would waste memory without adding detail.
+    if raw.width <= w && raw.height <= h {
+        raw
+    } else {
+        raw.resize_fit(w, h)
+    }
+}
 
 fn capture_range(count: usize, center: usize) -> std::ops::Range<usize> {
     let start = center
@@ -272,7 +292,15 @@ impl Dispatch2<ExtImageCopyCaptureFrameV1, LayerApp> for CaptureFrameData {
                     }
                 }
             }
-            ext_image_copy_capture_frame_v1::Event::Failed { .. } => {
+            ext_image_copy_capture_frame_v1::Event::Failed { reason } => {
+                if state.capture.debug_sizes {
+                    if let Some(cap) = state.capture.active.get(&cap_id) {
+                        eprintln!(
+                            "veilshell: recents {}: capture failed ({reason:?})",
+                            cap.card_id
+                        );
+                    }
+                }
                 state.capture.cancel_capture(cap_id);
             }
             _ => {}
@@ -337,6 +365,8 @@ pub(crate) struct ToplevelCaptureState {
     active: HashMap<u64, ActiveCapture>,
     cache_by_card: HashMap<String, Arc<RgbaImage>>,
     cache_by_identifier: HashMap<String, Arc<RgbaImage>>,
+    target: Option<RenderTarget>,
+    debug_sizes: bool,
     next_capture_id: u64,
 }
 
@@ -365,8 +395,20 @@ impl ToplevelCaptureState {
             active: HashMap::new(),
             cache_by_card: HashMap::new(),
             cache_by_identifier: HashMap::new(),
+            target: None,
+            debug_sizes: std::env::var_os("VEILSHELL_DEBUG_RECENTS")
+                .is_some_and(|value| value == "1"),
             next_capture_id: 1,
         }
+    }
+
+    pub(crate) fn needs_capture(&self, target: RenderTarget) -> bool {
+        self.target != Some(target)
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.target = None;
+        self.cancel_all_active();
     }
 
     /// Populate any previously captured thumbnails onto `cards` and trigger fresh asynchronous
@@ -375,8 +417,10 @@ impl ToplevelCaptureState {
         &mut self,
         cards: &mut [RecentsCard],
         center: usize,
+        target: RenderTarget,
         qh: &QueueHandle<LayerApp>,
     ) {
+        self.target = Some(target);
         let range = capture_range(cards.len(), center);
         let visible_ids: HashSet<String> = cards[range.clone()]
             .iter()
@@ -409,6 +453,9 @@ impl ToplevelCaptureState {
         self.cancel_all_active();
 
         let (Some(source_mgr), Some(capture_mgr)) = (&self.source_mgr, &self.capture_mgr) else {
+            if self.debug_sizes && !range.is_empty() {
+                eprintln!("veilshell: recents capture protocols unavailable");
+            }
             return;
         };
 
@@ -417,6 +464,12 @@ impl ToplevelCaptureState {
             let Some((tl_obj_id, tl)) =
                 find_toplevel_for_card(card, &self.toplevels, &used_handles)
             else {
+                if self.debug_sizes {
+                    eprintln!(
+                        "veilshell: recents {}: no matching Wayland toplevel",
+                        card.id
+                    );
+                }
                 continue;
             };
             used_handles.insert(tl_obj_id);
@@ -515,21 +568,25 @@ impl ToplevelCaptureState {
         let card_id = cap.card_id.clone();
         let foreign_id = cap.foreign_id.clone();
 
-        let thumb = match (fmt, cap.pool.as_mut(), cap.buffer.as_ref()) {
+        let raw = match (fmt, cap.pool.as_mut(), cap.buffer.as_ref()) {
             (Some(pixel_fmt), Some(pool), Some(buf)) => buf.canvas(pool).and_then(|bytes| {
-                let raw = RgbaImage::from_wayland_shm(w, h, stride, bytes, pixel_fmt, flip_y)?;
-                if w <= THUMB_MAX_W && h <= THUMB_MAX_H {
-                    Some(Arc::new(raw))
-                } else {
-                    Some(Arc::new(raw.resize_fit(THUMB_MAX_W, THUMB_MAX_H)))
-                }
+                RgbaImage::from_wayland_shm(w, h, stride, bytes, pixel_fmt, flip_y)
             }),
             _ => None,
         };
 
         cap.cleanup_protocol();
 
-        let thumb = thumb?;
+        let target = self.target?;
+        let displayed = recents_preview_pixels(target, (w, h));
+        let thumb = Arc::new(cache_preview(raw?, displayed));
+        if self.debug_sizes {
+            let (dw, dh) = recents_preview_pixels(target, (thumb.width, thumb.height));
+            eprintln!(
+                "veilshell: recents {card_id}: source={w}x{h} cached={}x{} centered-card={dw}x{dh} (px)",
+                thumb.width, thumb.height
+            );
+        }
         self.cache_by_card
             .insert(card_id.clone(), Arc::clone(&thumb));
         if let Some(fid) = foreign_id {
@@ -604,4 +661,37 @@ fn find_toplevel_for_card<'a>(
         .iter()
         .find(|(&id, tl)| !used.contains(&id) && tl.app_id.eq_ignore_ascii_case(&card.app_id))
         .map(|(&id, tl)| (id, tl))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reference_tablet_cards_keep_their_physical_resolution() {
+        for size in [(1210, 807), (807, 1210)] {
+            assert_eq!(preview_cache_bounds(size), size);
+        }
+        let raw = RgbaImage::new(1280, 1920, vec![255; 1280 * 1920 * 4]).unwrap();
+        let cached = cache_preview(raw, (807, 1210));
+        assert_eq!((cached.width, cached.height), (807, 1210));
+    }
+
+    #[test]
+    fn cache_bounds_limit_large_cards_without_a_landscape_bias() {
+        assert_eq!(preview_cache_bounds((4096, 4096)), (1024, 1024));
+        assert_eq!(preview_cache_bounds((6144, 320)), (1536, 80));
+        assert_eq!(preview_cache_bounds((320, 6144)), (80, 1536));
+        let (w, h) = preview_cache_bounds((1650, 1290));
+        assert!(w * h <= MAX_PREVIEW_PIXELS);
+    }
+
+    #[test]
+    fn a_small_source_is_kept_without_resampling() {
+        let raw = RgbaImage::new(320, 200, vec![255; 320 * 200 * 4]).unwrap();
+        let id = raw.id();
+        let cached = cache_preview(raw, (1210, 807));
+        assert_eq!((cached.width, cached.height), (320, 200));
+        assert_eq!(cached.id(), id);
+    }
 }

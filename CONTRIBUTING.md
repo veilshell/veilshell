@@ -39,6 +39,12 @@ compositor harnesses:
    for sharp text and real installed app icons; set
    `VEILSHELL_TEST_RENDERER=software` or `wgpu` to test a specific backend.
 
+To diagnose soft Recents previews, start VeilShell with
+`VEILSHELL_DEBUG_RECENTS=1` and open Recents over real windows. The daemon logs
+the compositor's source buffer, cached image, and centered card sizes in
+physical pixels. Compare portrait and landscape at the same output scale.
+Demo snapshots exercise the layout, not window capture quality.
+
 ## Great Starting Areas ("Good First Issues")
 
 - **Hardware profiles (`hardware-profiles/`):** Add a TOML quirk file for your

@@ -25,7 +25,7 @@ pub use primitives::{
     DrawCommand, DrawList, HitRect, HitRegion, HitTarget, ImageQuad, RenderTarget, RgbaImage,
     RoundedRect, SceneOutput, ShmPixelFormat, TextAlign, TextLabel,
 };
-pub use recents::recents_stride;
+pub use recents::{recents_preview_pixels, recents_stride};
 pub use scene::{
     build_scene, build_scene_layout, build_top_strip_scene, default_demo_apps, home_page_count,
     home_reveal_travel, AppTile, RecentsCard, SceneContext,

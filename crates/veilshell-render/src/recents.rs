@@ -6,8 +6,8 @@ use veilshell_core::{Rgba, ThemePalette};
 
 use crate::scene::push_bottom_pill_bar;
 use crate::{
-    font, HitRect, HitTarget, ImageQuad, RecentsCard, RoundedRect, SceneContext, SceneOutput,
-    TextAlign,
+    font, HitRect, HitTarget, ImageQuad, RecentsCard, RenderTarget, RoundedRect, SceneContext,
+    SceneOutput, TextAlign,
 };
 
 const SCALE: f32 = 0.63;
@@ -16,6 +16,22 @@ const LANDSCAPE_OVERLAP: f32 = 0.25;
 const LANDSCAPE_DEPTH: f32 = 0.08;
 const APP_ICON: f32 = 48.0;
 const LABEL_GAP: f32 = 12.0;
+
+fn fit_preview((max_w, max_h): (f32, f32), (w, h): (u32, u32)) -> (f32, f32) {
+    let (w, h) = (w.max(1) as f32, h.max(1) as f32);
+    let fit = (max_w / w).min(max_h / h);
+    (w * fit, h * fit)
+}
+
+/// Physical size of a centered preview, rounded up to cover its footprint.
+/// Use the centered size for neighbors too, so they're sharp when swiped into place.
+#[must_use]
+pub fn recents_preview_pixels(target: RenderTarget, source: (u32, u32)) -> (u32, u32) {
+    let (w, h) = target.logical_size();
+    let (w, h) = fit_preview((w as f32 * SCALE, h as f32 * SCALE), source);
+    let scale = target.pixel_scale();
+    ((w * scale.x).ceil() as u32, (h * scale.y).ceil() as u32)
+}
 
 /// The travel required to move the overview by one centered window.
 #[must_use]
@@ -125,8 +141,7 @@ impl DeckLayout {
         let max_w = self.width * scale;
         let max_h = self.height * scale;
         let (w, h) = card.thumbnail.as_ref().map_or((max_w, max_h), |thumb| {
-            let fit = (max_w / thumb.width as f32).min(max_h / thumb.height as f32);
-            (thumb.width as f32 * fit, thumb.height as f32 * fit)
+            fit_preview((max_w, max_h), (thumb.width, thumb.height))
         });
         let rect = HitRect::new(center_x - w * 0.5, center_y - h * 0.5, w, h);
         if rect.x + rect.w <= 0.0 || rect.x >= self.width {
@@ -236,5 +251,26 @@ impl DeckLayout {
             palette.foreground.with_alpha(self.progress),
             TextAlign::Left,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_footprint_uses_physical_pixels_in_both_orientations() {
+        let landscape = RenderTarget::new((1280, 853), (1920, 1280)).unwrap();
+        let portrait = RenderTarget::new((853, 1280), (1280, 1920)).unwrap();
+        let unscaled = RenderTarget::unscaled(853, 1280).unwrap();
+        assert_eq!(recents_preview_pixels(landscape, (1920, 1280)), (1210, 807));
+        assert_eq!(recents_preview_pixels(portrait, (1280, 1920)), (807, 1210));
+        assert_eq!(recents_preview_pixels(unscaled, (1280, 1920)), (538, 807));
+    }
+
+    #[test]
+    fn preview_footprint_fits_the_window_aspect_before_scaling_to_pixels() {
+        let target = RenderTarget::new((960, 640), (1920, 1280)).unwrap();
+        assert_eq!(recents_preview_pixels(target, (600, 900)), (538, 807));
     }
 }
