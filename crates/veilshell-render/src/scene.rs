@@ -1088,12 +1088,12 @@ fn build_osk(
     );
 
     let rows = ctx.osk_state.rows();
-    let pad = 12.0;
-    let gap = 8.0;
+    let pad = 12.0_f32.min(height * 0.045);
     let row_count = rows.len().max(1);
+    let gap = 8.0_f32.min((height - pad * 2.0) / (row_count as f32 * 5.0));
     let row_h = ((height - pad * 2.0 - gap * (row_count.saturating_sub(1)) as f32)
         / row_count as f32)
-        .max(28.0);
+        .max(1.0);
 
     for (r_idx, row) in rows.iter().enumerate() {
         let y = pad + r_idx as f32 * (row_h + gap);
@@ -1105,7 +1105,8 @@ fn build_osk(
         for key in row {
             let kw = unit_w * key.width_units;
             let active_mod = (key.id == "shf" && ctx.osk_state.shift != ShiftState::Off)
-                || (key.id == "ctl" && ctx.osk_state.ctrl);
+                || (key.id == "ctl" && ctx.osk_state.ctrl)
+                || (key.id == "term" && ctx.osk_state.terminal);
             let highlighted = key.is_accent || active_mod;
             let fill = if highlighted {
                 palette.accent.with_alpha(0.90)
@@ -1125,11 +1126,16 @@ fn build_osk(
                     0.08,
                 ),
             );
+            let label_scale = if kw < 50.0 && key.label.len() > 2 {
+                1
+            } else {
+                2
+            };
             out.draw_list.push_text(
                 cursor_x + kw * 0.5,
-                y + (row_h - 14.0) * 0.5,
-                key.label,
-                2,
+                y + (row_h - 7.0 * label_scale as f32) * 0.5,
+                crate::font::fit_text(key.label, label_scale, kw - 4.0),
+                label_scale,
                 fg,
                 TextAlign::Center,
             );

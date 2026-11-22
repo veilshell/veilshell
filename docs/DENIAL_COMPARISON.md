@@ -76,8 +76,8 @@ using the [parity spec](DENIAL_PARITY_SPEC.md).
 | Feature | Denial | VeilShell Status | Current VeilShell Implementation / Gap Notes |
 |---|---|---|---|
 | Built-in Touch OSK (`input-method-v2` + `virtual-keyboard-v1`) | Native mobile/tablet keyboard | **Done** | Multi-layer (`Letters`, `Numbers`, `Symbols`, Shift/Caps/Ctrl), `ContentPurpose` auto-layer switching, auto-pop on text focus in Tablet Mode, swipe-down dismiss. |
-| Key Press Visual Feedback, Key Repeat & Long-Press Accents | Standard touch keyboard ergonomics | **Missing** | Tapping a key emits input immediately, but lacks pressed-key highlight popups, hold-to-repeat on Backspace/arrows, and long-press accented characters / international layouts. |
-| Arrow / Escape / Tab Utility Row (Terminal Mode) | Tablet/Linux terminal ergonomics | **Missing** | High value for Linux users running `foot`/`ghostty`/`nvim` on a tablet without a keyboard. |
+| Key Press Visual Feedback, Key Repeat & Long-Press Accents | Standard touch keyboard ergonomics | **Partial** | Hold Backspace or an arrow for 400 ms to repeat. Pressed-key popups, accents and international layouts remain open. |
+| Arrow / Escape / Tab Utility Row (Terminal Mode) | Tablet/Linux terminal ergonomics | **Done** | `TERM` toggles a utility row while retaining the alphabetic keys. A terminal input hint enables it automatically. |
 
 ### 6. Rendering, Theming & Visual Polish
 

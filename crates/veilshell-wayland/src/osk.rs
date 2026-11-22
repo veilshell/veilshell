@@ -4,6 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use smithay_client_toolkit::dispatch2::Dispatch2;
 use smithay_client_toolkit::reexports::client::globals::GlobalList;
@@ -18,7 +19,7 @@ use smithay_client_toolkit::reexports::protocols_misc::zwp_virtual_keyboard_v1::
 use smithay_client_toolkit::reexports::protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
 
 use veilshell_core::{OskEmit, OskLayer, US_QWERTY_XKB_KEYMAP};
-use veilshell_render::SceneKind;
+use veilshell_render::{HitRect, SceneKind};
 
 use crate::client::LayerApp;
 
@@ -74,28 +75,45 @@ impl Dispatch2<ZwpInputMethodV2, LayerApp> for InputMethodData {
     ) {
         match event {
             zwp_input_method_v2::Event::Activate => {
+                state.cancel_osk_drag();
+                state.osk.pending_layout = None;
                 state.osk.im_pending_active = true;
             }
             zwp_input_method_v2::Event::Deactivate => {
+                state.cancel_osk_drag();
+                state.osk.pending_layout = None;
                 state.osk.im_pending_active = false;
             }
-            zwp_input_method_v2::Event::ContentType {
-                hint: _,
-                purpose:
+            zwp_input_method_v2::Event::ContentType { purpose, .. } => {
+                let layer = match purpose {
                     WEnum::Value(
                         ContentPurpose::Number | ContentPurpose::Digits | ContentPurpose::Phone,
-                    ),
-            } => {
-                state.renderer.context_mut().osk_state.layer = OskLayer::Numbers;
-            }
-            zwp_input_method_v2::Event::ContentType { .. } => {
-                state.renderer.context_mut().osk_state.layer = OskLayer::Letters;
+                    ) => OskLayer::Numbers,
+                    _ => OskLayer::Letters,
+                };
+                let terminal = purpose == WEnum::Value(ContentPurpose::Terminal);
+                state.osk.pending_layout = Some((layer, terminal));
             }
             zwp_input_method_v2::Event::Done => {
                 state.osk.im_serial = state.osk.im_serial.wrapping_add(1);
                 let was_active = state.osk.im_active;
                 let now_active = state.osk.im_pending_active;
                 state.osk.im_active = now_active;
+                let layout_dirty =
+                    state
+                        .osk
+                        .pending_layout
+                        .take()
+                        .is_some_and(|(layer, terminal)| {
+                            let osk = &mut state.renderer.context_mut().osk_state;
+                            let changed = osk.layer != layer || osk.terminal != terminal;
+                            osk.layer = layer;
+                            osk.terminal = terminal;
+                            if changed {
+                                state.cancel_osk_drag();
+                            }
+                            changed
+                        });
                 if now_active
                     && !was_active
                     && state.visible
@@ -110,9 +128,12 @@ impl Dispatch2<ZwpInputMethodV2, LayerApp> for InputMethodData {
                 {
                     state.osk.auto_opened = false;
                     state.show_scene(SceneKind::Pill, false);
+                } else if layout_dirty && state.active_scene == SceneKind::Osk {
+                    state.draw_overlay();
                 }
             }
             zwp_input_method_v2::Event::Unavailable => {
+                state.cancel_osk_drag();
                 state.osk.input_method = None;
                 state.osk.im_pending_active = false;
                 state.osk.im_active = false;
@@ -120,6 +141,44 @@ impl Dispatch2<ZwpInputMethodV2, LayerApp> for InputMethodData {
             }
             _ => {}
         }
+    }
+}
+
+pub(crate) struct OskRepeat {
+    label: &'static str,
+    key: HitRect,
+    deadline: Option<Instant>,
+    pub(crate) fired: bool,
+}
+
+impl OskRepeat {
+    pub(crate) fn new(now: Instant, label: &'static str, key: HitRect) -> Self {
+        Self {
+            label,
+            key,
+            deadline: Some(now + Duration::from_millis(400)),
+            fired: false,
+        }
+    }
+
+    pub(crate) fn position(&mut self, x: f32, y: f32) {
+        if !self.key.contains(x, y) {
+            self.deadline = None;
+        }
+    }
+
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    pub(crate) fn tick(&mut self, now: Instant) -> Option<&'static str> {
+        if now < self.deadline? {
+            return None;
+        }
+        self.fired = true;
+        // Do not catch up a burst if the compositor or renderer was busy.
+        self.deadline = Some(now + Duration::from_millis(55));
+        Some(self.label)
     }
 }
 
@@ -134,6 +193,7 @@ pub(crate) struct OskWaylandState {
     pub(crate) im_active: bool,
     pub(crate) im_serial: u32,
     pub(crate) auto_opened: bool,
+    pending_layout: Option<(OskLayer, bool)>,
     key_seq: u32,
 }
 
@@ -156,6 +216,7 @@ impl OskWaylandState {
             im_active: false,
             im_serial: 0,
             auto_opened: false,
+            pending_layout: None,
             key_seq: 1,
         }
     }
@@ -273,4 +334,32 @@ fn upload_xkb_keymap(vk: &ZwpVirtualKeyboardV1) -> Option<()> {
     // format = 1 corresponds to `wl_keyboard::keymap_format::xkb_v1`.
     vk.keymap(1, file.as_fd(), len);
     Some(())
+}
+
+#[cfg(test)]
+mod repeat_tests {
+    use super::*;
+
+    #[test]
+    fn hold_delays_its_first_stroke_and_does_not_catch_up() {
+        let now = Instant::now();
+        let mut repeat = OskRepeat::new(now, "del", HitRect::new(0.0, 0.0, 50.0, 50.0));
+        assert_eq!(repeat.tick(now + Duration::from_millis(399)), None);
+        assert!(!repeat.fired);
+        assert_eq!(repeat.tick(now + Duration::from_millis(400)), Some("del"));
+        assert_eq!(repeat.tick(now + Duration::from_secs(3)), Some("del"));
+        assert_eq!(repeat.tick(now + Duration::from_secs(3)), None);
+        assert!(repeat.fired);
+    }
+
+    #[test]
+    fn leaving_the_key_cancels_repeat_even_if_the_finger_returns() {
+        let now = Instant::now();
+        let mut repeat = OskRepeat::new(now, "left", HitRect::new(0.0, 0.0, 50.0, 50.0));
+        repeat.position(60.0, 20.0);
+        repeat.position(20.0, 20.0);
+        assert_eq!(repeat.deadline(), None);
+        assert_eq!(repeat.tick(now + Duration::from_secs(1)), None);
+        assert!(!repeat.fired);
+    }
 }

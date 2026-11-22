@@ -78,6 +78,9 @@ veilctl quit             # Stop the daemon cleanly
 ./scripts/test-headless-hyprland.sh /tmp/veilshell-hypr-test
 ```
 
+In the on-screen keyboard, tap **TERM** for Escape, Tab and the arrow keys.
+Hold Backspace or an arrow to repeat.
+
 For Omarchy users, optional instant theme-hook (`adapters/omarchy/hooks/30-veilshell-theme`)
 and `systemd --user` (`adapters/omarchy/systemd/veilshell.service`) integration guides live in [`adapters/omarchy/README.md`](adapters/omarchy/README.md).
 For SDDM, see the [standalone session preview](adapters/session/README.md).

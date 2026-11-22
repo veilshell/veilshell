@@ -979,6 +979,32 @@ mod tests {
     }
 
     #[test]
+    fn terminal_keys_fit_in_a_compact_osk() {
+        let mut ctx = SceneContext::default();
+        ctx.osk_state.terminal = true;
+        let out = build_scene_layout(
+            SceneKind::Osk,
+            390.0,
+            172.0,
+            &ThemePalette::default_dark(),
+            &ctx,
+        );
+        assert!(out.hit_regions.iter().all(|region| {
+            let rect = region.rect;
+            rect.w > 0.0 && rect.h > 0.0 && rect.x + rect.w <= 390.1 && rect.y + rect.h <= 172.1
+        }));
+        assert!(out
+            .hit_regions
+            .iter()
+            .any(|region| region.target == HitTarget::OskKey { label: "up" }));
+        assert!(out
+            .draw_list
+            .commands
+            .iter()
+            .any(|command| matches!(command, DrawCommand::Text(label) if label.text == "TERM")));
+    }
+
+    #[test]
     fn rgba_image_resize_and_shm_conversion() {
         // Xrgb8888 little-endian [B, G, R, X] -> straight RGBA [R, G, B, 255]
         let xrgb_bytes = [

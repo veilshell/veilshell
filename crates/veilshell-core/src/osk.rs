@@ -29,6 +29,9 @@ pub enum OskKeyAction {
     Space,
     ArrowLeft,
     ArrowRight,
+    ArrowUp,
+    ArrowDown,
+    ToggleTerminal,
     ToggleShift,
     ToggleCtrl,
     SwitchLayer(OskLayer),
@@ -69,17 +72,30 @@ pub struct OskState {
     pub layer: OskLayer,
     pub shift: ShiftState,
     pub ctrl: bool,
+    pub terminal: bool,
 }
 
 impl OskState {
-    /// Build the 4 key rows for the current [`OskLayer`] and [`ShiftState`].
+    /// Build the key rows for the current layout and optional terminal shortcuts.
     #[must_use]
     pub fn rows(self) -> Vec<Vec<OskKeySpec>> {
         match self.layer {
-            OskLayer::Letters => self.letters_rows(),
+            OskLayer::Letters => {
+                let mut rows = self.letters_rows();
+                if self.terminal {
+                    rows.insert(0, terminal_utility_row());
+                }
+                rows
+            }
             OskLayer::Numbers => numbers_rows(),
             OskLayer::Symbols => symbols_rows(),
         }
+    }
+
+    /// Whether a held key should emit repeating, balanced key strokes.
+    #[must_use]
+    pub fn can_repeat(key_id: &str) -> bool {
+        matches!(key_id, "del" | "left" | "right" | "up" | "down")
     }
 
     /// Process tapping key `key_id` and emit the resulting text or virtual-key event.
@@ -104,6 +120,10 @@ impl OskState {
             }
             OskKeyAction::ToggleCtrl => {
                 self.ctrl = !self.ctrl;
+                OskEmit::None
+            }
+            OskKeyAction::ToggleTerminal => {
+                self.terminal = !self.terminal;
                 OskEmit::None
             }
             OskKeyAction::SwitchLayer(next) => {
@@ -151,6 +171,8 @@ impl OskState {
             OskKeyAction::Escape => self.emit_special(1),
             OskKeyAction::ArrowLeft => self.emit_special(105),
             OskKeyAction::ArrowRight => self.emit_special(106),
+            OskKeyAction::ArrowUp => self.emit_special(103),
+            OskKeyAction::ArrowDown => self.emit_special(108),
             OskKeyAction::Dismiss => OskEmit::Dismiss,
         }
     }
@@ -231,6 +253,7 @@ impl OskState {
                 false,
             ),
             mod_key("ctl", "CTL", 1.1, OskKeyAction::ToggleCtrl),
+            mod_key("term", "TERM", 1.55, OskKeyAction::ToggleTerminal),
             char_key(",", ",", ','),
             action_key("space", "SPACE", 4.0, OskKeyAction::Space, false),
             char_key(".", ".", '.'),
@@ -240,6 +263,53 @@ impl OskState {
 
         vec![row0, row1, row2, row3]
     }
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_row_sends_shortcuts_without_leaving_letters() {
+        let mut osk = OskState::default();
+        assert_eq!(osk.press("up"), OskEmit::None);
+        assert_eq!(osk.press("term"), OskEmit::None);
+        assert!(osk.terminal);
+        assert_eq!(osk.layer, OskLayer::Letters);
+        for (id, evdev_code) in [
+            ("esc", 1),
+            ("tab", 15),
+            ("left", 105),
+            ("up", 103),
+            ("down", 108),
+            ("right", 106),
+        ] {
+            assert_eq!(
+                osk.press(id),
+                OskEmit::SpecialKey {
+                    evdev_code,
+                    ctrl: false
+                }
+            );
+        }
+        osk.press("term");
+        assert!(!osk.terminal);
+        assert_eq!(osk.press("down"), OskEmit::None);
+    }
+}
+
+fn terminal_utility_row() -> Vec<OskKeySpec> {
+    [
+        ("esc", "ESC", OskKeyAction::Escape),
+        ("tab", "TAB", OskKeyAction::Tab),
+        ("left", "<-", OskKeyAction::ArrowLeft),
+        ("up", "UP", OskKeyAction::ArrowUp),
+        ("down", "DOWN", OskKeyAction::ArrowDown),
+        ("right", "->", OskKeyAction::ArrowRight),
+    ]
+    .into_iter()
+    .map(|(id, label, action)| action_key(id, label, 1.0, action, false))
+    .collect()
 }
 
 fn numbers_rows() -> Vec<Vec<OskKeySpec>> {

@@ -30,7 +30,7 @@ use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_han
 
 use veilshell_core::{
     classify_bottom_pill, GestureAction, GestureSample, GestureThresholds, Orientation, OskEmit,
-    Spring, SpringParams, ThemePalette,
+    OskState, Spring, SpringParams, ThemePalette,
 };
 use veilshell_render::power::{PowerAction, PowerInput, PowerMenu};
 use veilshell_render::{
@@ -41,7 +41,7 @@ use veilshell_render::{
 use crate::capture::ToplevelCaptureState;
 #[cfg(feature = "wgpu")]
 use crate::gpu::WgpuWaylandSurface;
-use crate::osk::OskWaylandState;
+use crate::osk::{OskRepeat, OskWaylandState};
 use crate::{LayerRole, LayerSurfaceSpec, WaylandRuntimeConfig};
 
 /// Errors raised while connecting to or running the `Wayland` layer-shell client.
@@ -177,6 +177,7 @@ struct ActiveDrag {
     last_x: f32,
     last_y: f32,
     active_slider: Option<(&'static str, veilshell_render::HitRect)>,
+    osk_repeat: Option<OskRepeat>,
     start_time: Instant,
 }
 
@@ -456,6 +457,9 @@ impl LayerApp {
     }
 
     pub(crate) fn show_scene(&mut self, scene: SceneKind, animate: bool) {
+        if scene != self.active_scene {
+            self.cancel_osk_drag();
+        }
         if scene != SceneKind::Shade {
             if let Some(menu) = &mut self.renderer.context_mut().power_menu {
                 if !matches!(*menu, PowerMenu::Running(_)) {
@@ -517,6 +521,7 @@ impl LayerApp {
     fn set_visible(&mut self, visible: bool) {
         self.visible = visible;
         if !visible {
+            self.cancel_osk_drag();
             self.active_scene = SceneKind::Pill;
         }
         self.sync_surfaces();
@@ -715,6 +720,25 @@ impl LayerApp {
             }
         }
 
+        let now = Instant::now();
+        let osk_repeat = if kind == SurfaceKind::Overlay && self.active_scene == SceneKind::Osk {
+            self.overlay_layout.as_ref().and_then(|layout| {
+                layout
+                    .hit_regions
+                    .iter()
+                    .rev()
+                    .find_map(|hit| match hit.target {
+                        HitTarget::OskKey { label }
+                            if hit.rect.contains(x, y) && OskState::can_repeat(label) =>
+                        {
+                            Some(OskRepeat::new(now, label, hit.rect))
+                        }
+                        _ => None,
+                    })
+            })
+        } else {
+            None
+        };
         self.drag = Some(ActiveDrag {
             touch_id,
             surface: kind,
@@ -723,7 +747,8 @@ impl LayerApp {
             last_x: x,
             last_y: y,
             active_slider,
-            start_time: Instant::now(),
+            osk_repeat,
+            start_time: now,
         });
     }
 
@@ -736,6 +761,9 @@ impl LayerApp {
         }
         drag.last_x = x;
         drag.last_y = y;
+        if let Some(repeat) = &mut drag.osk_repeat {
+            repeat.position(x, y);
+        }
 
         match drag.surface {
             SurfaceKind::Pill => {
@@ -852,7 +880,7 @@ impl LayerApp {
                         self.show_scene(SceneKind::Pill, false);
                         return;
                     }
-                    if dist < 24.0 {
+                    if dist < 24.0 && !drag.osk_repeat.is_some_and(|repeat| repeat.fired) {
                         self.handle_overlay_tap(drag.last_x, drag.last_y);
                     } else {
                         self.draw_overlay();
@@ -1010,17 +1038,55 @@ impl LayerApp {
             }
             HitTarget::Power(input) => self.handle_power_input(input),
             HitTarget::PowerPanel => {}
-            HitTarget::OskKey { label } => match self.renderer.context_mut().osk_state.press(label)
-            {
-                OskEmit::Dismiss => {
-                    self.osk.auto_opened = false;
-                    self.show_scene(SceneKind::Pill, false);
-                }
-                emit => {
-                    self.osk.emit(emit, &self.qh);
-                    self.draw_overlay();
-                }
-            },
+            HitTarget::OskKey { label } => self.press_osk_key(label),
+        }
+    }
+
+    fn press_osk_key(&mut self, label: &'static str) {
+        let state = &mut self.renderer.context_mut().osk_state;
+        let previous = *state;
+        let action = state.press(label);
+        let changed = *state != previous;
+        if action == OskEmit::Dismiss {
+            self.osk.auto_opened = false;
+            self.show_scene(SceneKind::Pill, false);
+        } else {
+            self.osk.emit(action, &self.qh);
+            if changed {
+                self.draw_overlay();
+            }
+        }
+    }
+
+    pub(crate) fn cancel_osk_drag(&mut self) {
+        if self.active_scene == SceneKind::Osk {
+            self.drag = None;
+        }
+    }
+
+    fn osk_repeat_timeout(&self) -> Option<Duration> {
+        if self.active_scene != SceneKind::Osk {
+            return None;
+        }
+        self.drag
+            .as_ref()?
+            .osk_repeat
+            .as_ref()?
+            .deadline()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    fn tick_osk_repeat(&mut self) {
+        if self.active_scene != SceneKind::Osk {
+            return;
+        }
+        if let Some(key) = self
+            .drag
+            .as_mut()
+            .and_then(|drag| drag.osk_repeat.as_mut())
+            .and_then(|repeat| repeat.tick(Instant::now()))
+        {
+            self.press_osk_key(key);
         }
     }
 
@@ -1223,8 +1289,11 @@ pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
 
     while !app.exit {
         event_loop
-            .dispatch(None, &mut app)
+            .dispatch(app.osk_repeat_timeout(), &mut app)
             .map_err(|e| WaylandError::Runtime(e.to_string()))?;
+        if !app.exit {
+            app.tick_osk_repeat();
+        }
     }
 
     app.capture.destroy();
@@ -1360,6 +1429,9 @@ impl LayerShellHandler for LayerApp {
         let Some(kind) = self.surface_kind(layer.wl_surface()) else {
             return;
         };
+        if kind == SurfaceKind::Overlay {
+            self.cancel_osk_drag();
+        }
 
         let surf = match kind {
             SurfaceKind::Pill => self.pill.as_mut(),
@@ -1439,11 +1511,25 @@ impl SeatHandler for LayerApp {
         capability: Capability,
     ) {
         if capability == Capability::Pointer {
+            if self
+                .drag
+                .as_ref()
+                .is_some_and(|drag| drag.touch_id.is_none())
+            {
+                self.cancel_osk_drag();
+            }
             if let Some(pointer) = self.pointer.take() {
                 pointer.release();
             }
         }
         if capability == Capability::Touch {
+            if self
+                .drag
+                .as_ref()
+                .is_some_and(|drag| drag.touch_id.is_some())
+            {
+                self.cancel_osk_drag();
+            }
             if let Some(touch) = self.touch.take() {
                 touch.release();
             }
@@ -1468,9 +1554,19 @@ impl PointerHandler for LayerApp {
             };
             let (x, y) = (event.position.0 as f32, event.position.1 as f32);
             match event.kind {
-                PointerEventKind::Press { .. } => self.begin_drag(None, kind, x, y),
+                PointerEventKind::Press { button: 0x110, .. } if self.drag.is_none() => {
+                    self.begin_drag(None, kind, x, y);
+                }
                 PointerEventKind::Motion { .. } => self.update_drag(None, x, y),
-                PointerEventKind::Release { .. } => self.finish_drag(None),
+                PointerEventKind::Release { button: 0x110, .. } => self.finish_drag(None),
+                PointerEventKind::Leave { .. }
+                    if self
+                        .drag
+                        .as_ref()
+                        .is_some_and(|drag| drag.touch_id.is_none()) =>
+                {
+                    self.cancel_osk_drag();
+                }
                 _ => {}
             }
         }

@@ -74,7 +74,8 @@
 #### Sprint 4B — Day-to-day tablet parity
 
 - [ ] Fullscreen split shade: edge of pull selects page; horizontal swipe switches Notifications and Quick Settings. Add actionable notification banners, history, dismissal, Do Not Disturb, and lock-screen privacy.
-- [ ] Keyboard hold-to-repeat for Backspace and arrows, terminal keys, long-press accents, and optional local suggestions that are disabled for sensitive fields.
+- [x] Keyboard hold-to-repeat for Backspace and arrows, and a terminal utility row with Escape, Tab and all four arrows.
+- [ ] Keyboard long-press accents and optional local suggestions that are disabled for sensitive fields.
 - [ ] Editable Home: reorder icons, create folders, persist layout, share a dock across pages, and open a separate alphabetical app drawer. Desktop launcher adds search, recents and physical-keyboard navigation.
 
 #### Sprint 4C — External displays

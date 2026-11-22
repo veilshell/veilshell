@@ -348,6 +348,7 @@ fn cmd_mode(arg: Option<&str>) -> ExitCode {
 fn cmd_snapshot(args: &[String]) -> ExitCode {
     let demo = args.iter().any(|a| a == "--demo");
     let power_menu = args.iter().any(|a| a == "--power-menu");
+    let terminal_osk = args.iter().any(|a| a == "--terminal-osk");
     let scene_name = parse_flag(args, "--scene").unwrap_or_else(|| "home".to_owned());
     let Some(scene) = SceneKind::parse_name(&scene_name) else {
         eprintln!("invalid --scene '{scene_name}' (expected: pill, home, recents, shade, osk)");
@@ -355,6 +356,10 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
     };
     if power_menu && (!demo || scene != SceneKind::Shade) {
         eprintln!("--power-menu requires --demo --scene shade");
+        return ExitCode::FAILURE;
+    }
+    if terminal_osk && (!demo || scene != SceneKind::Osk) {
+        eprintln!("--terminal-osk requires --demo --scene osk");
         return ExitCode::FAILURE;
     }
 
@@ -428,6 +433,7 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
     if power_menu {
         ctx.power_menu = Some(veilshell_render::power::PowerMenu::Actions);
     }
+    ctx.osk_state.terminal = terminal_osk;
     if !demo {
         let snap = LinuxHardware::auto_detect().snapshot();
         ctx.clock_text = current_clock_hhmm();
@@ -513,6 +519,7 @@ fn print_help() {
          \tsnapshot [OPTIONS]                Render an offscreen glassmorphic PNG snapshot\n\
          \t  --scene <pill|home|recents|shade|osk> --renderer <auto|wgpu|software> [--wallpaper <PNG>]\n\
          \t  --width <PX> --height <PX> --out <PATH> [--demo]\n\
+         \t  --power-menu | --terminal-osk    Preview a demo subview (shade or osk)\n\
          \thelp                              Print this help message",
         env!("CARGO_PKG_VERSION")
     );
