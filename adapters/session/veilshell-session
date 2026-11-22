@@ -37,6 +37,19 @@ lock_and_wait() {
     fail "Hyprland did not confirm the session lock"
 }
 
+locker_choice() {
+    local choice=${VEILSHELL_LOCKER:-}
+    local user_config=${XDG_CONFIG_HOME:-$HOME/.config}
+    if [[ -z $choice && $user_config == /* && -r $user_config/veilshell/locker ]]; then
+        IFS= read -r choice <"$user_config/veilshell/locker" || true
+    fi
+    case $choice in
+        native|veilshell-lock) printf '%s\n' native ;;
+        ""|hyprlock) printf '%s\n' hyprlock ;;
+        *) fail "unsupported locker setting: $choice (expected hyprlock or native)" ;;
+    esac
+}
+
 case ${1:-} in
     --publish-display)
         # Internal Hyprland startup hook. Publish inert data, not shell code.
@@ -50,6 +63,11 @@ case ${1:-} in
     --lock)
         require_session
         # Multiple lock requests must not queue a second locker after unlock.
+        if [[ $(locker_choice) == native ]]; then
+            exec flock --exclusive --nonblock --conflict-exit-code 0 --no-fork \
+                "$VEILSHELL_SESSION_DIR/locker.lock" \
+                veilshell-lock
+        fi
         exec flock --exclusive --nonblock --conflict-exit-code 0 --no-fork \
             "$VEILSHELL_SESSION_DIR/locker.lock" \
             hyprlock --config "$config_dir/hyprlock.conf" --grace 0 --immediate-render
@@ -139,10 +157,18 @@ elif (( $# != 0 )); then
     fail "usage: veilshell-session [--check]"
 fi
 
-for binary in Hyprland hyprctl hypridle hyprlock flock timeout systemctl veilshell veilctl veilshell-session; do
+locker_bin=$(locker_choice)
+if [[ $locker_bin == native ]]; then
+    locker_bin=veilshell-lock
+    required_configs=(hyprland.lua hypridle.conf)
+else
+    required_configs=(hyprland.lua hypridle.conf hyprlock.conf)
+fi
+
+for binary in Hyprland hyprctl hypridle "$locker_bin" flock timeout systemctl veilshell veilctl veilshell-session; do
     command -v "$binary" >/dev/null || fail "missing command: $binary"
 done
-for config in hyprland.lua hypridle.conf hyprlock.conf; do
+for config in "${required_configs[@]}"; do
     [[ -f $config_dir/$config && -r $config_dir/$config ]] || fail "missing config: $config_dir/$config"
 done
 if $check_only; then

@@ -1,0 +1,32 @@
+[package]
+name = "veilshell-lock"
+description = "Dedicated ext-session-lock-v1 touch and keyboard screen locker for VeilShell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "veilshell-lock"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+smithay-client-toolkit.workspace = true
+veilshell-core.workspace = true
+veilshell-lock-input.workspace = true
+veilshell-render = { path = "../veilshell-render", default-features = false }
+
+# Deny unsafe_code everywhere in this crate except the isolated PAM/POSIX FFI module.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"

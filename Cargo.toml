@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/veilshell-core",
     "crates/veilshell-lock-input",
+    "crates/veilshell-lock",
     "crates/veilshell-compositor",
     "crates/veilshell-hw",
     "crates/veilshell-theme",
@@ -22,6 +23,7 @@ authors = ["VeilShell Contributors"]
 [workspace.dependencies]
 ab_glyph = "0.2"
 veilshell-core = { path = "crates/veilshell-core" }
+veilshell-lock-input = { path = "crates/veilshell-lock-input" }
 veilshell-compositor = { path = "crates/veilshell-compositor" }
 veilshell-hw = { path = "crates/veilshell-hw" }
 veilshell-theme = { path = "crates/veilshell-theme" }

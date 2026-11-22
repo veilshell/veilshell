@@ -71,6 +71,10 @@ elif name == "hyprlock":
     log("hyprlock started")
     if os.getenv("TEST_POWER"):
         sys.exit(0)
+elif name == "veilshell-lock":
+    log("veilshell-lock started")
+    if os.getenv("TEST_POWER"):
+        sys.exit(0)
 elif name == "hyprctl":
     assert sys.argv[1:] == ["locked"]
     print("true" if os.getenv("TEST_LOCKED") else "false")
@@ -110,8 +114,8 @@ class SessionTests(unittest.TestCase):
         mock.write_text(MOCK)
         mock.chmod(0o755)
         for name in (
-            "Hyprland", "hyprctl", "hypridle", "hyprlock", "systemctl", "veilshell", "veilctl",
-            "xdg-settings", "gtk-launch", "xdg-terminal-exec", "xdg-open",
+            "Hyprland", "hyprctl", "hypridle", "hyprlock", "veilshell-lock", "systemctl",
+            "veilshell", "veilctl", "xdg-settings", "gtk-launch", "xdg-terminal-exec", "xdg-open",
         ):
             (bindir / name).symlink_to(mock)
         (bindir / COMMAND.name).symlink_to(COMMAND)
@@ -286,6 +290,19 @@ class SessionTests(unittest.TestCase):
         result = self.run_launcher("--power", "suspend")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("suspended", self.log.read_text())
+
+
+    def test_native_locker_opt_in_runs_veilshell_lock(self):
+        self.publish_session()
+        self.env["VEILSHELL_LOCKER"] = "native"
+        self.assertEqual(self.run_launcher("--check").returncode, 0)
+        with subprocess.Popen([COMMAND, "--lock"], env=self.env) as locker:
+            try:
+                self.wait_for("veilshell-lock started")
+                self.assertEqual(self.run_launcher("--lock").returncode, 0)
+                self.assertEqual(self.log.read_text().count("veilshell-lock started"), 1)
+            finally:
+                locker.terminate()
 
 
 if __name__ == "__main__":

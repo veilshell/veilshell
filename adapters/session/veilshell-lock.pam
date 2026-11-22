@@ -1,0 +1,4 @@
+#%PAM-1.0
+# Reference PAM stack for veilshell-lock (install to /etc/pam.d/veilshell-lock).
+auth      include   system-local-login
+account   include   system-local-login
