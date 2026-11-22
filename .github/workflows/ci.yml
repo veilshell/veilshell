@@ -33,7 +33,7 @@ jobs:
       - name: Tier 1 — Unit tests
         run: cargo test --workspace
       - name: Standalone session launcher tests
-        run: python3 scripts/test-session.py
+        run: python3 scripts/test-session.py && python3 scripts/test-session-services.py
       - name: Tier 2 — Offscreen visual snapshots
         run: ./scripts/test-snapshots.sh /tmp/veilshell-ci-snapshots
       - name: Upload visual snapshot artifacts

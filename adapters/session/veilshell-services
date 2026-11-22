@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""Session-scoped daily-driver desktop services supervisor for VeilShell.
+
+Starts available XDG desktop portals, a polkit authentication agent, and a
+Wayland notification daemon inside the standalone VeilShell session's isolated
+environment, without mutating systemd --user activation state or leaking
+processes after logout.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+
+ALL_SERVICES = ("portals", "polkit", "notifications")
+
+DEFAULT_LIBEXEC_DIRS = (
+    "/usr/lib",
+    "/usr/libexec",
+    "/usr/lib/xdg-desktop-portal",
+    "/usr/lib/hyprpolkitagent",
+    "/usr/lib/polkit-gnome",
+    "/usr/lib/mate-polkit",
+    "/usr/lib/polkit-kde",
+    "/usr/libexec/polkit-gnome",
+)
+
+POLKIT_CANDIDATES = (
+    "hyprpolkitagent",
+    "polkit-gnome-authentication-agent-1",
+    "polkit-kde-authentication-agent-1",
+    "polkit-mate-authentication-agent-1",
+    "lxqt-policykit-agent",
+)
+
+NOTIFICATION_CANDIDATES = (
+    "mako",
+    "swaync",
+    "dunst",
+    "fnott",
+)
+
+
+def fail(msg: str) -> None:
+    print(f"veilshell-services: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def verify_session() -> None:
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+    session_dir = os.environ.get("VEILSHELL_SESSION_DIR", "")
+    display = os.environ.get("WAYLAND_DISPLAY", "")
+    signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    if not (
+        runtime.startswith("/")
+        and session_dir.startswith("/")
+        and display
+        and signature
+    ):
+        fail("not running inside a standalone VeilShell session")
+    display_file = Path(session_dir) / "display"
+    try:
+        lines = display_file.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        fail("missing standalone session display handshake")
+    if lines != [display, signature]:
+        fail("display does not match the standalone VeilShell session")
+
+
+def config_path() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME", "")
+    base = Path(xdg) if xdg.startswith("/") else Path.home() / ".config"
+    return base / "veilshell" / "services.conf"
+
+
+def parse_config() -> tuple[set[str], dict[str, str]]:
+    """Return (enabled_services, overrides)."""
+    overrides: dict[str, str] = {}
+    env_spec = os.environ.get("VEILSHELL_SERVICES", "").strip()
+    enabled: set[str] = set(ALL_SERVICES)
+
+    cfg = config_path()
+    file_services: list[str] = []
+    if cfg.is_file():
+        try:
+            for raw in cfg.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, val = (part.strip() for part in line.split("=", 1))
+                    if key in ("polkit_agent", "notification_daemon") and val:
+                        overrides[key] = val
+                else:
+                    file_services.append(line.lower())
+        except OSError:
+            pass
+
+    if file_services:
+        if "none" in file_services:
+            enabled = set()
+        elif "all" in file_services:
+            enabled = set(ALL_SERVICES)
+        else:
+            enabled = {s for s in file_services if s in ALL_SERVICES}
+
+    if env_spec:
+        tokens = [t.strip().lower() for t in env_spec.split(",") if t.strip()]
+        if "none" in tokens:
+            enabled = set()
+        elif "all" in tokens:
+            enabled = set(ALL_SERVICES)
+        else:
+            enabled = {t for t in tokens if t in ALL_SERVICES}
+
+    if os.environ.get("VEILSHELL_POLKIT_AGENT"):
+        overrides["polkit_agent"] = os.environ["VEILSHELL_POLKIT_AGENT"]
+    if os.environ.get("VEILSHELL_NOTIFICATION_DAEMON"):
+        overrides["notification_daemon"] = os.environ["VEILSHELL_NOTIFICATION_DAEMON"]
+
+    return enabled, overrides
+
+
+def search_dirs() -> list[Path]:
+    dirs: list[Path] = []
+    custom = os.environ.get("VEILSHELL_SERVICES_BIN_DIRS", "")
+    if custom:
+        for entry in custom.split(os.pathsep):
+            if entry:
+                dirs.append(Path(entry))
+    else:
+        for entry in DEFAULT_LIBEXEC_DIRS:
+            dirs.append(Path(entry))
+    return dirs
+
+
+def find_executable(name_or_path: str) -> str | None:
+    if "/" in name_or_path:
+        path = Path(name_or_path)
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+        return None
+    for directory in search_dirs():
+        candidate = directory / name_or_path
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return shutil.which(name_or_path)
+
+
+def discover_services(
+    enabled: set[str], overrides: dict[str, str]
+) -> dict[str, list[list[str]]]:
+    plan: dict[str, list[list[str]]] = {
+        "portals_backends": [],
+        "portals_frontend": [],
+        "polkit": [],
+        "notifications": [],
+    }
+
+    if "portals" in enabled:
+        for backend in ("xdg-desktop-portal-hyprland", "xdg-desktop-portal-gtk"):
+            exe = find_executable(backend)
+            if exe:
+                plan["portals_backends"].append([exe])
+        frontend = find_executable("xdg-desktop-portal")
+        if frontend:
+            plan["portals_frontend"].append([frontend, "--replace"])
+
+    if "polkit" in enabled:
+        if "polkit_agent" in overrides:
+            exe = find_executable(overrides["polkit_agent"])
+            if exe:
+                plan["polkit"].append([exe])
+        else:
+            for candidate in POLKIT_CANDIDATES:
+                exe = find_executable(candidate)
+                if exe:
+                    plan["polkit"].append([exe])
+                    break
+
+    if "notifications" in enabled:
+        if "notification_daemon" in overrides:
+            exe = find_executable(overrides["notification_daemon"])
+            if exe:
+                plan["notifications"].append([exe])
+        else:
+            for candidate in NOTIFICATION_CANDIDATES:
+                exe = find_executable(candidate)
+                if exe:
+                    plan["notifications"].append([exe])
+                    break
+
+    return plan
+
+
+def print_check() -> int:
+    enabled, overrides = parse_config()
+    plan = discover_services(enabled, overrides)
+    print(f"enabled: {', '.join(sorted(enabled)) if enabled else 'none'}")
+    backends = [cmd[0] for cmd in plan["portals_backends"]]
+    frontend = [cmd[0] for cmd in plan["portals_frontend"]]
+    polkit = [cmd[0] for cmd in plan["polkit"]]
+    notif = [cmd[0] for cmd in plan["notifications"]]
+    print(f"portals.backends: {', '.join(backends) if backends else 'none'}")
+    print(f"portals.frontend: {', '.join(frontend) if frontend else 'none'}")
+    print(f"polkit: {', '.join(polkit) if polkit else 'none'}")
+    print(f"notifications: {', '.join(notif) if notif else 'none'}")
+    return 0
+
+
+def spawn(cmd: list[str]) -> subprocess.Popen[bytes] | None:
+    try:
+        return subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+    except OSError as exc:
+        print(f"veilshell-services: failed to start {cmd[0]}: {exc}", file=sys.stderr)
+        return None
+
+
+def terminate_children(children: list[subprocess.Popen[bytes]]) -> None:
+    for proc in children:
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+    deadline = time.monotonic() + 2.5
+    while time.monotonic() < deadline:
+        if all(proc.poll() is not None for proc in children):
+            break
+        time.sleep(0.05)
+    for proc in children:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=0.5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def main() -> int:
+    if len(sys.argv) == 2 and sys.argv[1] == "--check":
+        return print_check()
+    if len(sys.argv) != 1:
+        fail("usage: veilshell-services [--check]")
+
+    verify_session()
+    enabled, overrides = parse_config()
+    if not enabled:
+        return 0
+
+    plan = discover_services(enabled, overrides)
+    children: list[subprocess.Popen[bytes]] = []
+    stopping = False
+
+    def handle_stop(_signum: int, _frame: object) -> None:
+        nonlocal stopping
+        stopping = True
+
+    signal.signal(signal.SIGTERM, handle_stop)
+    signal.signal(signal.SIGINT, handle_stop)
+    signal.signal(signal.SIGHUP, handle_stop)
+
+    try:
+        # Start portal backends first so xdg-desktop-portal discovers them immediately.
+        for cmd in plan["portals_backends"]:
+            proc = spawn(cmd)
+            if proc is not None:
+                children.append(proc)
+        if plan["portals_backends"] and plan["portals_frontend"]:
+            time.sleep(0.15)
+        for cmd in plan["portals_frontend"]:
+            proc = spawn(cmd)
+            if proc is not None:
+                children.append(proc)
+        for cmd in plan["polkit"]:
+            proc = spawn(cmd)
+            if proc is not None:
+                children.append(proc)
+        for cmd in plan["notifications"]:
+            proc = spawn(cmd)
+            if proc is not None:
+                children.append(proc)
+
+        if not children:
+            return 0
+
+        while not stopping:
+            if all(proc.poll() is not None for proc in children):
+                break
+            time.sleep(0.25)
+    finally:
+        terminate_children(children)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
