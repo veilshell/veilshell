@@ -73,12 +73,12 @@ impl ThemePalette {
     pub fn default_dark() -> Self {
         Self {
             name: "veilshell-dark".into(),
-            background: Rgba::from_rgb_u8(11, 17, 32),
-            surface: Rgba::from_rgb_u8(24, 34, 56).with_alpha(0.72),
-            foreground: Rgba::from_rgb_u8(241, 245, 249),
-            muted: Rgba::from_rgb_u8(148, 163, 184),
-            accent: Rgba::from_rgb_u8(156, 121, 219),
-            error: Rgba::from_rgb_u8(248, 113, 113),
+            background: Rgba::from_rgb_u8(15, 17, 21),
+            surface: Rgba::from_rgb_u8(20, 23, 29).with_alpha(0.75),
+            foreground: Rgba::from_rgb_u8(244, 239, 244),
+            muted: Rgba::from_rgb_u8(202, 196, 208),
+            accent: Rgba::from_rgb_u8(208, 188, 255),
+            error: Rgba::from_rgb_u8(255, 107, 107),
         }
     }
 

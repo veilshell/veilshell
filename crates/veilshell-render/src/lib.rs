@@ -23,7 +23,7 @@ pub use primitives::{
 };
 pub use scene::{
     build_scene, build_scene_layout, build_top_strip_scene, default_demo_apps, home_page_count,
-    AppTile, RecentsCard, SceneContext, HOME_APPS_PER_PAGE,
+    AppTile, RecentsCard, SceneContext,
 };
 pub use software::SdfSoftwareRenderer;
 
@@ -618,9 +618,10 @@ mod tests {
 
     #[test]
     fn home_hit_test_resolves_app_tiles_and_pager_dots() {
-        let mut ctx = SceneContext::default();
-        let mut extra = ctx.home_apps.clone();
-        ctx.home_apps.append(&mut extra);
+        let ctx = SceneContext {
+            home_apps: (0..4).flat_map(|_| default_demo_apps()).collect(),
+            ..SceneContext::default()
+        };
         let out = build_scene_layout(
             SceneKind::Home,
             1280.0,
@@ -653,6 +654,86 @@ mod tests {
             ),
             Some(&HitTarget::HomePage { page: 1 })
         );
+    }
+
+    #[test]
+    fn home_grid_uses_viewport_dimensions_for_paging() {
+        let mut ctx = SceneContext {
+            home_apps: (0..12).flat_map(|_| default_demo_apps()).collect(),
+            ..SceneContext::default()
+        };
+        let dimensions = [(1280.0, 853.0), (853.0, 1280.0), (390.0, 518.0)];
+        assert!(
+            home_page_count(&ctx.home_apps, 390.0, 518.0)
+                > home_page_count(&ctx.home_apps, 1280.0, 853.0)
+        );
+        for (width, height) in dimensions {
+            let total = home_page_count(&ctx.home_apps, width, height);
+            let mut rendered_indices = Vec::new();
+            for page in 0..total {
+                ctx.home_page = page;
+                let scene = build_scene_layout(
+                    SceneKind::Home,
+                    width,
+                    height,
+                    &ThemePalette::default_dark(),
+                    &ctx,
+                );
+                let mut has_active_dot = false;
+                for region in scene.hit_regions {
+                    assert!(region.rect.x >= 0.0 && region.rect.y >= 0.0);
+                    assert!(region.rect.x + region.rect.w <= width + 0.01);
+                    assert!(region.rect.y + region.rect.h <= height + 0.01);
+                    match region.target {
+                        HitTarget::LaunchApp { index } => rendered_indices.push(index),
+                        HitTarget::HomePage { page: dot } => has_active_dot |= dot == page,
+                        _ => {}
+                    }
+                }
+                assert!(
+                    has_active_dot,
+                    "page {page} should remain visible in the pager"
+                );
+            }
+            assert!(rendered_indices.into_iter().eq(0..ctx.home_apps.len()));
+        }
+    }
+
+    #[test]
+    fn empty_home_does_not_offer_demo_apps() {
+        let ctx = SceneContext {
+            home_apps: Vec::new(),
+            home_page: 9,
+            ..SceneContext::default()
+        };
+        let scene = build_scene_layout(
+            SceneKind::Home,
+            390.0,
+            518.0,
+            &ThemePalette::default_dark(),
+            &ctx,
+        );
+        assert!(scene.hit_regions.iter().all(|region| !matches!(
+            region.target,
+            HitTarget::LaunchApp { .. } | HitTarget::HomePage { .. }
+        )));
+        assert!(scene.draw_list.commands.iter().any(
+            |command| matches!(command, DrawCommand::Text(label) if label.text == "No applications found")
+        ));
+    }
+
+    #[test]
+    fn compact_home_keeps_labels_that_fit() {
+        let scene = build_scene_layout(
+            SceneKind::Home,
+            390.0,
+            518.0,
+            &ThemePalette::default_dark(),
+            &SceneContext::default(),
+        );
+        assert!(scene.draw_list.commands.iter().any(
+            |command| matches!(command, DrawCommand::Text(label) if label.text == "Terminal")
+        ));
     }
 
     #[test]

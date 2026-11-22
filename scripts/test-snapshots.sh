@@ -10,13 +10,16 @@ cargo build --manifest-path "$REPO_ROOT/Cargo.toml" --bin veilctl
 VEILCTL="$REPO_ROOT/target/debug/veilctl"
 
 for scene in home shade recents pill osk; do
-    "$VEILCTL" snapshot --scene "$scene" --out "$OUT_DIR/$scene-landscape.png"
+    "$VEILCTL" snapshot --demo --scene "$scene" --out "$OUT_DIR/$scene-landscape.png"
 done
 
 # Portrait Surface Go 3 logical resolution (853x1280)
 for scene in home shade recents; do
-    "$VEILCTL" snapshot --scene "$scene" --width 853 --height 1280 --out "$OUT_DIR/$scene-portrait.png"
+    "$VEILCTL" snapshot --demo --scene "$scene" --width 853 --height 1280 --out "$OUT_DIR/$scene-portrait.png"
 done
+
+# A compact Home viewport exercises pagination with the 12 demo apps.
+"$VEILCTL" snapshot --demo --scene home --width 390 --height 518 --out "$OUT_DIR/home-compact.png"
 
 echo "All Tier 2 snapshots generated in $OUT_DIR"
 ls -lh "$OUT_DIR"

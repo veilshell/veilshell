@@ -414,7 +414,11 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
         parse_flag(args, "--out").unwrap_or_else(|| format!("veilshell-{}.png", scene.as_str())),
     );
 
-    let palette = load_best_available();
+    let palette = if demo {
+        veilshell_core::ThemePalette::default_dark()
+    } else {
+        load_best_available()
+    };
     let mut ctx = SceneContext::default();
     if !demo {
         let snap = LinuxHardware::auto_detect().snapshot();
@@ -426,10 +430,7 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
         ctx.night_light = snap.night_light;
         ctx.brightness_pct = snap.brightness_pct;
         ctx.volume_pct = snap.volume_pct;
-        let discovered = discover_desktop_apps();
-        if !discovered.is_empty() {
-            ctx.home_apps = apps_to_tiles(&discovered);
-        }
+        ctx.home_apps = apps_to_tiles(&discover_desktop_apps());
     }
 
     let mut renderer = match ActiveRenderer::new(renderer_pref, ctx) {

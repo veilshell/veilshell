@@ -2,6 +2,9 @@
 
 > **Context:** VeilShell is inspired by **[Denial](https://github.com/denialwm/denial)** (`denialwm/denial`) and is designed to run either as a zero-interference Laptop ↔ Tablet overlay inside an existing desktop session **or as a standalone bootable Wayland session** (via SDDM / `greetd` / display manager). When booting directly into VeilShell without a full desktop shell behind it, VeilShell must cover every day-to-day shell responsibility that Denial provides out of the box.
 
+For pinned source references, distinguish Denial's mobile and desktop profiles
+using the [parity spec](DENIAL_PARITY_SPEC.md).
+
 ## Architectural Difference at a Glance
 
 | Dimension | Denial (`denialwm/denial`) | VeilShell (`veilshell/veilshell`) |
@@ -30,8 +33,8 @@
 | Feature | Denial | VeilShell Status | Current VeilShell Implementation / Gap Notes |
 |---|---|---|---|
 | Bottom gesture pill & swipe navigation | Built-in touch/trackpad gestures & spring animations | **Done** | Critically damped springs (`veilshell-core::spring`), bottom pill flick/swipe gestures (`Home`, `Recents`, adjacent workspace), top pull handle for `Shade`. |
-| Home application launcher | Built-in app drawer / launcher with icons | **Done** | Paged `.desktop` grid (`Home`) with freedesktop `PNG` icon resolution, priority pinning, and glass badge fallback (`veilshell-shell::apps`). |
-| Home app search / instant filter | Built-in launcher search | **Missing** | Currently requires swiping across pages when 50–100+ `.desktop` apps are installed; needs a top search bar integrated with Touch OSK. |
+| Home application launcher | Mobile paged Home with editable slots and a separate all-apps drawer | **Partial** | Responsive paged `.desktop` grid with freedesktop `PNG` icons and a badge fallback. No editable layout, folders, widgets, or separate drawer. |
+| App search / instant filter | Search in the desktop launcher | **Missing** | VeilShell requires browsing pages to find an app. A search surface should accept both physical keyboard and touch input. |
 | Live Recents / Window Overview | Live Wayland surfaces inside overview | **Partial** | Captures live thumbnails via `ext-foreign-toplevel-list-v1` + `ext-image-copy-capture-v1` with tap-to-focus & `X`-to-close, **but** currently caps visible cards at `3` (`scene.rs`) without horizontal carousel scrolling or swipe-up-to-close gesture. |
 | Portrait / Landscape & Auto-Rotation | Responsive mobile/tablet layout + rotation | **Done** | `iio-sensor-proxy` (`monitor-sensor --accel`) + Rotation Lock + dynamic `wl_output`/configure resize handling across landscape & portrait layouts. |
 | Split-screen / Side-by-side touch snapping | Native compositor tiling/stacking/scrolling layouts | **Partial** | Delegated to host compositor (`Hyprland`), but VeilShell does not yet expose a touch drag-to-split affordance from `Recents`. |

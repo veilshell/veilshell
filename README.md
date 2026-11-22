@@ -86,6 +86,7 @@ and `systemd --user` (`adapters/omarchy/systemd/veilshell.service`) integration 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — Crate boundaries, `calloop` multi-surface runtime, and verification pyramid
 - [docs/ROADMAP.md](docs/ROADMAP.md) — Full project plan, resolved architectural decisions, and phased milestones
 - [docs/DENIAL_COMPARISON.md](docs/DENIAL_COMPARISON.md) — Feature parity audit vs. Denial (`denialwm/denial`) & standalone boot-session checklist
+- [docs/DENIAL_PARITY_SPEC.md](docs/DENIAL_PARITY_SPEC.md) — Pinned upstream visual reference, implementation gaps, and SDDM acceptance gates
 - [docs/PERFORMANCE_BUDGET.md](docs/PERFORMANCE_BUDGET.md) — Hard CPU, RAM, and frame-time budgets on 5W tablets
 - [docs/HARDWARE_PROFILES.md](docs/HARDWARE_PROFILES.md) — Adding declarative TOML profiles for new tablets
 - [docs/PORTING_A_COMPOSITOR.md](docs/PORTING_A_COMPOSITOR.md) — Implementing `CompositorBackend` for Niri, Sway, River, etc.

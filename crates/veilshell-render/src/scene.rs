@@ -112,7 +112,7 @@ impl Default for SceneContext {
     }
 }
 
-/// Built-in 12 placeholder tiles used when no `.desktop` apps are injected.
+/// Placeholder tiles for deterministic demo scenes only.
 #[must_use]
 pub fn default_demo_apps() -> Vec<AppTile> {
     [
@@ -140,13 +140,88 @@ pub fn default_demo_apps() -> Vec<AppTile> {
     .collect()
 }
 
-/// Number of application tiles rendered per page on `Home`.
-pub const HOME_APPS_PER_PAGE: usize = 12;
-
-/// Compute total page count (`>= 1`) for the given app slice.
+/// Compute total page count (`>= 1`) for the current Home viewport.
 #[must_use]
-pub fn home_page_count(apps: &[AppTile]) -> usize {
-    apps.len().div_ceil(HOME_APPS_PER_PAGE).max(1)
+pub fn home_page_count(apps: &[AppTile], width: f32, height: f32) -> usize {
+    HomeGrid::new(width, height).page_count(apps.len())
+}
+
+const HOME_FOREGROUND: Rgba = Rgba::from_rgb_u8(247, 247, 248);
+const HOME_BACKGROUND: Rgba = Rgba::from_rgb_u8(7, 9, 16);
+const HOME_GRID_GAP: f32 = 22.0;
+const PAGER_RESERVE: f32 = 28.0;
+
+struct HomeGrid {
+    columns: usize,
+    rows: usize,
+    inset: f32,
+    top: f32,
+    cell_w: f32,
+    cell_h: f32,
+    bottom_row_y: f32,
+}
+
+impl HomeGrid {
+    fn new(width: f32, height: f32) -> Self {
+        let inset = 22.0_f32.min(width * 0.06);
+        let usable_w = width - inset * 2.0;
+        let gap = HOME_GRID_GAP;
+        let max_columns = ((usable_w + gap) / (64.0 + gap)).floor() as usize;
+        let columns = (((usable_w + gap) / (224.0 + gap)).ceil() as usize)
+            .clamp(4, 14)
+            .min(max_columns.max(1));
+        let cell_w = (usable_w - gap * (columns - 1) as f32) / columns as f32;
+        let top = 66.0_f32.min(height * 0.25);
+        let available_h = (height - top - 36.0_f32.min(height * 0.2)).max(1.0);
+        let min_cell_h = 131.0_f32.min(available_h);
+        let rows_h = (available_h - PAGER_RESERVE).max(min_cell_h);
+        let phone_h = cell_w / 0.78;
+        let preferred_h = if phone_h > 240.0 {
+            min_cell_h
+        } else {
+            phone_h.min((rows_h - gap * 2.0) / 3.0).max(min_cell_h)
+        };
+        let rows = (((rows_h + gap) / (preferred_h + gap)).floor() as usize).clamp(1, 16);
+        let cell_h = if phone_h > 240.0 && rows > 1 {
+            (rows_h - gap * (rows - 1) as f32) / rows as f32
+        } else {
+            preferred_h
+        };
+        Self {
+            columns,
+            rows,
+            inset,
+            top,
+            cell_w,
+            cell_h,
+            bottom_row_y: top + available_h - cell_h,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.columns * self.rows
+    }
+
+    fn page_count(&self, count: usize) -> usize {
+        count.div_ceil(self.capacity()).max(1)
+    }
+
+    fn row_y(&self, row: usize) -> f32 {
+        if self.rows > 1 && row == self.rows - 1 {
+            self.bottom_row_y
+        } else {
+            self.top + row as f32 * (self.cell_h + HOME_GRID_GAP)
+        }
+    }
+
+    fn pager_y(&self) -> f32 {
+        if self.rows > 1 {
+            let above = self.row_y(self.rows - 2) + self.cell_h.min(126.0);
+            f32::midpoint(above, self.bottom_row_y)
+        } else {
+            self.bottom_row_y + self.cell_h + 12.0
+        }
+    }
 }
 
 /// Build the draw list AND interactive hit-test regions for a given [`SceneKind`].
@@ -263,8 +338,8 @@ fn push_bottom_pill_bar(
     palette: &ThemePalette,
     ctx: &SceneContext,
 ) {
-    let pill_w = (width * 0.20).clamp(110.0, 240.0);
-    let pill_h = 6.0_f32;
+    let pill_w = 180.0_f32.min(width * 0.8);
+    let pill_h = 5.0_f32;
     let cx = width * 0.5 + ctx.pill_drag_x.clamp(-60.0, 60.0);
     let cy = (height - 12.0 + ctx.pill_drag_y.clamp(-14.0, 4.0)).max(6.0);
     let active = ctx.pill_drag_x.abs() > 2.0 || ctx.pill_drag_y.abs() > 2.0;
@@ -272,20 +347,16 @@ fn push_bottom_pill_bar(
     let fill = if active {
         palette.accent.with_alpha(0.95)
     } else {
-        palette.foreground.with_alpha(0.84)
+        Rgba::from_rgb_u8(138, 138, 138)
     };
-    list.push_rect(
-        RoundedRect::filled(
-            cx - pill_w * 0.5,
-            cy - pill_h * 0.5,
-            pill_w,
-            pill_h,
-            pill_h * 0.5,
-            fill,
-        )
-        .with_glass_border(Rgba::from_rgb_u8(255, 255, 255).with_alpha(0.32), 1.0, 0.20)
-        .with_shadow(6.0, 2.0, 0.35),
-    );
+    list.push_rect(RoundedRect::filled(
+        cx - pill_w * 0.5,
+        cy - pill_h * 0.5,
+        pill_w,
+        pill_h,
+        pill_h * 0.5,
+        fill,
+    ));
 }
 
 fn build_pill(
@@ -295,21 +366,6 @@ fn build_pill(
     palette: &ThemePalette,
     ctx: &SceneContext,
 ) {
-    let tray_w = (width * 0.26).clamp(150.0, 290.0);
-    let tray_h = (height - 6.0).clamp(16.0, 24.0);
-    let tray_x = (width - tray_w) * 0.5;
-    let tray_y = (height - tray_h) * 0.5;
-    out.draw_list.push_rect(
-        RoundedRect::filled(
-            tray_x,
-            tray_y,
-            tray_w,
-            tray_h,
-            tray_h * 0.5,
-            palette.surface.with_alpha(0.58),
-        )
-        .with_glass_border(palette.foreground.with_alpha(0.16), 1.0, 0.10),
-    );
     push_bottom_pill_bar(&mut out.draw_list, width, height, palette, ctx);
     out.push_hit(HitRect::new(0.0, 0.0, width, height), HitTarget::BottomPill);
 }
@@ -378,7 +434,6 @@ fn build_status_bar(
     );
 }
 
-#[allow(clippy::too_many_lines)]
 fn build_home(
     out: &mut SceneOutput,
     width: f32,
@@ -387,131 +442,146 @@ fn build_home(
     ctx: &SceneContext,
 ) {
     let progress = ctx.overlay_progress.clamp(0.0, 1.0);
-    let y_slide = (1.0 - progress) * 44.0;
-    push_glass_backdrop(&mut out.draw_list, width, height, palette, progress);
+    let y_slide = (1.0 - progress) * 24.0;
+    // A plain dark fallback also keeps the launcher legible over active windows.
+    // The GPU backdrop may substitute the configured, cached wallpaper.
+    let wallpaper_tint = HOME_BACKGROUND.with_alpha(progress);
+    out.draw_list.push_backdrop(wallpaper_tint, wallpaper_tint);
     out.push_hit(
         HitRect::new(0.0, 0.0, width, height),
         HitTarget::DismissOverlay,
     );
-    build_status_bar(
-        &mut out.draw_list,
-        width,
-        palette,
-        ctx,
-        y_slide * 0.25,
-        progress,
-    );
+    let fg = HOME_FOREGROUND.with_alpha(progress);
+    push_home_status(&mut out.draw_list, width, height, ctx, fg);
 
-    let apps: Vec<AppTile> = if ctx.home_apps.is_empty() {
-        default_demo_apps()
-    } else {
-        ctx.home_apps.clone()
-    };
-
-    let total_pages = home_page_count(&apps);
+    let apps = &ctx.home_apps;
+    let grid = HomeGrid::new(width, height);
+    let total_pages = grid.page_count(apps.len());
     let page = ctx.home_page.min(total_pages - 1);
-    let start_idx = page * HOME_APPS_PER_PAGE;
-    let end_idx = (start_idx + HOME_APPS_PER_PAGE).min(apps.len());
+    let start = page * grid.capacity();
+    let icon_box = 92.0_f32.min(grid.cell_w).min(grid.cell_h * 0.73);
+    let icon_size = 85.0_f32.min(icon_box);
 
-    let cols = if width >= height { 4_usize } else { 3_usize };
-    let rows = HOME_APPS_PER_PAGE.div_ceil(cols);
-
-    let grid_w = (width * 0.78).clamp(300.0, 920.0);
-    let grid_h = (height - 170.0).max(260.0);
-    let cell_w = grid_w / cols as f32;
-    let cell_h = (grid_h / rows as f32).min(170.0);
-    let start_x = (width - cell_w * cols as f32) * 0.5;
-    let start_y = 96.0 + (grid_h - cell_h * rows as f32).max(0.0) * 0.35 + y_slide;
-
-    for (slot_idx, app) in apps[start_idx..end_idx].iter().enumerate() {
-        let global_idx = start_idx + slot_idx;
-        let col = slot_idx % cols;
-        let row = slot_idx / cols;
-        let cx = start_x + (col as f32 + 0.5) * cell_w;
-        let cy = start_y + (row as f32 + 0.44) * cell_h;
-        let tile = (cell_w.min(cell_h) * 0.52).clamp(58.0, 96.0);
-        let tile_x = cx - tile * 0.5;
-        let tile_y = cy - tile * 0.5;
-
-        out.draw_list.push_rect(
-            RoundedRect::filled(
-                tile_x,
-                tile_y,
-                tile,
-                tile,
-                tile * 0.28,
-                mix(palette.surface, app.tint, 0.22).with_alpha(0.84 * progress),
-            )
-            .with_glass_border(app.tint.with_alpha(0.45 * progress), 1.5, 0.14 * progress)
-            .with_shadow(16.0, 8.0, 0.32 * progress),
-        );
-
-        let label = truncate_label(&app.label, 14);
+    for (slot, app) in apps.iter().skip(start).take(grid.capacity()).enumerate() {
+        let col = slot % grid.columns;
+        let row = slot / grid.columns;
+        let x = grid.inset + col as f32 * (grid.cell_w + HOME_GRID_GAP);
+        let y = grid.row_y(row) + y_slide;
+        let cx = x + grid.cell_w * 0.5;
+        let cy = y + icon_box * 0.5;
         if let Some(icon) = &app.icon {
-            let icon_size = (tile * 0.68).round();
+            let scale = icon_size / icon.width.max(icon.height) as f32;
+            let w = icon.width as f32 * scale;
+            let h = icon.height as f32 * scale;
             out.draw_list.push_image(ImageQuad {
-                x: cx - icon_size * 0.5,
-                y: cy - icon_size * 0.5,
-                w: icon_size,
-                h: icon_size,
-                radius: icon_size * 0.18,
+                x: cx - w * 0.5,
+                y: cy - h * 0.5,
+                w,
+                h,
+                radius: 0.0,
                 alpha: progress,
                 image: Arc::clone(icon),
             });
         } else {
-            let badge = truncate_label(&app.badge, 4);
+            out.draw_list.push_rect(
+                RoundedRect::filled(
+                    cx - icon_size * 0.5,
+                    cy - icon_size * 0.5,
+                    icon_size,
+                    icon_size,
+                    icon_size * 0.24,
+                    mix(HOME_BACKGROUND, app.tint, 0.28).with_alpha(progress),
+                )
+                .with_glass_border(
+                    HOME_FOREGROUND.with_alpha(0.15 * progress),
+                    1.0,
+                    0.0,
+                ),
+            );
             out.draw_list.push_text(
                 cx,
                 cy - 7.0,
-                badge,
+                crate::font::fit_text(&app.badge, 2, icon_size - 4.0),
                 2,
-                palette.foreground.with_alpha(progress),
+                fg,
                 TextAlign::Center,
             );
         }
+        if grid.cell_w >= 40.0 && grid.cell_h >= 44.0 {
+            out.draw_list.push_text(
+                cx,
+                y + icon_box + 9.0,
+                crate::font::fit_text(&app.label, 1, grid.cell_w - 4.0),
+                1,
+                fg,
+                TextAlign::Center,
+            );
+        }
+        out.push_hit(
+            HitRect::new(x, y, grid.cell_w, (icon_box + 30.0).min(grid.cell_h)),
+            HitTarget::LaunchApp {
+                index: start + slot,
+            },
+        );
+    }
+    if apps.is_empty() {
         out.draw_list.push_text(
-            cx,
-            cy + tile * 0.5 + 12.0,
-            label,
-            2,
-            palette.foreground.with_alpha(0.90 * progress),
+            width * 0.5,
+            height * 0.5,
+            "No applications found",
+            1,
+            fg,
             TextAlign::Center,
         );
+    } else if total_pages > 1 {
+        push_home_pager(out, width, grid.pager_y(), page, total_pages, progress);
+    }
+    push_bottom_pill_bar(&mut out.draw_list, width, height, palette, ctx);
+}
 
-        out.push_hit(
-            HitRect::new(tile_x - 10.0, tile_y - 6.0, tile + 20.0, tile + 38.0),
-            HitTarget::LaunchApp { index: global_idx },
+fn push_home_status(list: &mut DrawList, width: f32, height: f32, ctx: &SceneContext, fg: Rgba) {
+    if width >= 160.0 {
+        let y = 22.0_f32.min(height * 0.1);
+        list.push_text(22.0, y, &ctx.clock_text, 1, fg, TextAlign::Left);
+        list.push_text(
+            width - 22.0,
+            y,
+            format!("{}%", ctx.battery_pct),
+            1,
+            fg,
+            TextAlign::Right,
         );
     }
+}
 
-    // Page dots with generous touch hitboxes
-    let dot_y = height - 48.0;
-    let dots = total_pages.min(9);
-    let span = (dots.saturating_sub(1)) as f32 * 22.0;
-    for p in 0..dots {
-        let dot_cx = width * 0.5 - span * 0.5 + p as f32 * 22.0;
-        let active = p == page;
-        let radius = if active { 5.0 } else { 3.5 };
-        let col = if active {
-            palette.accent.with_alpha(progress)
-        } else {
-            palette.muted.with_alpha(0.55 * progress)
-        };
+fn push_home_pager(
+    out: &mut SceneOutput,
+    width: f32,
+    cy: f32,
+    page: usize,
+    total: usize,
+    progress: f32,
+) {
+    // Keep the current page visible when the catalog outgrows the indicator.
+    let dots = total.min(((width - 13.0) / 15.0) as usize).min(9);
+    let first = page.saturating_sub(dots / 2).min(total - dots);
+    let mut x = (width - (15.0 * dots as f32 + 13.0)) * 0.5;
+    for p in first..first + dots {
+        let (w, alpha) = if p == page { (20.0, 0.87) } else { (7.0, 0.33) };
         out.draw_list.push_rect(RoundedRect::filled(
-            dot_cx - radius,
-            dot_y - radius,
-            radius * 2.0,
-            radius * 2.0,
-            radius,
-            col,
+            x + 4.0,
+            cy - 3.5,
+            w,
+            7.0,
+            3.5,
+            HOME_FOREGROUND.with_alpha(alpha * progress),
         ));
         out.push_hit(
-            HitRect::new(dot_cx - 11.0, dot_y - 14.0, 22.0, 28.0),
+            HitRect::new(x, cy - 14.0, w + 8.0, 28.0),
             HitTarget::HomePage { page: p },
         );
+        x += w + 8.0;
     }
-
-    push_bottom_pill_bar(&mut out.draw_list, width, height, palette, ctx);
 }
 
 #[allow(clippy::too_many_lines)]

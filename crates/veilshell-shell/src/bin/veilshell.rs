@@ -573,11 +573,9 @@ fn main() -> ExitCode {
     let mut scene_ctx = SceneContext {
         clock_text: current_clock_hhmm(),
         tablet_mode: initial_visible,
+        home_apps: apps_to_tiles(&discovered),
         ..SceneContext::default()
     };
-    if !discovered.is_empty() {
-        scene_ctx.home_apps = apps_to_tiles(&discovered);
-    }
 
     let compositor = match HyprlandBackend::from_env().filter(HyprlandBackend::is_available) {
         Some(hypr) => ActiveCompositor::Hyprland(hypr),

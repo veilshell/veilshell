@@ -255,6 +255,44 @@ pub fn measure_text_width(text: &str, scale: u32) -> u32 {
     (count * GLYPH_ADVANCE - 1) * scale.max(1)
 }
 
+/// Fit a single line to the renderer's actual font advance, with a short ellipsis.
+pub(crate) fn fit_text(text: &str, scale: u32, width: f32) -> String {
+    let text = text.trim();
+    let advance = |value: &str| {
+        let Some(sys) = system_font() else {
+            return measure_text_width(value, scale) as f32;
+        };
+        let scaled = sys.font.as_scaled(PxScale::from(scale_to_px(scale)));
+        let mut sum = 0.0;
+        let mut previous = None;
+        for ch in value.chars() {
+            let id = sys.font.glyph_id(ch);
+            if id == GlyphId(0) && !ch.is_ascii_whitespace() {
+                continue;
+            }
+            sum += previous.map_or(0.0, |prev| scaled.kern(prev, id)) + scaled.h_advance(id);
+            previous = Some(id);
+        }
+        sum
+    };
+    if advance(text) <= width {
+        return text.to_owned();
+    }
+    let mut shortened = String::from("..");
+    if advance(&shortened) > width {
+        return String::new();
+    }
+    for ch in text.chars() {
+        let end = shortened.len() - 2;
+        shortened.insert(end, ch);
+        if advance(&shortened) > width {
+            shortened.remove(end);
+            break;
+        }
+    }
+    shortened
+}
+
 /// Return 7 rows of 5-bit masks (MSB = leftmost pixel) for an ASCII character.
 #[must_use]
 #[allow(clippy::too_many_lines)]

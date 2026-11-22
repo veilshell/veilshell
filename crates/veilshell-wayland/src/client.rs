@@ -554,6 +554,15 @@ impl LayerApp {
         if !surf.configured || surf.width == 0 || surf.height == 0 {
             return;
         }
+        if self.active_scene == SceneKind::Home {
+            let ctx = self.renderer.context_mut();
+            let total = veilshell_render::home_page_count(
+                &ctx.home_apps,
+                surf.width as f32,
+                surf.height as f32,
+            );
+            ctx.home_page = ctx.home_page.min(total - 1);
+        }
         self.renderer.context_mut().overlay_progress = if self.overlay_spring.is_settled() {
             1.0
         } else {
@@ -873,8 +882,14 @@ impl LayerApp {
 
                 // Horizontal swipe on Home flips pages
                 if self.active_scene == SceneKind::Home && dx.abs() >= 72.0 && dx.abs() > dy.abs() {
-                    let total =
-                        veilshell_render::home_page_count(&self.renderer.context().home_apps);
+                    let Some(surf) = &self.overlay else {
+                        return;
+                    };
+                    let total = veilshell_render::home_page_count(
+                        &self.renderer.context().home_apps,
+                        surf.width as f32,
+                        surf.height as f32,
+                    );
                     if dx < 0.0 && self.renderer.context().home_page + 1 < total {
                         self.renderer.context_mut().home_page += 1;
                     } else if dx > 0.0 && self.renderer.context().home_page > 0 {
@@ -922,12 +937,7 @@ impl LayerApp {
                 self.show_scene(SceneKind::Pill, false);
             }
             HitTarget::LaunchApp { index } => {
-                let apps = if self.renderer.context().home_apps.is_empty() {
-                    veilshell_render::default_demo_apps()
-                } else {
-                    self.renderer.context().home_apps.clone()
-                };
-                if let Some(app) = apps.get(index) {
+                if let Some(app) = self.renderer.context().home_apps.get(index) {
                     let exec = app.exec.clone();
                     self.handler
                         .on_action(ShellAction::LaunchApp { exec }, self.renderer.context_mut());
