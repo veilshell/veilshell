@@ -85,6 +85,18 @@ In a third stock SDDM login, an allowlisted Foot fixture opened on VeilShell's
 Wayland display and was gone on return to SDDM. The test fixture was removed
 afterward. Omarchy coexistence still needs its own login regression test.
 
+## Omarchy-style shortcuts in the SDDM guest
+
+The standalone profile was tested in a disposable clone of the Arch/KVM
+guest on Hyprland `0.57.2`, with no Omarchy installed. The updated session
+scripts and bindings used the guest's existing VeilShell preview binaries.
+SDDM login reached Home with software fallback; `Super+Enter` launched Foot
+and a standalone-only `Super+Shift+F` override launched a distinct Foot
+fixture. `Super+Ctrl+L` locked; the guest password unlocked; normal daemon
+exit removed the shell and returned to SDDM. This does not verify a real
+browser, file manager or web app, and does not replace the Omarchy coexistence
+test or physical Surface Go 3 validation.
+
 ## Integration gates
 
 Use the [first release checklist](ROADMAP.md#first-release) for overlay

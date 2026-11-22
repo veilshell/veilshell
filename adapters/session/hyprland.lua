@@ -16,8 +16,30 @@ hl.on("hyprland.start", function()
     hl.exec_cmd("veilshell-session --publish-display")
 end)
 
-hl.bind("SUPER + H", hl.dsp.exec_cmd("veilctl show home"))
-hl.bind("SUPER + R", hl.dsp.exec_cmd("veilctl show recents"))
-hl.bind("SUPER + S", hl.dsp.exec_cmd("veilctl show shade"))
-hl.bind("SUPER + L", hl.dsp.exec_cmd("veilshell-session --lock"))
-hl.bind("SUPER + SHIFT + E", hl.dsp.exec_cmd("veilctl quit"))
+local session_config = os.getenv("VEILSHELL_SESSION_CONFIG_DIR") or "/usr/share/veilshell/session"
+local user_config = (os.getenv("XDG_CONFIG_HOME") or (os.getenv("HOME") .. "/.config")) .. "/veilshell"
+local profile = "preview"
+local selection = io.open(user_config .. "/bindings.profile", "r")
+if selection then
+    profile = selection:read("*l")
+    selection:close()
+end
+
+if profile == "omarchy" then
+    dofile(session_config .. "/bindings-omarchy.lua")
+elseif profile == "preview" then
+    hl.bind("SUPER + H", hl.dsp.exec_cmd("veilctl show home"))
+    hl.bind("SUPER + R", hl.dsp.exec_cmd("veilctl show recents"))
+    hl.bind("SUPER + S", hl.dsp.exec_cmd("veilctl show shade"))
+    hl.bind("SUPER + L", hl.dsp.exec_cmd("veilshell-session --lock"))
+    hl.bind("SUPER + SHIFT + E", hl.dsp.exec_cmd("veilctl quit"))
+else
+    error("VeilShell bindings.profile must be 'preview' or 'omarchy'")
+end
+
+-- Explicitly opted-in standalone Lua, never the user's regular Hyprland tree.
+local overrides = io.open(user_config .. "/bindings.lua", "r")
+if overrides then
+    overrides:close()
+    dofile(user_config .. "/bindings.lua")
+end

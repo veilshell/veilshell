@@ -32,6 +32,7 @@ signal.signal(signal.SIGTERM, stop)
 
 if name == "Hyprland":
     if "--verify-config" in sys.argv:
+        assert Path(os.environ["VEILSHELL_SESSION_CONFIG_DIR"]) == Path(sys.argv[-1]).parent
         sys.exit(int(os.getenv("TEST_VERIFY_STATUS", "0")))
     if os.getenv("TEST_HYPR_FAIL"):
         sys.exit(1)
@@ -78,6 +79,15 @@ elif name == "systemctl":
     assert sys.argv[1:] == ["--no-ask-password", "suspend"]
     log("suspended")
     sys.exit(0)
+elif name == "xdg-settings":
+    assert sys.argv[1:] == ["get", "default-web-browser"]
+    print(os.getenv("TEST_BROWSER", "fixture-browser.desktop"))
+    sys.exit(0)
+elif name in ("gtk-launch", "xdg-terminal-exec", "xdg-open"):
+    assert os.environ["WAYLAND_DISPLAY"] == "isolated"
+    assert os.environ["HYPRLAND_INSTANCE_SIGNATURE"] == "private"
+    log(" ".join([name, *sys.argv[1:]]))
+    sys.exit(0)
 else:
     sys.exit(0)
 
@@ -100,7 +110,8 @@ class SessionTests(unittest.TestCase):
         mock.write_text(MOCK)
         mock.chmod(0o755)
         for name in (
-            "Hyprland", "hyprctl", "hypridle", "hyprlock", "systemctl", "veilshell", "veilctl"
+            "Hyprland", "hyprctl", "hypridle", "hyprlock", "systemctl", "veilshell", "veilctl",
+            "xdg-settings", "gtk-launch", "xdg-terminal-exec", "xdg-open",
         ):
             (bindir / name).symlink_to(mock)
         (bindir / COMMAND.name).symlink_to(COMMAND)
@@ -208,6 +219,29 @@ class SessionTests(unittest.TestCase):
         self.publish_session()
         self.env["HYPRLAND_INSTANCE_SIGNATURE"] = "omarchy"
         result = self.run_launcher("--power", "suspend")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("display does not match", result.stderr)
+        self.assertFalse(self.log.exists())
+
+    def test_app_shortcuts_run_in_the_standalone_environment(self):
+        self.publish_session()
+        for target, expected in (
+            ("terminal", "xdg-terminal-exec"),
+            ("browser", "gtk-launch fixture-browser.desktop"),
+            ("files", f"xdg-open {self.env['HOME']}"),
+        ):
+            result = self.run_launcher("--launch", target)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(expected, self.log.read_text().splitlines())
+
+    def test_app_shortcuts_reject_other_displays_and_invalid_desktop_ids(self):
+        self.publish_session()
+        self.env["TEST_BROWSER"] = "../invalid.desktop"
+        result = self.run_launcher("--launch", "browser")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no valid default browser", result.stderr)
+        self.env["HYPRLAND_INSTANCE_SIGNATURE"] = "omarchy"
+        result = self.run_launcher("--launch", "terminal")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("display does not match", result.stderr)
         self.assertFalse(self.log.exists())

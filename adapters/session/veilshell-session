@@ -54,6 +54,27 @@ case ${1:-} in
             "$VEILSHELL_SESSION_DIR/locker.lock" \
             hyprlock --config "$config_dir/hyprlock.conf" --grace 0 --immediate-render
         ;;
+    --launch)
+        require_session
+        case ${2:-} in
+            terminal)
+                for terminal in xdg-terminal-exec foot ghostty kitty alacritty; do
+                    if command -v "$terminal" >/dev/null; then
+                        exec "$terminal"
+                    fi
+                done
+                fail "no supported terminal found"
+                ;;
+            browser)
+                browser=$(xdg-settings get default-web-browser) || fail "could not find the default browser"
+                [[ $browser == *.desktop && $browser != -* && $browser != */* ]] ||
+                    fail "no valid default browser desktop entry"
+                exec gtk-launch "$browser"
+                ;;
+            files) exec xdg-open "$HOME" ;;
+            *) fail "launch target must be terminal, browser or files" ;;
+        esac
+        ;;
     --power)
         require_session
         case ${2:-} in
@@ -125,7 +146,7 @@ for config in hyprland.lua hypridle.conf hyprlock.conf; do
     [[ -f $config_dir/$config && -r $config_dir/$config ]] || fail "missing config: $config_dir/$config"
 done
 if $check_only; then
-    Hyprland --verify-config --config "$config_dir/hyprland.lua"
+    VEILSHELL_SESSION_CONFIG_DIR="$config_dir" Hyprland --verify-config --config "$config_dir/hyprland.lua"
     exit 0
 fi
 

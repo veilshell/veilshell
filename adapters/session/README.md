@@ -32,7 +32,7 @@ cargo build --release --bin veilshell --bin veilctl
 sudo install -Dm755 target/release/veilshell /usr/bin/veilshell
 sudo install -Dm755 target/release/veilctl /usr/bin/veilctl
 sudo install -Dm755 adapters/session/veilshell-session /usr/bin/veilshell-session
-sudo install -Dm644 -t /usr/share/veilshell/session adapters/session/{hyprland.lua,hypridle.conf,hyprlock.conf}
+sudo install -Dm644 -t /usr/share/veilshell/session adapters/session/{hyprland.lua,bindings-omarchy.lua,hypridle.conf,hyprlock.conf}
 veilshell-session --check
 sudo install -Dm644 adapters/session/veilshell.desktop /usr/share/wayland-sessions/veilshell.desktop
 ```
@@ -61,6 +61,47 @@ SDDM. After logging back into Omarchy, check that its layout, shortcuts,
 and services are unchanged. This is a separate compositor, not a VM: hardware
 settings (Wi-Fi, audio level, brightness) are shared, and the preview is not
 designed for simultaneous desktops under the same user account.
+
+## Optional Omarchy-style keybindings
+
+Set the first line of `$XDG_CONFIG_HOME/veilshell/bindings.profile` (normally
+`~/.config/veilshell/bindings.profile`) to `omarchy`, then run
+`veilshell-session --check` before logging in. Use `preview` or remove the
+profile file to restore the defaults. Neither profile loads Omarchy's Lua,
+autostart, shell, or UWSM.
+
+| Keys | Action |
+|---|---|
+| `Super+Space` | VeilShell Home, not the Omarchy menu or a searchable launcher |
+| `Super+Enter`, `Super+Shift+Enter` / `Super+Shift+B`, `Super+Shift+F` | Terminal, default browser, default file manager |
+| `Super+Q/W`, `Super+F`, `Super+T`, `Alt+Tab` / `Alt+Shift+Tab` | Close, fullscreen, toggle floating, cycle windows |
+| `Super+1–0`, add `Shift` to move, or `Shift+Alt` to send without following | Hyprland workspaces 1–10; not Omarchy's per-monitor numbering |
+| `Super+Tab` / `Super+Shift+Tab`, `Super+S` / `Super+Alt+S` | Cycle workspaces, toggle/send to scratchpad |
+| `Super+Ctrl+L` | Lock with Hyprlock |
+| `Super+Ctrl+Alt+R` / `Super+Ctrl+Alt+S` | VeilShell Recents / Quick Settings |
+| Volume, brightness and playback keys | `wpctl`, `brightnessctl` and `playerctl` where available |
+
+Log out from **Quick Settings → Power**. `Super+R` is left free for personal
+bindings, and `Super+Shift+E` no longer logs out in this profile. Terminal
+launch uses `xdg-terminal-exec` or an installed terminal. Browser launch uses
+`xdg-settings` and `gtk-launch`; file manager launch uses `xdg-open`.
+Applications that hand off to an existing process or require UWSM or portals
+may need a separate launcher. Installed web apps remain in Home if their
+desktop entries are discoverable; their shortcuts aren't imported.
+
+For personal bindings, add only the Lua you want to
+`$XDG_CONFIG_HOME/veilshell/bindings.lua` (normally under `~/.config`). It
+runs after the selected profile. Unbind a conflicting chord before binding
+it, for example:
+
+```lua
+hl.unbind("SUPER + SHIFT + F")
+hl.bind("SUPER + SHIFT + F", hl.dsp.exec_cmd("flea --gui"))
+```
+
+Re-run `veilshell-session --check` after edits. This profile does not port
+Omarchy-specific panels, launch-or-focus helpers, theme toggles, or resize
+submaps; personal Lua that depends on `o.*` needs to be adapted first.
 
 To remove the **session picker entry** without touching SDDM or other sessions:
 
