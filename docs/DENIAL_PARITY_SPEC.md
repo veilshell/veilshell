@@ -86,7 +86,8 @@ must not use an ordinary fullscreen layer surface to imitate secure locking.
    Surface Go. Offscreen CPU/GPU snapshots establish a baseline, not proof of
    live session or pixel parity.
 
-See [the feature comparison](DENIAL_COMPARISON.md) for the broader backlog.
+See [the feature comparison](DENIAL_COMPARISON.md) for the broader backlog and
+[the validation protocol](DENIAL_VALIDATION.md) for matched captures and VM evidence.
 
 [Mobile OSK]: https://github.com/denialwm/denial/blob/01b588ec50831bce9e57aed623901f49846ec791/plugins/denial_desktop/lib/src/widgets/osk/shell_osk_panel.dart
 [Phone and monitor]: https://github.com/denialwm/denial/blob/01b588ec50831bce9e57aed623901f49846ec791/docs/PHONE_AND_MONITOR.md

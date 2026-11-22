@@ -3,14 +3,15 @@
 > **Context:** VeilShell is inspired by **[Denial](https://github.com/denialwm/denial)** (`denialwm/denial`) and is designed to run either as a zero-interference Laptop ↔ Tablet overlay inside an existing desktop session **or as a standalone bootable Wayland session** (via SDDM / `greetd` / display manager). When booting directly into VeilShell without a full desktop shell behind it, VeilShell must cover every day-to-day shell responsibility that Denial provides out of the box.
 
 For pinned source references, distinguish Denial's mobile and desktop profiles
-using the [parity spec](DENIAL_PARITY_SPEC.md).
+using the [parity spec](DENIAL_PARITY_SPEC.md). See the
+[validation record](DENIAL_VALIDATION.md) for live evidence and known blockers.
 
 ## Architectural Difference at a Glance
 
 | Dimension | Denial (`denialwm/denial`) | VeilShell (`veilshell/veilshell`) |
 |---|---|---|
 | **Architecture** | Monolithic Wayland compositor (Rust + Smithay) embedding the **Flutter engine** directly in-process | Distro- & compositor-agnostic **pure-Rust `wlr-layer-shell` shell** (`smithay-client-toolkit` + `wgpu`) running over Hyprland (with Niri/Sway planned) |
-| **Rendering** | Flutter / Skia scene graph with live DMA-BUF window textures | Single-pass instanced `wgpu` Vulkan/GLES WGSL SDF renderer + shelf-packed GPU atlas + blur-once wallpaper cache + zero-`unsafe` CPU SDF fallback |
+| **Rendering** | Flutter Impeller GLES scene graph with live DMA-BUF window textures | Single-pass instanced `wgpu` Vulkan/GLES WGSL SDF renderer + shelf-packed GPU atlas + blur-once wallpaper cache + zero-`unsafe` CPU SDF fallback |
 | **Target Footprint** | Modern ARM64 phones/tablets & desktops | Older fanless **5W / 4–8 GB RAM** x86 & ARM tablets (`< 40 MiB` RSS, `0%` idle CPU in Laptop Mode) |
 | **Desktop Coexistence** | Replaces your compositor completely | Zero-interference overlay in Laptop Mode **or** optional standalone SDDM/`greetd` tablet session |
 | **License** | `GPL-3.0-or-later` | `GPL-3.0-or-later` |
@@ -43,7 +44,7 @@ using the [parity spec](DENIAL_PARITY_SPEC.md).
 
 | Feature | Denial | VeilShell Status | Current VeilShell Implementation / Gap Notes |
 |---|---|---|---|
-| Standalone Wayland session entry (`SDDM` / `greetd` / `.desktop`) | Ships as a standalone Wayland compositor session | **Partial** | [SDDM preview adapter](../adapters/session/README.md) starts a dedicated Hyprland and session-owned services; mock lifecycle tested. Real SDDM login, portals, autostart and packaging remain. |
+| Standalone Wayland session entry (`SDDM` / `greetd` / `.desktop`) | Ships as a standalone Wayland compositor session | **Partial** | [SDDM preview adapter](../adapters/session/README.md) starts a dedicated Hyprland. Real guest login/logout passed with software rendering forced; stock auto renderer, portals, autostart and packaging remain. |
 | Touch Lock Screen (`ext-session-lock-v1`) | Native lock screen with password/PIN, fingerprint, `logind` lock/unlock, `--start-locked`, and hidden sensitive notifications | **Missing** | **Critical for standalone boot.** Currently relies on external lockers (`hyprlock`, etc.) that lack touch PIN/OSK ergonomics. Needs `ext-session-lock-v1` + PAM auth + `logind` `PrepareForSleep`/Lock signal listener. |
 | Power Menu (Lock, Sleep, Reboot, Shutdown, Logout) | Integrated session power actions + power-button handling | **Partial** | Touch Power menu in the standalone preview, including confirmation and a lock check before Suspend. Physical power-button behavior and hardware smoke tests remain. |
 | Idle Management & DPMS / Screen Blank | Integrated `logind` + DPMS + Always-On Display / wake handling | **Partial** | The preview provides Hypridle lock, display blank and wake defaults; no always-on display, touchscreen unlock, or hardware sleep verification yet. |
@@ -84,7 +85,7 @@ using the [parity spec](DENIAL_PARITY_SPEC.md).
 
 | Feature | Denial | VeilShell Status | Current VeilShell Implementation / Gap Notes |
 |---|---|---|---|
-| GPU Glassmorphic Renderer | Flutter/Skia GPU compositing | **Done** | Single-pass instanced `wgpu` Vulkan/GLES WGSL SDF renderer + zero-copy `wgpu::Surface` Wayland swapchain + CPU SDF fallback (`--renderer auto\|wgpu\|software`). |
+| GPU Glassmorphic Renderer | Flutter Impeller GLES compositing | **Partial** | GPU Wayland presentation and software rendering work in nested tests; stock SDDM hit an EGL panic instead of falling back. Static wallpaper glass is not compositor refraction. |
 | TrueType / OpenType Typography | Native Skia text rendering | **Done** | `ab_glyph` system font atlas with automatic 5×7 HUD bitmap fallback. |
 | App Icons (PNG + SVG) | Full desktop icon rendering | **Done** | Freedesktop themes and installed PNG/SVG assets supply the launcher artwork. A letter badge is the fallback for a genuinely missing or unusable icon. |
 | Dynamic Theming & Wallpaper Accent Extraction | Light/dark themes + accent colors borrowed from wallpaper | **Partial** | Live Omarchy Aether `colors.toml` mtime watcher + WCAG AA dark fallback exist; missing automatic wallpaper-dominant-color accent extraction for non-Omarchy distros and a Light/Dark toggle. |

@@ -68,8 +68,11 @@
 - [x] Preview-only touch power menu with Lock, Suspend, Logout, Restart and Shut down. Confirm session-ending actions and refuse touch Suspend without compositor lock acknowledgment.
 - [ ] Verify lock-before-suspend, resume and real power actions on hardware.
 - [x] Interim Hyprlock password locker and Hypridle configuration scoped to the preview session.
+- [x] SDDM guest login and touch logout smoke test with a guest-only software override.
+- [ ] Verify stock SDDM login with automatic renderer selection in the guest.
 - [ ] Native Denial-style lock face: wallpaper, clock/date, swipe-up touch authentication, password fallback, PIN and optional fingerprint. Require compositor-enforced locking.
-- [ ] Arch Linux / AUR `PKGBUILD` (`packaging/arch/PKGBUILD`) and real SDDM login/logout smoke test.
+- [ ] Session-scoped desktop services: autostart, polkit prompts, file picker, and screen-sharing portals.
+- [ ] Arch Linux / AUR `PKGBUILD` (`packaging/arch/PKGBUILD`).
 
 #### Sprint 4B — Day-to-day tablet parity
 
@@ -77,6 +80,7 @@
 - [x] Responsive control center: Connectivity, Display & Sound, and Device sections, compacting to the available controls and using both columns in landscape.
 - [x] Denial-style Recents deck: frameless live window previews with app icon/name above each card, higher-resolution captures, swipe paging, and swipe-up-to-close.
 - [ ] Notification center: actionable banners, history, dismissal, and lock-screen privacy.
+- [ ] Touch Wi-Fi network selection and Bluetooth pairing, not just radio toggles.
 - [x] Keyboard hold-to-repeat for Backspace and arrows, and a terminal utility row with Escape, Tab and all four arrows.
 - [ ] Keyboard long-press accents and optional local suggestions that are disabled for sensitive fields.
 - [ ] Editable Home: reorder icons, create folders, persist layout, share a dock across pages, and open a separate alphabetical app drawer. Desktop launcher adds search, recents and physical-keyboard navigation.
@@ -88,7 +92,7 @@
 
 #### Release follow-up
 
-- See the [Denial parity reference](DENIAL_PARITY_SPEC.md) for upstream behavior, UI metrics and validation gates.
+- See the [Denial parity reference](DENIAL_PARITY_SPEC.md) for upstream behavior and UI metrics and the [validation protocol](DENIAL_VALIDATION.md) for matched capture and release gates.
 - [ ] Additional compositor backends (`Niri`, `Sway`) & community `hardware-profiles/*.toml`
 - [ ] Tier 3 frame-time & RSS performance budget assertions in CI
 - [ ] First tagged **`v0.1.0`** release
