@@ -11,6 +11,7 @@ use veilshell_core::{app_badge, parse_desktop_entry, DesktopApp, Rgba};
 use veilshell_render::{AppTile, RgbaImage};
 
 mod icons;
+pub(crate) use icons::decode_bitmap;
 mod xdg;
 
 use icons::IconLookup;

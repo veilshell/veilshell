@@ -304,7 +304,15 @@ if [[ ${VEILSHELL_TEST_STANDALONE:-0} == 1 ]]; then
     grep -x omarchy "$XDG_CONFIG_HOME/veilshell/bindings.profile"
     pointer 480 145
     wait_for "Settings restores the Desk panel immediately" desk_panel_reserved 44
+    # Wallpaper source is independent of the color preference; no host
+    # Omarchy files are visible in this fixture's XDG state directory.
     pointer 480 350
+    grep -x omarchy "$XDG_CONFIG_HOME/veilshell/theme.source"
+    pointer 480 215
+    grep -x Dusk "$XDG_CONFIG_HOME/veilshell/wallpaper.preset"
+    pointer 480 215
+    grep -x 'Omarchy wallpaper' "$XDG_CONFIG_HOME/veilshell/wallpaper.preset"
+    pointer 480 410
     wait_for "Settings Back returns to Quick Settings" in_scene shade
     [[ $("$BIN/veilctl" mode tablet) == "Mode set to Tablet "* ]]
     wait_for "Tablet removes desktop reservation" desk_panel_reserved 0

@@ -86,16 +86,7 @@ impl OmarchyAetherProvider {
     /// Resolve the standard `$HOME/.local/state/omarchy/current/theme/colors.toml` path.
     #[must_use]
     pub fn default_path() -> Option<PathBuf> {
-        let home = std::env::var_os("HOME")?;
-        Some(
-            PathBuf::from(home)
-                .join(".local")
-                .join("state")
-                .join("omarchy")
-                .join("current")
-                .join("theme")
-                .join("colors.toml"),
-        )
+        Some(omarchy_current_dir()?.join("theme/colors.toml"))
     }
 
     /// Return the configured `colors.toml` path.
@@ -103,6 +94,19 @@ impl OmarchyAetherProvider {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// Read-only Omarchy state directory, also used to locate the current wallpaper.
+#[must_use]
+pub fn omarchy_current_dir() -> Option<PathBuf> {
+    let absolute_var = |name| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    let state = absolute_var("XDG_STATE_HOME")
+        .or_else(|| absolute_var("HOME").map(|path| path.join(".local/state")))?;
+    Some(state.join("omarchy/current"))
 }
 
 impl ThemeProvider for OmarchyAetherProvider {

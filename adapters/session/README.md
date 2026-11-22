@@ -7,8 +7,8 @@ same VeilShell daemon used by the overlay, in Tablet Mode. You do not need
 this entry to run the [overlay](../../README.md#two-ways-to-run-one-shell).
 The preview does not load the user's normal Hyprland or Omarchy config,
 start global user targets, or publish over another desktop's activation
-environment. The daemon uses its built-in palette rather than syncing
-Omarchy's theme, and it does not invoke Omarchy's Night Light or notification
+environment. The daemon uses its built-in palette unless you opt into
+Omarchy colors in Settings. It does not invoke Omarchy's Night Light or notification
 helpers. The compositor also leaves the user's shared GSettings cursor
 preferences alone. VeilShell can still read installed apps and icon themes.
 
@@ -70,11 +70,15 @@ through its values:
 |---|---|
 | Startup mode | Tablet, Desk, or Automatic (follow supported keyboard detection). Takes effect at the next login. |
 | Desk panel | Show or hide the top pills immediately. Hiding the panel restores the pull handle, so Quick Settings stays reachable. |
-| Wallpaper | Midnight, Forest, or Dusk. Built-in gradients apply immediately behind windows and on Tablet Home. No photo picker yet. |
+| Wallpaper | Midnight, Forest, Dusk, or Omarchy wallpaper. Applies behind windows and on Tablet Home. Omarchy's selected PNG/JPEG is read at login and when selected; missing or unsupported images fall back to Midnight. No photo picker yet. |
+| Theme | VeilShell Dark or Omarchy colors. Applies to VeilShell surfaces, not app themes or Hyprland's window decorations. Missing colors fall back to VeilShell Dark. |
 | Shortcut profile | Preview or Omarchy-style. Takes effect at the next login; `bindings.lua` overrides still load last. |
 
 Preferences are stored under `$XDG_CONFIG_HOME/veilshell/`, normally
 `~/.config/veilshell/`. They do not change SDDM, Omarchy, or the overlay.
+The two Omarchy options are independent and only read `omarchy/current/background`
+and `omarchy/current/theme/colors.toml` under `$XDG_STATE_HOME` (normally
+`~/.local/state`). They do not launch Omarchy's shell or change its theme.
 This is the built-in shell Settings surface, not a replacement for a distro's
 display, input, network, or power management. Day-to-day controls remain in
 Quick Settings; full system settings pages and Welcome are future work.

@@ -38,21 +38,28 @@ impl ShellSession {
         matches!(self, Self::Standalone)
     }
 
-    /// Only the overlay follows the host desktop's palette, read-only.
+    /// Follow the host desktop's palette read-only, by default in the overlay and
+    /// only when selected in standalone Settings.
     #[must_use]
     pub fn palette(self) -> ThemePalette {
-        match self {
-            Self::Overlay => load_best_available(),
-            Self::Standalone => ThemePalette::default_dark(),
+        if self.follows_omarchy_colors() {
+            load_best_available()
+        } else {
+            ThemePalette::default_dark()
         }
+    }
+
+    fn follows_omarchy_colors(self) -> bool {
+        self == Self::Overlay
+            || crate::settings::directory()
+                .is_some_and(|dir| crate::settings::follows_omarchy_colors(&dir))
     }
 
     #[must_use]
     pub fn desktop_theme_path(self) -> Option<PathBuf> {
-        match self {
-            Self::Overlay => OmarchyAetherProvider::default_path(),
-            Self::Standalone => None,
-        }
+        self.follows_omarchy_colors()
+            .then(OmarchyAetherProvider::default_path)
+            .flatten()
     }
 }
 
@@ -76,14 +83,5 @@ mod tests {
             "wayland-3",
             "private-instance"
         ));
-    }
-
-    #[test]
-    fn standalone_does_not_load_the_omarchy_palette() {
-        assert!(ShellSession::Standalone.desktop_theme_path().is_none());
-        assert_eq!(
-            ShellSession::Standalone.palette().name,
-            ThemePalette::default_dark().name
-        );
     }
 }

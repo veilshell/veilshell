@@ -13,6 +13,7 @@ use veilshell_render::RgbaImage;
 use super::xdg::{self, DataDirs, Group};
 
 mod image;
+pub(crate) use image::decode_bitmap;
 
 const FALLBACK_THEME: &str = "hicolor";
 const LOGICAL_SIZE: u32 = 85;

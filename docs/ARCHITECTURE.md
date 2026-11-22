@@ -40,9 +40,10 @@ the device.
 The standalone adapter starts the same daemon and publishes separate Wayland
 and Hyprland endpoints in a private runtime directory. Only a matching
 standalone session may apply compositor layout and sensor-driven rotation or
-expose session power actions. The preview uses the built-in palette and
-delegates locking to Hyprlock. Future fullscreen defaults and a
-keyboard-and-mouse Desk Mode belong to this session, not to shared UI code.
+expose session power actions. The preview defaults to the built-in palette
+and wallpaper; Settings can opt into either Omarchy source independently,
+read-only. Locking is delegated to Hyprlock. Desk Mode and future fullscreen
+defaults belong to this session, not the overlay.
 
 Scene layout and input use logical coordinates in both modes; the renderers
 use physical-pixel buffers. Use the [adapter contract](PORTING_A_COMPOSITOR.md)

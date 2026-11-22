@@ -1,6 +1,10 @@
+use std::sync::Arc;
+
 use veilshell_core::{Rgba, ThemePalette};
 
-use crate::{DrawList, HitRect, HitTarget, RoundedRect, SceneOutput, TextAlign};
+use crate::{
+    DrawList, HitRect, HitTarget, ImageQuad, RoundedRect, SceneContext, SceneOutput, TextAlign,
+};
 
 /// Standalone preferences exposed by the shell. File I/O lives in the session adapter.
 #[derive(Clone, Debug, PartialEq)]
@@ -8,6 +12,7 @@ pub struct SettingsView {
     pub startup: &'static str,
     pub panel: bool,
     pub wallpaper: WallpaperPreset,
+    pub follow_omarchy_colors: bool,
     pub bindings: &'static str,
     pub feedback: Option<String>,
 }
@@ -18,6 +23,7 @@ pub enum WallpaperPreset {
     Midnight,
     Forest,
     Dusk,
+    Omarchy,
 }
 
 impl WallpaperPreset {
@@ -26,7 +32,8 @@ impl WallpaperPreset {
         match self {
             Self::Midnight => Self::Forest,
             Self::Forest => Self::Dusk,
-            Self::Dusk => Self::Midnight,
+            Self::Dusk => Self::Omarchy,
+            Self::Omarchy => Self::Midnight,
         }
     }
 
@@ -36,12 +43,15 @@ impl WallpaperPreset {
             Self::Midnight => "Midnight",
             Self::Forest => "Forest",
             Self::Dusk => "Dusk",
+            Self::Omarchy => "Omarchy wallpaper",
         }
     }
 
     pub(crate) const fn colors(self) -> (Rgba, Rgba) {
         match self {
-            Self::Midnight => (Rgba::from_rgb_u8(30, 40, 68), Rgba::from_rgb_u8(7, 9, 16)),
+            Self::Midnight | Self::Omarchy => {
+                (Rgba::from_rgb_u8(30, 40, 68), Rgba::from_rgb_u8(7, 9, 16))
+            }
             Self::Forest => (Rgba::from_rgb_u8(33, 72, 66), Rgba::from_rgb_u8(10, 18, 23)),
             Self::Dusk => (Rgba::from_rgb_u8(96, 49, 71), Rgba::from_rgb_u8(26, 19, 43)),
         }
@@ -49,11 +59,80 @@ impl WallpaperPreset {
 }
 
 #[must_use]
-pub fn build_wallpaper(preset: WallpaperPreset) -> DrawList {
-    let (top, bottom) = preset.colors();
+pub fn build_wallpaper(ctx: &SceneContext, width: f32, height: f32) -> DrawList {
     let mut list = DrawList::default();
-    list.push_backdrop(top, bottom);
+    push_session_wallpaper(&mut list, ctx, width, height, 1.0);
     list
+}
+
+pub(crate) fn push_session_wallpaper(
+    list: &mut DrawList,
+    ctx: &SceneContext,
+    width: f32,
+    height: f32,
+    alpha: f32,
+) {
+    let Some(settings) = &ctx.settings else {
+        return;
+    };
+    let (top, bottom) = settings.wallpaper.colors();
+    list.push_backdrop(top.with_alpha(alpha), bottom.with_alpha(alpha));
+    if let Some(image) = ctx
+        .session_wallpaper
+        .as_ref()
+        .filter(|_| settings.wallpaper == WallpaperPreset::Omarchy)
+    {
+        let scale = (width / image.width as f32).max(height / image.height as f32);
+        let w = image.width as f32 * scale;
+        let h = image.height as f32 * scale;
+        list.push_image(ImageQuad {
+            x: (width - w) * 0.5,
+            y: (height - h) * 0.5,
+            w,
+            h,
+            radius: 0.0,
+            alpha,
+            image: Arc::clone(image),
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::primitives::DrawCommand;
+
+    #[test]
+    fn imported_wallpaper_covers_portrait_without_stretching() {
+        let mut ctx = SceneContext {
+            settings: Some(SettingsView {
+                startup: "Desk",
+                panel: true,
+                wallpaper: WallpaperPreset::Omarchy,
+                follow_omarchy_colors: false,
+                bindings: "Preview",
+                feedback: None,
+            }),
+            session_wallpaper: crate::RgbaImage::new(2, 1, vec![255; 8]).map(Arc::new),
+            ..SceneContext::default()
+        };
+        let list = build_wallpaper(&ctx, 640.0, 960.0);
+        let quad = list
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::Image(quad) => Some(quad),
+                _ => None,
+            })
+            .unwrap();
+        assert!((quad.x + 640.0).abs() < f32::EPSILON);
+        assert!((quad.w / quad.h - 2.0).abs() < f32::EPSILON);
+        ctx.session_wallpaper = None;
+        assert!(!build_wallpaper(&ctx, 640.0, 960.0)
+            .commands
+            .iter()
+            .any(|cmd| matches!(cmd, DrawCommand::Image(_))));
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +140,7 @@ pub enum SettingsAction {
     Startup,
     Panel,
     Wallpaper,
+    Theme,
     Bindings,
     Back,
 }
@@ -102,9 +182,18 @@ pub(crate) fn build_settings(
             settings.bindings,
             SettingsAction::Bindings,
         ),
+        (
+            "Theme",
+            if settings.follow_omarchy_colors {
+                "Omarchy colors"
+            } else {
+                "VeilShell Dark"
+            },
+            SettingsAction::Theme,
+        ),
         ("Back to Quick Settings", "", SettingsAction::Back),
     ];
-    let step = ((height - 66.0) / 5.0).clamp(38.0, 67.0);
+    let step = ((height - 66.0) / 6.0).clamp(30.0, 67.0);
     for (i, (title, value, action)) in rows.into_iter().enumerate() {
         let rect = HitRect::new(x, 48.0 + i as f32 * step, w, step - 4.0);
         if rect.y + rect.h > height {

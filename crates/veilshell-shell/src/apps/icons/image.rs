@@ -28,10 +28,19 @@ pub(super) fn load(path: &Path, format: Format) -> Option<RgbaImage> {
 }
 
 fn load_bitmap(path: &Path) -> Option<RgbaImage> {
+    let image = decode_bitmap(path, MAX_BITMAP_SIDE)?;
+    Some(if image.width <= PIXELS && image.height <= PIXELS {
+        image
+    } else {
+        image.resize_fit(PIXELS, PIXELS)
+    })
+}
+
+pub(crate) fn decode_bitmap(path: &Path, max_side: usize) -> Option<RgbaImage> {
     let mut reader = BufReader::new(xdg::open_bounded(path, MAX_BITMAP_BYTES)?);
     // Some menu generators install JPEG bytes at a `.png` path. Keep themed
     // lookup unchanged and only enable the compatibility decoder for JPEG magic.
-    let image = if reader.fill_buf().ok()?.starts_with(&[0xff, 0xd8, 0xff]) {
+    if reader.fill_buf().ok()?.starts_with(&[0xff, 0xd8, 0xff]) {
         let mut bytes = Vec::new();
         reader
             .take(MAX_BITMAP_BYTES + 1)
@@ -40,23 +49,18 @@ fn load_bitmap(path: &Path) -> Option<RgbaImage> {
         if bytes.len() as u64 > MAX_BITMAP_BYTES {
             return None;
         }
-        load_jpeg(&bytes)?
+        load_jpeg(&bytes, max_side)
     } else {
-        load_png(reader)?
-    };
-    if image.width <= PIXELS && image.height <= PIXELS {
-        Some(image)
-    } else {
-        Some(image.resize_fit(PIXELS, PIXELS))
+        load_png(reader, max_side)
     }
 }
 
-fn load_png(reader: BufReader<File>) -> Option<RgbaImage> {
+fn load_png(reader: BufReader<File>, max_side: usize) -> Option<RgbaImage> {
     let mut decoder = png::Decoder::new(reader);
     decoder.set_transformations(png::Transformations::normalize_to_color8());
     let header = decoder.read_header_info().ok()?;
     // Reject huge sources before allocating the decoder's output buffer.
-    if header.width as usize > MAX_BITMAP_SIDE || header.height as usize > MAX_BITMAP_SIDE {
+    if header.width as usize > max_side || header.height as usize > max_side {
         return None;
     }
     let mut reader = decoder.read_info().ok()?;
@@ -79,10 +83,10 @@ fn load_png(reader: BufReader<File>) -> Option<RgbaImage> {
     RgbaImage::new(info.width, info.height, rgba)
 }
 
-fn load_jpeg(bytes: &[u8]) -> Option<RgbaImage> {
+fn load_jpeg(bytes: &[u8], max_side: usize) -> Option<RgbaImage> {
     let options = DecoderOptions::new_safe()
-        .set_max_width(MAX_BITMAP_SIDE)
-        .set_max_height(MAX_BITMAP_SIDE)
+        .set_max_width(max_side)
+        .set_max_height(max_side)
         .jpeg_set_out_colorspace(ColorSpace::RGBA);
     let mut decoder = JpegDecoder::new_with_options(ZCursor::new(bytes), options);
     decoder.decode_headers().ok()?;

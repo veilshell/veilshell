@@ -40,6 +40,7 @@ pub struct RecentsCard {
 #[allow(clippy::struct_excessive_bools)]
 pub struct SceneContext {
     pub settings: Option<crate::SettingsView>,
+    pub session_wallpaper: Option<Arc<RgbaImage>>,
     pub launcher: crate::LauncherState,
     pub clock_text: String,
     pub battery_pct: u8,
@@ -87,6 +88,7 @@ impl Default for SceneContext {
     fn default() -> Self {
         Self {
             settings: None,
+            session_wallpaper: None,
             launcher: crate::LauncherState::default(),
             clock_text: "12:00".into(),
             battery_pct: 86,
@@ -475,12 +477,22 @@ fn build_home(
     let y_slide = (1.0 - progress) * home_reveal_travel(height);
     // A plain dark fallback also keeps the launcher legible over active windows.
     // The GPU backdrop may substitute the configured, cached wallpaper.
-    let (top, bottom) = ctx
-        .settings
-        .as_ref()
-        .map_or((HOME_BACKGROUND, HOME_BACKGROUND), |s| s.wallpaper.colors());
-    out.draw_list
-        .push_backdrop(top.with_alpha(progress), bottom.with_alpha(progress));
+    if ctx.settings.is_some() {
+        crate::settings::push_session_wallpaper(&mut out.draw_list, ctx, width, height, progress);
+        if ctx.session_wallpaper.is_some() {
+            out.draw_list.push_rect(RoundedRect::filled(
+                0.0,
+                0.0,
+                width,
+                height,
+                0.0,
+                HOME_BACKGROUND.with_alpha(0.32 * progress),
+            ));
+        }
+    } else {
+        let tint = HOME_BACKGROUND.with_alpha(progress);
+        out.draw_list.push_backdrop(tint, tint);
+    }
     out.push_hit(
         HitRect::new(0.0, 0.0, width, height),
         HitTarget::DismissOverlay,

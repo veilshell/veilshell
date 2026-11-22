@@ -59,7 +59,23 @@ impl<C: CompositorBackend> LiveActionHandler<C> {
         }
         if let (Some(dir), Some(view)) = (settings::directory(), &mut ctx.settings) {
             match settings::change(&dir, action, view) {
-                Ok(updated) => *view = updated,
+                Ok(updated) => {
+                    *view = updated;
+                    if action == veilshell_render::SettingsAction::Theme {
+                        let palette = self.session.palette();
+                        if view.follow_omarchy_colors
+                            && palette.name == ThemePalette::default_dark().name
+                        {
+                            view.feedback =
+                                Some("Omarchy colors unavailable; using VeilShell Dark.".into());
+                        }
+                        if let Some(tx) = &self.session_tx {
+                            let _ = tx.send(DaemonCommand::UpdatePalette(palette));
+                        }
+                    } else if action == veilshell_render::SettingsAction::Wallpaper {
+                        ctx.session_wallpaper = load_session_wallpaper(view);
+                    }
+                }
                 Err(err) => {
                     eprintln!("veilshell: could not save preferences: {err}");
                     view.feedback = Some("Could not save this preference.".into());
@@ -510,8 +526,7 @@ fn spawn_hardware_watchers(
         .spawn(move || {
             // Reconcile with the sample used by the mode state machine, not a new baseline.
             let mut last_kbd = initial_keyboard_attached;
-            let theme_path = session.desktop_theme_path();
-            let mut last_theme_mtime = read_mtime(theme_path.as_ref());
+            let mut last_theme_mtime = read_mtime(session.desktop_theme_path().as_ref());
             let mut last_bat = read_sysfs_battery().map(|(pct, _)| pct);
             let mut last_minute = unix_minute();
 
@@ -543,8 +558,8 @@ fn spawn_hardware_watchers(
 
                 if periodic {
                     ticks = 0;
-                    let cur_mtime = read_mtime(theme_path.as_ref());
-                    if cur_mtime.is_some() && cur_mtime != last_theme_mtime {
+                    let cur_mtime = read_mtime(session.desktop_theme_path().as_ref());
+                    if cur_mtime != last_theme_mtime {
                         last_theme_mtime = cur_mtime;
                         let palette = session.palette();
                         let _ = poll_tx.send(DaemonCommand::UpdatePalette(palette));
@@ -746,7 +761,23 @@ fn initial_scene(
     };
     ctx.shade.auto_rotate_available = false;
     ctx.shade.quiet = None;
+    if let Some(view) = &mut ctx.settings {
+        ctx.session_wallpaper = load_session_wallpaper(view);
+    }
     ctx
+}
+
+fn load_session_wallpaper(
+    view: &mut veilshell_render::SettingsView,
+) -> Option<Arc<veilshell_render::RgbaImage>> {
+    if view.wallpaper != veilshell_render::WallpaperPreset::Omarchy {
+        return None;
+    }
+    let wallpaper = settings::import_wallpaper();
+    if wallpaper.is_none() {
+        view.feedback = Some("Omarchy wallpaper unavailable; using Midnight.".into());
+    }
+    wallpaper
 }
 
 fn main() -> ExitCode {

@@ -1031,25 +1031,13 @@ impl LayerApp {
     }
 
     fn draw_wallpaper(&mut self) {
-        if !self
-            .wallpaper
-            .as_ref()
-            .is_some_and(|surface| surface.configured)
-        {
-            return;
-        }
-        if let Some(preset) = self
-            .renderer
-            .context()
-            .settings
-            .as_ref()
-            .map(|s| s.wallpaper)
-        {
-            self.present_surface(
-                SurfaceKind::Wallpaper,
-                &veilshell_render::build_wallpaper(preset),
-                false,
+        if let Some(surface) = self.wallpaper.as_ref().filter(|s| s.configured) {
+            let list = veilshell_render::build_wallpaper(
+                self.renderer.context(),
+                surface.width as f32,
+                surface.height as f32,
             );
+            self.present_surface(SurfaceKind::Wallpaper, &list, false);
         }
     }
 
