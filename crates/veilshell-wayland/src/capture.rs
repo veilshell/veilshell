@@ -34,8 +34,18 @@ use veilshell_render::{RecentsCard, RgbaImage, SceneKind, ShmPixelFormat};
 use crate::client::LayerApp;
 
 const MAX_RECENT_THUMBNAILS: usize = 3;
-const THUMB_MAX_W: u32 = 360;
-const THUMB_MAX_H: u32 = 260;
+// The centered card is 63% of the output rather than a tiny tile. Preserve
+// enough source detail to avoid upscaling the old 360×260 previews.
+// Bounded so three neighboring previews still fit in the GPU's 2048² atlas.
+const THUMB_MAX_W: u32 = 960;
+const THUMB_MAX_H: u32 = 640;
+
+fn capture_range(count: usize, center: usize) -> std::ops::Range<usize> {
+    let start = center
+        .saturating_sub(1)
+        .min(count.saturating_sub(MAX_RECENT_THUMBNAILS));
+    start..(start + MAX_RECENT_THUMBNAILS).min(count)
+}
 
 pub(crate) struct ForeignToplevelListData;
 pub(crate) struct ForeignToplevelHandleData;
@@ -364,10 +374,26 @@ impl ToplevelCaptureState {
     pub(crate) fn apply_cached_and_capture(
         &mut self,
         cards: &mut [RecentsCard],
-        _shm: &Shm,
+        center: usize,
         qh: &QueueHandle<LayerApp>,
     ) {
-        for card in cards.iter_mut() {
+        let range = capture_range(cards.len(), center);
+        let visible_ids: HashSet<String> = cards[range.clone()]
+            .iter()
+            .map(|card| card.id.clone())
+            .collect();
+        let visible_foreign_ids: HashSet<String> = cards[range.clone()]
+            .iter()
+            .filter_map(|card| card.foreign_id.clone())
+            .collect();
+        self.cache_by_card.retain(|id, _| visible_ids.contains(id));
+        self.cache_by_identifier
+            .retain(|id, _| visible_foreign_ids.contains(id));
+        for (index, card) in cards.iter_mut().enumerate() {
+            if !range.contains(&index) {
+                card.thumbnail = None;
+                continue;
+            }
             if card.thumbnail.is_none() {
                 let cached = card
                     .foreign_id
@@ -387,7 +413,7 @@ impl ToplevelCaptureState {
         };
 
         let mut used_handles = HashSet::new();
-        for card in cards.iter().take(MAX_RECENT_THUMBNAILS) {
+        for card in &cards[range] {
             let Some((tl_obj_id, tl)) =
                 find_toplevel_for_card(card, &self.toplevels, &used_handles)
             else {
@@ -492,7 +518,11 @@ impl ToplevelCaptureState {
         let thumb = match (fmt, cap.pool.as_mut(), cap.buffer.as_ref()) {
             (Some(pixel_fmt), Some(pool), Some(buf)) => buf.canvas(pool).and_then(|bytes| {
                 let raw = RgbaImage::from_wayland_shm(w, h, stride, bytes, pixel_fmt, flip_y)?;
-                Some(Arc::new(raw.resize_fit(THUMB_MAX_W, THUMB_MAX_H)))
+                if w <= THUMB_MAX_W && h <= THUMB_MAX_H {
+                    Some(Arc::new(raw))
+                } else {
+                    Some(Arc::new(raw.resize_fit(THUMB_MAX_W, THUMB_MAX_H)))
+                }
             }),
             _ => None,
         };

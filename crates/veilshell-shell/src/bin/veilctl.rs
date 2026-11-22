@@ -467,6 +467,10 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
         ctx.night_light = snap.night_light;
         ctx.brightness_pct = snap.brightness_pct;
         ctx.volume_pct = snap.volume_pct;
+        veilshell_shell::shade::apply_hardware(&mut ctx, &snap);
+        if scene == SceneKind::Shade {
+            veilshell_shell::shade::refresh_optional(&mut ctx);
+        }
         ctx.home_apps = apps_to_tiles(&discover_desktop_apps());
     }
 

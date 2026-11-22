@@ -2,6 +2,7 @@
 
 pub mod apps;
 pub mod ipc;
+pub mod shade;
 
 use std::fmt::Write as _;
 

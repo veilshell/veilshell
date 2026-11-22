@@ -35,14 +35,14 @@ use veilshell_core::{
 use veilshell_render::power::{PowerAction, PowerInput, PowerMenu};
 use veilshell_render::{
     build_scene, build_scene_layout, build_top_strip_scene, home_page_count, home_reveal_travel,
-    shade_reveal_travel, ActiveRenderer, DrawList, HitTarget, SceneContext, SceneKind, SceneOutput,
-    WallpaperImage,
+    recents_stride, shade_reveal_travel, ActiveRenderer, DrawList, HitTarget, SceneContext,
+    SceneKind, SceneOutput, WallpaperImage,
 };
 
 use crate::capture::ToplevelCaptureState;
 #[cfg(feature = "wgpu")]
 use crate::gpu::WgpuWaylandSurface;
-use crate::motion::{horizontal, vertical, DragMotion, DragVelocity};
+use crate::motion::{horizontal, slider_pct_for_y, vertical, DragMotion, DragVelocity, SliderDrag};
 use crate::osk::{OskRepeat, OskWaylandState};
 use crate::{LayerRole, LayerSurfaceSpec, WaylandRuntimeConfig};
 
@@ -179,7 +179,8 @@ struct ActiveDrag {
     last_x: f32,
     last_y: f32,
     overlay_tap_allowed: bool,
-    active_slider: Option<(&'static str, veilshell_render::HitRect)>,
+    recent_card: Option<String>,
+    active_slider: Option<SliderDrag>,
     osk_repeat: Option<OskRepeat>,
     motion: Option<DragMotion>,
     velocity: DragVelocity,
@@ -516,11 +517,8 @@ impl LayerApp {
                 );
             }
             if scene == SceneKind::Recents {
-                self.capture.apply_cached_and_capture(
-                    &mut self.renderer.context_mut().recents_cards,
-                    &self.shm,
-                    &self.qh,
-                );
+                self.renderer.context_mut().recents_index = 0;
+                self.capture_recents();
             }
         }
 
@@ -533,6 +531,7 @@ impl LayerApp {
 
         self.overlay_spring = spring;
         self.home_spring = None;
+        self.renderer.context_mut().recents_throw = None;
         self.last_anim_tick = Instant::now();
         self.refresh_after_open = !refresh;
 
@@ -559,6 +558,7 @@ impl LayerApp {
         if !visible {
             self.drag = None;
             self.home_spring = None;
+            self.renderer.context_mut().recents_throw = None;
             self.refresh_after_open = false;
             self.active_scene = SceneKind::Pill;
         }
@@ -620,7 +620,16 @@ impl LayerApp {
         }
         let ctx = self.renderer.context_mut();
         ctx.overlay_progress = self.overlay_spring.value.clamp(0.0, 1.0);
-        ctx.home_position = self.home_spring.map(|spring| spring.value);
+        ctx.home_position = if self.active_scene == SceneKind::Home {
+            self.home_spring.map(|spring| spring.value)
+        } else {
+            None
+        };
+        ctx.recents_position = if self.active_scene == SceneKind::Recents {
+            self.home_spring.map(|spring| spring.value)
+        } else {
+            None
+        };
         let layout = build_scene_layout(
             self.active_scene,
             surf.width as f32,
@@ -746,17 +755,27 @@ impl LayerApp {
 
     fn begin_drag(&mut self, touch_id: Option<i32>, kind: SurfaceKind, x: f32, y: f32) {
         let overlay_tap_allowed = kind == SurfaceKind::Overlay && self.overlay_input_ready();
+        let recent_card = if overlay_tap_allowed && self.active_scene == SceneKind::Recents {
+            self.overlay_layout
+                .as_ref()
+                .and_then(|layout| match layout.hit_test(x, y) {
+                    Some(HitTarget::FocusWindow { id }) => Some(id.clone()),
+                    _ => None,
+                })
+        } else {
+            None
+        };
         let mut active_slider = None;
         if overlay_tap_allowed && self.active_scene == SceneKind::Shade {
             if let Some(layout) = &self.overlay_layout {
                 if let Some(HitTarget::ShadeSlider { id, rect }) = layout.hit_test(x, y) {
-                    active_slider = Some((*id, *rect));
-                    let pct = slider_pct_for_x(x, *rect);
-                    self.handler.on_action(
-                        ShellAction::SetSlider { id, pct },
-                        self.renderer.context_mut(),
-                    );
-                    self.draw_overlay();
+                    let ctx = self.renderer.context();
+                    let level = if *id == "brightness" {
+                        ctx.brightness_pct
+                    } else {
+                        ctx.volume_pct
+                    };
+                    active_slider = Some(SliderDrag::new(id, *rect, level));
                 }
             }
         }
@@ -788,6 +807,7 @@ impl LayerApp {
             last_x: x,
             last_y: y,
             overlay_tap_allowed,
+            recent_card,
             active_slider,
             osk_repeat,
             motion: None,
@@ -807,6 +827,23 @@ impl LayerApp {
     fn home_pages(&self) -> usize {
         let (w, h) = self.overlay_size();
         home_page_count(&self.renderer.context().home_apps, w, h)
+    }
+
+    fn page_count(&self) -> usize {
+        if self.active_scene == SceneKind::Recents {
+            self.renderer.context().recents_cards.len().max(1)
+        } else {
+            self.home_pages()
+        }
+    }
+
+    fn capture_recents(&mut self) {
+        let ctx = self.renderer.context_mut();
+        ctx.recents_index = ctx
+            .recents_index
+            .min(ctx.recents_cards.len().saturating_sub(1));
+        self.capture
+            .apply_cached_and_capture(&mut ctx.recents_cards, ctx.recents_index, &self.qh);
     }
 
     fn has_gesture_overlay(&self) -> bool {
@@ -851,12 +888,12 @@ impl LayerApp {
             }
         }
         // Keep bottom-edge workspace/Recents gestures separate from content drags.
-        if surface != SurfaceKind::Overlay || start_y >= h - 52.0 || !self.has_gesture_overlay() {
+        if surface != SurfaceKind::Overlay || start_y >= h - 52.0 {
             return None;
         }
         let progress = self.overlay_spring.value.clamp(0.0, 1.0);
         let closing = self.overlay_spring.target <= 0.0;
-        if vertical(dx, dy) && self.home_spring.is_none() {
+        if self.has_gesture_overlay() && vertical(dx, dy) && self.home_spring.is_none() {
             let (travel, sign) = if self.active_scene == SceneKind::Home {
                 (home_reveal_travel(h), -1.0)
             } else {
@@ -866,19 +903,23 @@ impl LayerApp {
                 return Some((DragMotion::reveal(progress, travel, sign, closing), None));
             }
         }
-        if self.active_scene == SceneKind::Home
+        if matches!(self.active_scene, SceneKind::Home | SceneKind::Recents)
             && self.overlay_spring.is_settled()
             && progress >= 1.0
             && horizontal(dx, dy)
-            && self.home_pages() > 1
+            && self.page_count() > 1
         {
-            let from = self
-                .home_spring
-                .map_or(self.renderer.context().home_page as f32, |s| s.value);
+            let ctx = self.renderer.context();
+            let (page, stride) = if self.active_scene == SceneKind::Recents {
+                (ctx.recents_index, recents_stride(w, h))
+            } else {
+                (ctx.home_page, w)
+            };
+            let from = self.home_spring.map_or(page as f32, |s| s.value);
             return Some((
                 DragMotion::HomePage {
                     from,
-                    width: w.max(1.0),
+                    width: stride.max(1.0),
                 },
                 None,
             ));
@@ -893,17 +934,17 @@ impl LayerApp {
         if drag.active_slider.is_some() {
             return false;
         }
-        let Some((motion, opening)) = drag
-            .motion
+        let (surface, start_y, existing) = (drag.surface, drag.start_y, drag.motion);
+        let Some((motion, opening)) = existing
             .map(|m| (m, None))
-            .or_else(|| self.start_interactive_motion(drag.surface, drag.start_y, dx, dy))
+            .or_else(|| self.start_interactive_motion(surface, start_y, dx, dy))
         else {
             return false;
         };
         if let Some(drag) = &mut self.drag {
             drag.motion = Some(motion);
         }
-        let position = motion.position(dx, dy, self.home_pages());
+        let position = motion.position(dx, dy, self.page_count());
         let ctx = self.renderer.context_mut();
         ctx.pill_drag_x = 0.0;
         ctx.pill_drag_y = 0.0;
@@ -932,7 +973,7 @@ impl LayerApp {
                 self.home_spring.map_or(from, |spring| spring.value)
             }
         };
-        let pages = self.home_pages();
+        let pages = self.page_count();
         let spring = velocity.map_or_else(
             || motion.cancel(value, pages),
             |speed| motion.release(value, speed, pages),
@@ -942,7 +983,12 @@ impl LayerApp {
             DragMotion::HomePage { .. } => {
                 self.home_spring = Some(spring);
                 let page = spring.target as usize;
-                if self.renderer.context().home_page != page {
+                if self.active_scene == SceneKind::Recents {
+                    if self.renderer.context().recents_index != page {
+                        self.renderer.context_mut().recents_index = page;
+                        self.capture_recents();
+                    }
+                } else if self.renderer.context().home_page != page {
                     self.renderer.context_mut().home_page = page;
                     self.handler.on_action(
                         ShellAction::HomePageChanged(page),
@@ -990,6 +1036,7 @@ impl LayerApp {
         ctx.pill_drag_x = 0.0;
         ctx.pill_drag_y = 0.0;
         ctx.top_drag_y = 0.0;
+        ctx.recents_throw = None;
         self.draw_pill();
         self.draw_top_strip();
         if let Some(motion) = motion {
@@ -1013,34 +1060,62 @@ impl LayerApp {
             repeat.position(x, y);
         }
         let (dx, dy) = (x - drag.start_x, y - drag.start_y);
+        if let Some(id) = drag.recent_card.as_ref().filter(|_| drag.motion.is_none()) {
+            let ctx = self.renderer.context_mut();
+            if ctx.recents_throw.is_some() || (dy < 0.0 && vertical(dx, dy)) {
+                ctx.recents_throw = Some((id.clone(), dy.min(0.0)));
+                self.draw_overlay();
+                return;
+            }
+        }
         if self.update_interactive_drag(dx, dy) {
             return;
         }
-        let Some(drag) = &self.drag else {
-            return;
+        let (surface, start_x, start_y, has_slider) = {
+            let Some(drag) = &self.drag else {
+                return;
+            };
+            (
+                drag.surface,
+                drag.start_x,
+                drag.start_y,
+                drag.active_slider.is_some(),
+            )
         };
 
-        match drag.surface {
+        if has_slider {
+            let pct = {
+                let slider = self.drag.as_mut().and_then(|d| d.active_slider.as_mut());
+                slider.and_then(|slider| {
+                    slider
+                        .update(dy, Instant::now())
+                        .map(|pct| (slider.id, pct))
+                })
+            };
+            if let Some((id, pct)) = pct {
+                self.handler.on_action(
+                    ShellAction::SetSlider { id, pct },
+                    self.renderer.context_mut(),
+                );
+                self.draw_overlay();
+            }
+            return;
+        }
+
+        match surface {
             SurfaceKind::Pill => {
-                self.renderer.context_mut().pill_drag_x = x - drag.start_x;
-                self.renderer.context_mut().pill_drag_y = y - drag.start_y;
+                self.renderer.context_mut().pill_drag_x = x - start_x;
+                self.renderer.context_mut().pill_drag_y = y - start_y;
                 self.draw_pill();
             }
             SurfaceKind::TopStrip => {
-                self.renderer.context_mut().top_drag_y = (y - drag.start_y).max(0.0);
+                self.renderer.context_mut().top_drag_y = (y - start_y).max(0.0);
                 self.draw_top_strip();
             }
             SurfaceKind::Overlay => {
-                if let Some((id, rect)) = drag.active_slider {
-                    let pct = slider_pct_for_x(x, rect);
-                    self.handler.on_action(
-                        ShellAction::SetSlider { id, pct },
-                        self.renderer.context_mut(),
-                    );
-                    self.draw_overlay();
-                } else if drag.start_y >= (self.viewport_h as f32 - 52.0) {
-                    self.renderer.context_mut().pill_drag_x = x - drag.start_x;
-                    self.renderer.context_mut().pill_drag_y = y - drag.start_y;
+                if start_y >= (self.viewport_h as f32 - 52.0) {
+                    self.renderer.context_mut().pill_drag_x = x - start_x;
+                    self.renderer.context_mut().pill_drag_y = y - start_y;
                     self.draw_overlay();
                 }
             }
@@ -1060,6 +1135,16 @@ impl LayerApp {
         self.renderer.context_mut().pill_drag_x = 0.0;
         self.renderer.context_mut().pill_drag_y = 0.0;
         self.renderer.context_mut().top_drag_y = 0.0;
+        if let Some((id, offset)) = self.renderer.context_mut().recents_throw.take() {
+            let (_, vy) = drag.velocity.at_release(Instant::now());
+            if offset <= -96.0 || (offset <= -32.0 && vy <= -650.0) {
+                self.handler
+                    .on_action(ShellAction::CloseWindow(id), self.renderer.context_mut());
+                self.capture_recents();
+            }
+            self.draw_overlay();
+            return;
+        }
         if let Some(motion) = drag.motion {
             self.settle_interactive_drag(motion, Some(drag.velocity.at_release(Instant::now())));
             return;
@@ -1127,7 +1212,12 @@ impl LayerApp {
                 }
             }
             SurfaceKind::Overlay => {
-                if drag.active_slider.is_some() {
+                if let Some(slider) = drag.active_slider {
+                    let pct = slider.finish(drag.last_y, dy);
+                    self.handler.on_action(
+                        ShellAction::SetSlider { id: slider.id, pct },
+                        self.renderer.context_mut(),
+                    );
                     self.draw_overlay();
                     return;
                 }
@@ -1248,20 +1338,6 @@ impl LayerApp {
                     .on_action(ShellAction::FocusWindow(id), self.renderer.context_mut());
                 self.show_scene(SceneKind::Pill, false);
             }
-            HitTarget::CloseWindow { id } => {
-                self.handler
-                    .on_action(ShellAction::CloseWindow(id), self.renderer.context_mut());
-                self.handler.on_action(
-                    ShellAction::RequestRefresh(SceneKind::Recents),
-                    self.renderer.context_mut(),
-                );
-                self.capture.apply_cached_and_capture(
-                    &mut self.renderer.context_mut().recents_cards,
-                    &self.shm,
-                    &self.qh,
-                );
-                self.draw_overlay();
-            }
             HitTarget::ShadeToggle { id } => {
                 self.handler
                     .on_action(ShellAction::ToggleSetting(id), self.renderer.context_mut());
@@ -1272,7 +1348,7 @@ impl LayerApp {
                 }
             }
             HitTarget::ShadeSlider { id, rect } => {
-                let pct = slider_pct_for_x(x, rect);
+                let pct = slider_pct_for_y(y, rect);
                 self.handler.on_action(
                     ShellAction::SetSlider { id, pct },
                     self.renderer.context_mut(),
@@ -1350,14 +1426,6 @@ impl LayerApp {
         }
         self.draw_overlay();
     }
-}
-
-fn slider_pct_for_x(x: f32, rect: veilshell_render::HitRect) -> u8 {
-    if rect.w <= 1.0 {
-        return 50;
-    }
-    let ratio = ((x - rect.x) / rect.w).clamp(0.0, 1.0);
-    (ratio * 100.0).round() as u8
 }
 
 /// Start the single-surface compatibility wrapper around [`run_shell_daemon`].

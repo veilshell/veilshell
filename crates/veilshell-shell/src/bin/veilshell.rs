@@ -24,6 +24,7 @@ use veilshell_render::{
 };
 use veilshell_shell::apps::{apps_to_tiles, current_clock_hhmm, discover_desktop_apps};
 use veilshell_shell::ipc::{default_socket_path, spawn_ipc_listener};
+use veilshell_shell::shade;
 use veilshell_shell::ShellState;
 use veilshell_theme::{load_best_available, OmarchyAetherProvider};
 use veilshell_wayland::channel::{self, Sender};
@@ -137,6 +138,7 @@ impl LiveActionHandler {
         ctx.night_light = snap.night_light;
         ctx.brightness_pct = snap.brightness_pct;
         ctx.volume_pct = snap.volume_pct;
+        shade::apply_hardware(ctx, &snap);
         ctx.rotation_locked = self.rotation.is_locked();
         ctx.tablet_mode = self.mode_sm.effective_mode() == ShellMode::Tablet;
     }
@@ -181,6 +183,8 @@ impl LiveActionHandler {
         ctx.clock_text = current_clock_hhmm();
         if scene == SceneKind::Shade {
             self.sync_hardware_snapshot(ctx);
+            shade::refresh_optional(ctx);
+            ctx.shade.feedback = None;
         } else {
             self.sync_fast_sysfs(ctx);
         }
@@ -216,6 +220,109 @@ impl LiveActionHandler {
             }
         }
     }
+
+    fn toggle_setting(&mut self, id: &str, ctx: &mut SceneContext) {
+        ctx.shade.feedback = None;
+        let result = match id {
+            "wifi" => {
+                let Some(on) = ctx.shade.wifi_radio else {
+                    return;
+                };
+                self.hw.set_wifi(!on).map(|()| {
+                    ctx.shade.wifi_radio = Some(!on);
+                    if on {
+                        ctx.wifi_connected = false;
+                        ctx.shade.wifi_name = None;
+                    }
+                })
+            }
+            "bluetooth" => self.hw.set_bluetooth(!ctx.bluetooth_enabled).map(|()| {
+                ctx.bluetooth_enabled = !ctx.bluetooth_enabled;
+            }),
+            "lte" => {
+                let Some(on) = ctx.shade.mobile_radio else {
+                    return;
+                };
+                self.hw.set_wwan(!on).map(|()| {
+                    ctx.shade.mobile_radio = Some(!on);
+                    if on {
+                        ctx.lte_connected = false;
+                    }
+                })
+            }
+            "night_light" => self.hw.set_night_light(!ctx.night_light).map(|()| {
+                ctx.night_light = !ctx.night_light;
+            }),
+            "autorotate" => {
+                let previous = self.rotation.effective();
+                self.rotation.set_locked(!self.rotation.is_locked());
+                ctx.rotation_locked = self.rotation.is_locked();
+                let next = self.rotation.effective();
+                if self.auto_rotate
+                    && !ctx.rotation_locked
+                    && next != previous
+                    && self.mode_sm.effective_mode() == ShellMode::Tablet
+                {
+                    self.apply_effective_orientation(next);
+                }
+                return;
+            }
+            "tablet_mode" => {
+                if let Some(next_mode) = self.mode_sm.handle(ModeEvent::ToggleManual) {
+                    let _ = self.compositor.apply_shell_mode(next_mode);
+                }
+                ctx.tablet_mode = self.mode_sm.effective_mode() == ShellMode::Tablet;
+                return;
+            }
+            "profile" => {
+                if let Some(label) = shade::cycle_profile() {
+                    ctx.shade.power_profile = Some(label);
+                } else {
+                    ctx.shade.feedback = Some("Could not change power profile".into());
+                }
+                return;
+            }
+            "quiet" => {
+                if let Some(quiet) = shade::toggle_quiet() {
+                    ctx.shade.quiet = Some(quiet);
+                } else {
+                    ctx.shade.feedback = Some("Could not change Silent mode".into());
+                }
+                return;
+            }
+            _ => return,
+        };
+        if let Err(err) = result {
+            eprintln!("veilshell: {id} toggle failed: {err}");
+            ctx.shade.feedback = Some("Could not change this setting".into());
+        }
+    }
+
+    fn set_slider(&mut self, id: &str, pct: u8, ctx: &mut SceneContext) {
+        let result = match id {
+            "brightness" => {
+                let pct = pct.clamp(5, 100);
+                if pct == ctx.brightness_pct {
+                    return;
+                }
+                self.hw
+                    .set_brightness(pct)
+                    .map(|()| ctx.brightness_pct = pct)
+            }
+            "volume" => {
+                let pct = pct.min(100);
+                if pct == ctx.volume_pct {
+                    return;
+                }
+                self.hw.set_volume(pct).map(|()| ctx.volume_pct = pct)
+            }
+            _ => return,
+        };
+        ctx.shade.feedback = result.err().map(|err| {
+            eprintln!("veilshell: set {id} failed: {err}");
+            format!("Could not change {id}")
+        });
+    }
 }
 
 impl ShellActionHandler for LiveActionHandler {
@@ -228,8 +335,10 @@ impl ShellActionHandler for LiveActionHandler {
                 }
             }
             ShellAction::CloseWindow(id) => {
-                if let Err(err) = self.compositor.close_window(&WindowId(id)) {
+                if let Err(err) = self.compositor.close_window(&WindowId(id.clone())) {
                     eprintln!("veilshell: close_window failed: {err}");
+                } else {
+                    ctx.recents_cards.retain(|card| card.id != id);
                 }
             }
             ShellAction::LaunchApp { exec } => {
@@ -242,78 +351,8 @@ impl ShellActionHandler for LiveActionHandler {
                     eprintln!("veilshell: switch_workspace failed: {err}");
                 }
             }
-            ShellAction::ToggleSetting(id) => match id {
-                "wifi" => {
-                    let target = !ctx.wifi_connected;
-                    match self.hw.set_wifi(target) {
-                        Ok(()) => ctx.wifi_connected = target,
-                        Err(err) => eprintln!("veilshell: wifi toggle failed: {err}"),
-                    }
-                }
-                "bluetooth" => {
-                    let target = !ctx.bluetooth_enabled;
-                    match self.hw.set_bluetooth(target) {
-                        Ok(()) => ctx.bluetooth_enabled = target,
-                        Err(err) => eprintln!("veilshell: bluetooth toggle failed: {err}"),
-                    }
-                }
-                "lte" => {
-                    let target = !ctx.lte_connected;
-                    match self.hw.set_wwan(target) {
-                        Ok(()) => ctx.lte_connected = target,
-                        Err(err) => eprintln!("veilshell: wwan toggle failed: {err}"),
-                    }
-                }
-                "autorotate" => {
-                    let prev = self.rotation.effective();
-                    let next_locked = !self.rotation.is_locked();
-                    self.rotation.set_locked(next_locked);
-                    ctx.rotation_locked = self.rotation.is_locked();
-                    let next = self.rotation.effective();
-                    if self.auto_rotate
-                        && !next_locked
-                        && next != prev
-                        && self.mode_sm.effective_mode() == ShellMode::Tablet
-                    {
-                        self.apply_effective_orientation(next);
-                    }
-                }
-                "night_light" => {
-                    let target = !ctx.night_light;
-                    match self.hw.set_night_light(target) {
-                        Ok(()) => ctx.night_light = target,
-                        Err(err) => eprintln!("veilshell: night_light toggle failed: {err}"),
-                    }
-                }
-                "tablet_mode" => {
-                    if let Some(next_mode) = self.mode_sm.handle(ModeEvent::ToggleManual) {
-                        let _ = self.compositor.apply_shell_mode(next_mode);
-                    }
-                    ctx.tablet_mode = self.mode_sm.effective_mode() == ShellMode::Tablet;
-                }
-                _ => {}
-            },
-            ShellAction::SetSlider { id, pct } => match id {
-                "brightness" => {
-                    let clamped = pct.clamp(5, 100);
-                    if clamped != ctx.brightness_pct {
-                        match self.hw.set_brightness(clamped) {
-                            Ok(()) => ctx.brightness_pct = clamped,
-                            Err(err) => eprintln!("veilshell: set_brightness failed: {err}"),
-                        }
-                    }
-                }
-                "volume" => {
-                    let clamped = pct.min(100);
-                    if clamped != ctx.volume_pct {
-                        match self.hw.set_volume(clamped) {
-                            Ok(()) => ctx.volume_pct = clamped,
-                            Err(err) => eprintln!("veilshell: set_volume failed: {err}"),
-                        }
-                    }
-                }
-                _ => {}
-            },
+            ShellAction::ToggleSetting(id) => self.toggle_setting(id, ctx),
+            ShellAction::SetSlider { id, pct } => self.set_slider(id, pct, ctx),
             ShellAction::HomePageChanged(page) => {
                 ctx.home_page = page;
             }
@@ -635,6 +674,7 @@ fn main() -> ExitCode {
         session_tx: standalone.then(|| cmd_tx.clone()),
     };
     handler.sync_hardware_snapshot(&mut scene_ctx);
+    shade::refresh_optional(&mut scene_ctx);
     handler.refresh_context(SceneKind::Recents, &mut scene_ctx);
 
     if opts.dry_run || env::var_os("WAYLAND_DISPLAY").is_none() {

@@ -66,7 +66,7 @@ cargo run -p veilshell-shell --bin veilshell -- --policy tablet --scene pill
 
 # Control the running daemon via veilctl Unix socket IPC
 veilctl show home        # Open paged .desktop app launcher
-veilctl show recents     # Open live Hyprland window deck (tap to focus, X to close)
+veilctl show recents     # Open the window deck (tap to focus, swipe up on a card to close)
 veilctl show shade       # Open Quick Settings shade
 veilctl show osk         # Open multi-layer Touch OSK (auto-opens on text focus in Tablet Mode)
 veilctl show pill        # Dismiss overlays back to the bottom gesture pill
@@ -85,6 +85,7 @@ Swipe up from the bottom pill to pull Home into view, or swipe down from the
 top handle to pull in Quick Settings. Reverse a short pull to cancel. Swipe
 down on Home or up on Quick Settings to close. Swipe across Home to slide to
 another app page, or swipe up again from Home's bottom edge to open Recents.
+In Recents, swipe across to browse windows and swipe up on a card to close it.
 A horizontal swipe on the bottom pill still changes workspaces.
 
 For Omarchy users, optional instant theme-hook (`adapters/omarchy/hooks/30-veilshell-theme`)

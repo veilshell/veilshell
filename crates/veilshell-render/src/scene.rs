@@ -4,15 +4,18 @@ use std::sync::Arc;
 
 use veilshell_core::{OskState, Rgba, ShiftState, ThemePalette};
 
-use crate::power::{draw_power_menu, PowerInput, PowerMenu};
+use crate::power::PowerMenu;
 use crate::primitives::{
     DrawList, HitRect, HitTarget, ImageQuad, RgbaImage, RoundedRect, SceneOutput, TextAlign,
 };
+use crate::recents::build_recents;
+use crate::shade::{build_shade, ShadeStatus};
 use crate::SceneKind;
 
 /// Visual application tile shown in the paged `Home` app grid.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppTile {
+    pub id: String,
     pub badge: String,
     pub label: String,
     pub exec: String,
@@ -45,6 +48,7 @@ pub struct SceneContext {
     pub night_light: bool,
     pub brightness_pct: u8,
     pub volume_pct: u8,
+    pub shade: ShadeStatus,
     /// Session controls are absent in the in-desktop overlay mode.
     pub power_menu: Option<PowerMenu>,
     /// Horizontal drag indicator in logical pixels for live pill gesture feedback.
@@ -63,6 +67,9 @@ pub struct SceneContext {
     pub home_position: Option<f32>,
     /// Open windows shown in the `Recents` deck.
     pub recents_cards: Vec<RecentsCard>,
+    pub recents_index: usize,
+    pub recents_position: Option<f32>,
+    pub recents_throw: Option<(String, f32)>,
     /// Multi-layer touch keyboard state and modifier latches.
     pub osk_state: OskState,
 }
@@ -80,6 +87,7 @@ impl Default for SceneContext {
             night_light: false,
             brightness_pct: 72,
             volume_pct: 55,
+            shade: ShadeStatus::default(),
             power_menu: None,
             pill_drag_x: 0.0,
             pill_drag_y: 0.0,
@@ -95,7 +103,7 @@ impl Default for SceneContext {
                     title: "Terminal".into(),
                     focused: true,
                     foreign_id: None,
-                    thumbnail: None,
+                    thumbnail: Some(Arc::new(demo_thumbnail((28, 32, 40)))),
                 },
                 RecentsCard {
                     id: "0x2".into(),
@@ -103,7 +111,7 @@ impl Default for SceneContext {
                     title: "VeilShell".into(),
                     focused: false,
                     foreign_id: None,
-                    thumbnail: None,
+                    thumbnail: Some(Arc::new(demo_thumbnail((40, 35, 52)))),
                 },
                 RecentsCard {
                     id: "0x3".into(),
@@ -111,12 +119,34 @@ impl Default for SceneContext {
                     title: "Surface Notes".into(),
                     focused: false,
                     foreign_id: None,
-                    thumbnail: None,
+                    thumbnail: Some(Arc::new(demo_thumbnail((24, 44, 40)))),
                 },
             ],
+            recents_index: 0,
+            recents_position: None,
+            recents_throw: None,
             osk_state: OskState::default(),
         }
     }
+}
+
+/// A simple synthetic window preview for offline snapshot verification.
+fn demo_thumbnail(base: (u8, u8, u8)) -> RgbaImage {
+    const W: u32 = 320;
+    const H: u32 = 200;
+    let mut rgba = Vec::with_capacity((W * H * 4) as usize);
+    for y in 0..H {
+        for _x in 0..W {
+            let shade = (((y * 3 / H) as i16 - 1).unsigned_abs() * 18) as u8;
+            rgba.extend_from_slice(&[
+                base.0.saturating_sub(shade),
+                base.1.saturating_sub(shade),
+                base.2.saturating_sub(shade),
+                255,
+            ]);
+        }
+    }
+    RgbaImage::new(W, H, rgba).expect("fixed demo thumbnail size")
 }
 
 /// Placeholder tiles for deterministic demo scenes only.
@@ -138,6 +168,7 @@ pub fn default_demo_apps() -> Vec<AppTile> {
     ]
     .into_iter()
     .map(|(badge, label, exec, (r, g, b))| AppTile {
+        id: exec.to_owned(),
         badge: badge.to_owned(),
         label: label.to_owned(),
         exec: exec.to_owned(),
@@ -157,16 +188,6 @@ pub fn home_page_count(apps: &[AppTile], width: f32, height: f32) -> usize {
 #[must_use]
 pub fn home_reveal_travel(height: f32) -> f32 {
     (height * 0.42).clamp(120.0, 360.0)
-}
-
-fn shade_panel_height(height: f32) -> f32 {
-    (height * 0.62).clamp(440.0, 476.0)
-}
-
-/// Move the shade until its bottom edge is just outside the top of the output.
-#[must_use]
-pub fn shade_reveal_travel(height: f32) -> f32 {
-    shade_panel_height(height) + 32.0
 }
 
 const HOME_FOREGROUND: Rgba = Rgba::from_rgb_u8(247, 247, 248);
@@ -317,44 +338,7 @@ fn mix(a: Rgba, b: Rgba, t: f32) -> Rgba {
     }
 }
 
-fn truncate_label(raw: &str, max_chars: usize) -> String {
-    let trimmed = raw.trim();
-    let count = trimmed.chars().count();
-    if count <= max_chars || max_chars < 4 {
-        return trimmed.to_owned();
-    }
-    let mut out: String = trimmed.chars().take(max_chars - 2).collect();
-    out.push_str("..");
-    out
-}
-
-fn push_glass_backdrop(
-    list: &mut DrawList,
-    width: f32,
-    height: f32,
-    palette: &ThemePalette,
-    progress: f32,
-) {
-    let alpha = progress.clamp(0.0, 1.0);
-    let top = mix(palette.background, palette.accent, 0.08).with_alpha(0.94 * alpha);
-    let bottom =
-        mix(palette.background, Rgba::from_rgb_u8(4, 6, 12), 0.35).with_alpha(0.96 * alpha);
-    list.push_backdrop(top, bottom);
-    list.push_glow(
-        width * 0.22,
-        height * 0.18,
-        width.max(height) * 0.48,
-        palette.accent.with_alpha(0.14 * alpha),
-    );
-    list.push_glow(
-        width * 0.82,
-        height * 0.82,
-        width.max(height) * 0.42,
-        palette.accent.with_alpha(0.09 * alpha),
-    );
-}
-
-fn push_bottom_pill_bar(
+pub(crate) fn push_bottom_pill_bar(
     list: &mut DrawList,
     width: f32,
     height: f32,
@@ -391,70 +375,6 @@ fn build_pill(
 ) {
     push_bottom_pill_bar(&mut out.draw_list, width, height, palette, ctx);
     out.push_hit(HitRect::new(0.0, 0.0, width, height), HitTarget::BottomPill);
-}
-
-fn build_status_bar(
-    list: &mut DrawList,
-    width: f32,
-    palette: &ThemePalette,
-    ctx: &SceneContext,
-    y_offset: f32,
-    alpha: f32,
-) {
-    let bar_w = (width - 48.0).clamp(240.0, 1160.0);
-    let bar_h = 44.0;
-    let bar_x = (width - bar_w) * 0.5;
-    let bar_y = 20.0 + y_offset;
-
-    list.push_rect(
-        RoundedRect::filled(
-            bar_x,
-            bar_y,
-            bar_w,
-            bar_h,
-            22.0,
-            palette.surface.with_alpha(0.76 * alpha),
-        )
-        .with_glass_border(
-            palette.foreground.with_alpha(0.14 * alpha),
-            1.0,
-            0.08 * alpha,
-        )
-        .with_shadow(12.0, 4.0, 0.28 * alpha),
-    );
-
-    list.push_text(
-        bar_x + 22.0,
-        bar_y + 15.0,
-        &ctx.clock_text,
-        2,
-        palette.foreground.with_alpha(alpha),
-        TextAlign::Left,
-    );
-    list.push_text(
-        width * 0.5,
-        bar_y + 15.0,
-        "VeilShell",
-        2,
-        palette.accent.with_alpha(alpha),
-        TextAlign::Center,
-    );
-
-    let net = match (ctx.wifi_connected, ctx.lte_connected) {
-        (true, true) => "Wi-Fi LTE",
-        (true, false) => "Wi-Fi",
-        (false, true) => "LTE",
-        (false, false) => "Offline",
-    };
-    let status = format!("{net}  {}%", ctx.battery_pct);
-    list.push_text(
-        bar_x + bar_w - 22.0,
-        bar_y + 15.0,
-        status,
-        2,
-        palette.foreground.with_alpha(alpha),
-        TextAlign::Right,
-    );
 }
 
 fn build_home(
@@ -652,489 +572,6 @@ fn push_home_pager(
         );
         x += w + 8.0;
     }
-}
-
-#[allow(clippy::too_many_lines)]
-fn build_recents(
-    out: &mut SceneOutput,
-    width: f32,
-    height: f32,
-    palette: &ThemePalette,
-    ctx: &SceneContext,
-) {
-    let progress = ctx.overlay_progress.clamp(0.0, 1.0);
-    let y_slide = (1.0 - progress) * 48.0;
-    push_glass_backdrop(&mut out.draw_list, width, height, palette, progress);
-    out.push_hit(
-        HitRect::new(0.0, 0.0, width, height),
-        HitTarget::DismissOverlay,
-    );
-    build_status_bar(
-        &mut out.draw_list,
-        width,
-        palette,
-        ctx,
-        y_slide * 0.25,
-        progress,
-    );
-
-    if ctx.recents_cards.is_empty() {
-        let card_w = (width * 0.42).clamp(280.0, 440.0);
-        let card_h = 180.0;
-        let card_x = (width - card_w) * 0.5;
-        let card_y = (height - card_h) * 0.5 + y_slide;
-        out.draw_list.push_rect(
-            RoundedRect::filled(
-                card_x,
-                card_y,
-                card_w,
-                card_h,
-                24.0,
-                palette.surface.with_alpha(0.84 * progress),
-            )
-            .with_glass_border(
-                palette.foreground.with_alpha(0.16 * progress),
-                1.2,
-                0.10 * progress,
-            )
-            .with_shadow(20.0, 10.0, 0.36 * progress),
-        );
-        out.draw_list.push_text(
-            width * 0.5,
-            card_y + 68.0,
-            "No Open Windows",
-            2,
-            palette.foreground.with_alpha(progress),
-            TextAlign::Center,
-        );
-        out.draw_list.push_text(
-            width * 0.5,
-            card_y + 102.0,
-            "Tap backdrop to return",
-            2,
-            palette.muted.with_alpha(progress),
-            TextAlign::Center,
-        );
-        push_bottom_pill_bar(&mut out.draw_list, width, height, palette, ctx);
-        return;
-    }
-
-    let count = ctx.recents_cards.len().min(3);
-    let card_w = (width * 0.30).clamp(240.0, 380.0);
-    let card_h = (height * 0.58).clamp(260.0, 480.0);
-    let gap = 28.0;
-    let total_w = card_w * count as f32 + gap * count.saturating_sub(1) as f32;
-    let start_x = (width - total_w) * 0.5;
-    let base_y = (height - card_h) * 0.5 + 16.0 + y_slide;
-
-    for (idx, card) in ctx.recents_cards.iter().take(count).enumerate() {
-        let card_x = start_x + idx as f32 * (card_w + gap);
-        let card_y = if card.focused { base_y - 12.0 } else { base_y };
-        let border = if card.focused {
-            palette.accent.with_alpha(0.90 * progress)
-        } else {
-            palette.foreground.with_alpha(0.18 * progress)
-        };
-        let border_w = if card.focused { 2.5 } else { 1.2 };
-
-        out.draw_list.push_rect(
-            RoundedRect::filled(
-                card_x,
-                card_y,
-                card_w,
-                card_h,
-                24.0,
-                palette.surface.with_alpha(0.86 * progress),
-            )
-            .with_glass_border(border, border_w, 0.12 * progress)
-            .with_shadow(22.0, 12.0, 0.40 * progress),
-        );
-
-        // Header strip
-        out.draw_list.push_rect(RoundedRect::filled(
-            card_x + 14.0,
-            card_y + 14.0,
-            card_w - 28.0,
-            40.0,
-            14.0,
-            mix(
-                palette.background,
-                palette.accent,
-                if card.focused { 0.25 } else { 0.08 },
-            )
-            .with_alpha(0.85 * progress),
-        ));
-        out.draw_list.push_text(
-            card_x + 28.0,
-            card_y + 27.0,
-            truncate_label(&card.app_id, 16),
-            2,
-            palette.foreground.with_alpha(progress),
-            TextAlign::Left,
-        );
-
-        // Close pill badge
-        let close_x = card_x + card_w - 46.0;
-        let close_y = card_y + 22.0;
-        out.draw_list.push_rect(RoundedRect::filled(
-            close_x,
-            close_y,
-            24.0,
-            24.0,
-            12.0,
-            palette.error.with_alpha(0.86 * progress),
-        ));
-        out.draw_list.push_text(
-            close_x + 12.0,
-            close_y + 6.0,
-            "X",
-            2,
-            palette.background.with_alpha(progress),
-            TextAlign::Center,
-        );
-
-        // Card preview pane
-        let pane_x = card_x + 18.0;
-        let pane_y = card_y + 68.0;
-        let pane_w = card_w - 36.0;
-        let pane_h = card_h - 118.0;
-        out.draw_list.push_rect(
-            RoundedRect::filled(
-                pane_x,
-                pane_y,
-                pane_w,
-                pane_h,
-                16.0,
-                palette.background.with_alpha(0.75 * progress),
-            )
-            .with_glass_border(
-                palette.foreground.with_alpha(0.08 * progress),
-                1.0,
-                0.04 * progress,
-            ),
-        );
-        if let Some(thumb) = &card.thumbnail {
-            let avail_w = (pane_w - 8.0).max(16.0);
-            let avail_h = (pane_h - 8.0).max(16.0);
-            let scale = (avail_w / thumb.width as f32).min(avail_h / thumb.height as f32);
-            let iw = (thumb.width as f32 * scale).max(1.0);
-            let ih = (thumb.height as f32 * scale).max(1.0);
-            let ix = pane_x + (pane_w - iw) * 0.5;
-            let iy = pane_y + (pane_h - ih) * 0.5;
-            out.draw_list.push_image(ImageQuad {
-                x: ix,
-                y: iy,
-                w: iw,
-                h: ih,
-                radius: 12.0,
-                alpha: progress,
-                image: Arc::clone(thumb),
-            });
-            let pill_h = 24.0_f32.min(pane_h * 0.3);
-            let pill_y = pane_y + pane_h - pill_h - 8.0;
-            out.draw_list.push_rect(RoundedRect::filled(
-                pane_x + 10.0,
-                pill_y,
-                (pane_w - 20.0).max(24.0),
-                pill_h,
-                8.0,
-                palette.background.with_alpha(0.76 * progress),
-            ));
-            out.draw_list.push_text(
-                card_x + card_w * 0.5,
-                pill_y + (pill_h - 7.0) * 0.5,
-                truncate_label(&card.title, 26),
-                1,
-                palette.foreground.with_alpha(progress),
-                TextAlign::Center,
-            );
-        } else {
-            out.draw_list.push_text(
-                card_x + card_w * 0.5,
-                card_y + card_h * 0.5,
-                truncate_label(&card.title, 20),
-                2,
-                palette.muted.with_alpha(progress),
-                TextAlign::Center,
-            );
-        }
-        out.draw_list.push_text(
-            card_x + card_w * 0.5,
-            card_y + card_h - 30.0,
-            if card.focused {
-                "Active"
-            } else {
-                "Tap to focus"
-            },
-            2,
-            if card.focused {
-                palette.accent.with_alpha(progress)
-            } else {
-                palette.muted.with_alpha(progress)
-            },
-            TextAlign::Center,
-        );
-
-        out.push_hit(
-            HitRect::new(card_x, card_y, card_w, card_h),
-            HitTarget::FocusWindow {
-                id: card.id.clone(),
-            },
-        );
-        // Close hit region registered AFTER card so tapping X always closes instead of focusing
-        out.push_hit(
-            HitRect::new(close_x - 8.0, close_y - 8.0, 40.0, 40.0),
-            HitTarget::CloseWindow {
-                id: card.id.clone(),
-            },
-        );
-    }
-
-    push_bottom_pill_bar(&mut out.draw_list, width, height, palette, ctx);
-}
-
-#[allow(clippy::too_many_lines)]
-fn build_shade(
-    out: &mut SceneOutput,
-    width: f32,
-    height: f32,
-    palette: &ThemePalette,
-    ctx: &SceneContext,
-) {
-    let progress = ctx.overlay_progress.clamp(0.0, 1.0);
-    push_glass_backdrop(&mut out.draw_list, width, height, palette, progress);
-    if let Some(menu) = ctx.power_menu.filter(|menu| *menu != PowerMenu::Closed) {
-        draw_power_menu(out, palette, width, height, menu);
-        return;
-    }
-    out.push_hit(
-        HitRect::new(0.0, 0.0, width, height),
-        HitTarget::DismissOverlay,
-    );
-
-    let panel_w = (width * 0.62).clamp(360.0, 680.0);
-    let panel_h = shade_panel_height(height);
-    let panel_x = (width - panel_w) * 0.5;
-    let panel_y = 32.0 - (1.0 - progress) * shade_reveal_travel(height);
-
-    out.draw_list.push_rect(
-        RoundedRect::filled(
-            panel_x,
-            panel_y,
-            panel_w,
-            panel_h,
-            32.0,
-            palette.surface.with_alpha(0.86 * progress),
-        )
-        .with_glass_border(
-            palette.foreground.with_alpha(0.18 * progress),
-            1.5,
-            0.14 * progress,
-        )
-        .with_shadow(28.0, 14.0, 0.45 * progress),
-    );
-
-    out.draw_list.push_text(
-        panel_x + 32.0,
-        panel_y + 28.0,
-        &ctx.clock_text,
-        3,
-        palette.foreground.with_alpha(progress),
-        TextAlign::Left,
-    );
-    out.draw_list.push_text(
-        panel_x + panel_w - 32.0,
-        panel_y + 32.0,
-        format!("Battery {}%", ctx.battery_pct),
-        2,
-        palette.accent.with_alpha(progress),
-        TextAlign::Right,
-    );
-
-    let tiles = [
-        ("wifi", "Wi-Fi", ctx.wifi_connected),
-        ("bluetooth", "Bluetooth", ctx.bluetooth_enabled),
-        ("lte", "LTE Modem", ctx.lte_connected),
-        ("autorotate", "Auto-Rotate", !ctx.rotation_locked),
-        ("tablet_mode", "Tablet Mode", ctx.tablet_mode),
-        ("night_light", "Night Light", ctx.night_light),
-    ];
-
-    let inner_x = panel_x + 28.0;
-    let inner_w = panel_w - 56.0;
-    let cols = 3_usize;
-    let gap = 14.0;
-    let tile_w = (inner_w - gap * (cols - 1) as f32) / cols as f32;
-    let tile_h = 84.0;
-    let grid_y = panel_y + 84.0;
-
-    for (idx, (id, label, active)) in tiles.iter().enumerate() {
-        let is_power = *id == "tablet_mode" && ctx.power_menu.is_some();
-        let active = *active && !is_power;
-        let label = if is_power { "Power" } else { *label };
-        let col = idx % cols;
-        let row = idx / cols;
-        let tx = inner_x + col as f32 * (tile_w + gap);
-        let ty = grid_y + row as f32 * (tile_h + gap);
-
-        let fill = if active {
-            palette.accent.with_alpha(0.88 * progress)
-        } else {
-            palette.background.with_alpha(0.68 * progress)
-        };
-        let fg = if active {
-            palette.background.with_alpha(progress)
-        } else {
-            palette.foreground.with_alpha(progress)
-        };
-        let border = if active {
-            Rgba::from_rgb_u8(255, 255, 255).with_alpha(0.35 * progress)
-        } else {
-            palette.foreground.with_alpha(0.12 * progress)
-        };
-
-        out.draw_list.push_rect(
-            RoundedRect::filled(tx, ty, tile_w, tile_h, 20.0, fill)
-                .with_glass_border(border, 1.2, 0.14 * progress)
-                .with_shadow(10.0, 4.0, 0.25 * progress),
-        );
-        out.draw_list.push_text(
-            tx + tile_w * 0.5,
-            ty + 24.0,
-            label,
-            2,
-            fg,
-            TextAlign::Center,
-        );
-        out.draw_list.push_text(
-            tx + tile_w * 0.5,
-            ty + 48.0,
-            if is_power {
-                "Session"
-            } else if active {
-                "On"
-            } else {
-                "Off"
-            },
-            2,
-            fg.with_alpha(0.82 * progress),
-            TextAlign::Center,
-        );
-
-        out.push_hit(
-            HitRect::new(tx, ty, tile_w, tile_h),
-            if is_power {
-                HitTarget::Power(PowerInput::Open)
-            } else {
-                HitTarget::ShadeToggle { id }
-            },
-        );
-    }
-
-    let slider_start_y = grid_y + 2.0 * (tile_h + gap) + 22.0;
-    push_slider(
-        out,
-        inner_x,
-        slider_start_y,
-        inner_w,
-        "brightness",
-        "Brightness",
-        ctx.brightness_pct,
-        palette,
-        progress,
-    );
-    push_slider(
-        out,
-        inner_x,
-        slider_start_y + 72.0,
-        inner_w,
-        "volume",
-        "Volume",
-        ctx.volume_pct,
-        palette,
-        progress,
-    );
-
-    let handle_w = 72.0;
-    out.draw_list.push_rect(RoundedRect::filled(
-        panel_x + (panel_w - handle_w) * 0.5,
-        panel_y + panel_h - 18.0,
-        handle_w,
-        5.0,
-        2.5,
-        palette.muted.with_alpha(0.75 * progress),
-    ));
-
-    push_bottom_pill_bar(&mut out.draw_list, width, height, palette, ctx);
-    if progress < 1.0 {
-        out.hit_regions.clear();
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn push_slider(
-    out: &mut SceneOutput,
-    x: f32,
-    y: f32,
-    w: f32,
-    id: &'static str,
-    label: &str,
-    pct: u8,
-    palette: &ThemePalette,
-    progress: f32,
-) {
-    let pct_clamped = pct.min(100);
-    let h = 48.0;
-    out.draw_list.push_rect(
-        RoundedRect::filled(
-            x,
-            y,
-            w,
-            h,
-            24.0,
-            palette.background.with_alpha(0.72 * progress),
-        )
-        .with_glass_border(
-            palette.foreground.with_alpha(0.12 * progress),
-            1.0,
-            0.06 * progress,
-        ),
-    );
-    let fill_w = (w * f32::from(pct_clamped) / 100.0).max(h);
-    out.draw_list.push_rect(
-        RoundedRect::filled(
-            x,
-            y,
-            fill_w,
-            h,
-            24.0,
-            palette.accent.with_alpha(0.84 * progress),
-        )
-        .with_glass_border(
-            Rgba::from_rgb_u8(255, 255, 255).with_alpha(0.25 * progress),
-            1.0,
-            0.14 * progress,
-        ),
-    );
-    out.draw_list.push_text(
-        x + 20.0,
-        y + 17.0,
-        label,
-        2,
-        palette.background.with_alpha(progress),
-        TextAlign::Left,
-    );
-    out.draw_list.push_text(
-        x + w - 20.0,
-        y + 17.0,
-        format!("{pct_clamped}%"),
-        2,
-        palette.foreground.with_alpha(progress),
-        TextAlign::Right,
-    );
-
-    let rect = HitRect::new(x, y, w, h);
-    out.push_hit(rect, HitTarget::ShadeSlider { id, rect });
 }
 
 fn build_osk(

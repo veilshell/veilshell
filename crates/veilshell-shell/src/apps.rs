@@ -110,6 +110,7 @@ pub fn apps_to_tiles(apps: &[DesktopApp]) -> Vec<AppTile> {
                     .clone()
             });
             AppTile {
+                id: app.id.clone(),
                 badge: app_badge(&app.name),
                 label: app.name.clone(),
                 exec: format_exec_command(app),

@@ -74,7 +74,9 @@
 #### Sprint 4B — Day-to-day tablet parity
 
 - [x] Finger-following Home and Quick Settings reveals with reversible drags and spring settling, plus interactive Home paging.
-- [ ] Fullscreen split shade: edge of pull selects page; horizontal swipe switches Notifications and Quick Settings. Add actionable notification banners, history, dismissal, Do Not Disturb, and lock-screen privacy.
+- [x] Denial-mobile control center: fullscreen frost, connectivity capsules, vertical brightness/volume levels, four-column tiles, and `powerprofilesctl`/mako tiles shown only when available. Landscape uses the two-column layout.
+- [x] Denial-style Recents deck: frameless live window previews with app icon/name above each card, higher-resolution captures, swipe paging, and swipe-up-to-close.
+- [ ] Notification page of the split shade: actionable banners, history, dismissal, and lock-screen privacy. Quick Settings now has the Denial-style control layout and Do Not Disturb tile.
 - [x] Keyboard hold-to-repeat for Backspace and arrows, and a terminal utility row with Escape, Tab and all four arrows.
 - [ ] Keyboard long-press accents and optional local suggestions that are disabled for sensitive fields.
 - [ ] Editable Home: reorder icons, create folders, persist layout, share a dock across pages, and open a separate alphabetical app drawer. Desktop launcher adds search, recents and physical-keyboard navigation.

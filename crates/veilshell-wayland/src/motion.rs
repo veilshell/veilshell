@@ -4,6 +4,58 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use veilshell_core::{Spring, SpringParams};
+use veilshell_render::HitRect;
+
+pub(crate) struct SliderDrag {
+    pub(crate) id: &'static str,
+    pub(crate) rect: HitRect,
+    pub(crate) initial: u8,
+    last_sent: Option<Instant>,
+    dragging: bool,
+}
+
+impl SliderDrag {
+    pub(crate) fn new(id: &'static str, rect: HitRect, initial: u8) -> Self {
+        Self {
+            id,
+            rect,
+            initial,
+            last_sent: None,
+            dragging: false,
+        }
+    }
+
+    pub(crate) fn update(&mut self, dy: f32, now: Instant) -> Option<u8> {
+        self.dragging |= dy.abs() >= 4.0;
+        if !self.dragging
+            || self
+                .last_sent
+                .is_some_and(|at| now.duration_since(at) < Duration::from_millis(40))
+        {
+            return None;
+        }
+        self.last_sent = Some(now);
+        Some(self.relative(dy))
+    }
+
+    pub(crate) fn finish(&self, y: f32, dy: f32) -> u8 {
+        if self.dragging {
+            self.relative(dy)
+        } else {
+            slider_pct_for_y(y, self.rect)
+        }
+    }
+
+    fn relative(&self, dy: f32) -> u8 {
+        (f32::from(self.initial) - dy * 100.0 / self.rect.h.max(1.0))
+            .clamp(0.0, 100.0)
+            .round() as u8
+    }
+}
+
+pub(crate) fn slider_pct_for_y(y: f32, rect: HitRect) -> u8 {
+    ((1.0 - (y - rect.y) / rect.h.max(1.0)).clamp(0.0, 1.0) * 100.0).round() as u8
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum DragMotion {
@@ -191,5 +243,16 @@ mod tests {
             speed.at_release(now + Duration::from_millis(220)),
             (0.0, 0.0)
         );
+    }
+
+    #[test]
+    fn shade_slider_taps_absolute_but_drags_from_the_current_level() {
+        let now = Instant::now();
+        let mut slider = SliderDrag::new("volume", HitRect::new(0.0, 100.0, 60.0, 200.0), 30);
+        assert_eq!(slider.finish(120.0, 0.0), 90);
+        assert_eq!(slider.update(-2.0, now), None);
+        assert_eq!(slider.update(-20.0, now), Some(40));
+        assert_eq!(slider.update(-100.0, now + Duration::from_millis(15)), None);
+        assert_eq!(slider.finish(120.0, -100.0), 80);
     }
 }

@@ -284,8 +284,6 @@ pub enum HitTarget {
     HomePage { page: usize },
     /// Tapping a recents card focuses the window with identifier `id`.
     FocusWindow { id: String },
-    /// Tapping a recents close badge closes the window with identifier `id`.
-    CloseWindow { id: String },
     /// Tapping a Quick Settings tile toggles `id` (`wifi`, `bluetooth`, etc.).
     ShadeToggle { id: &'static str },
     /// Tapping or dragging inside a Quick Settings slider updates `id`.

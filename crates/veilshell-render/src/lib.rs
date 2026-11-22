@@ -6,7 +6,10 @@ pub mod font;
 pub mod gpu;
 pub mod power;
 pub mod primitives;
+mod recents;
 pub mod scene;
+mod shade;
+mod shade_glyphs;
 pub mod software;
 
 use std::fmt;
@@ -22,10 +25,12 @@ pub use primitives::{
     DrawCommand, DrawList, HitRect, HitRegion, HitTarget, ImageQuad, RgbaImage, RoundedRect,
     SceneOutput, ShmPixelFormat, TextAlign, TextLabel,
 };
+pub use recents::recents_stride;
 pub use scene::{
     build_scene, build_scene_layout, build_top_strip_scene, default_demo_apps, home_page_count,
-    home_reveal_travel, shade_reveal_travel, AppTile, RecentsCard, SceneContext,
+    home_reveal_travel, AppTile, RecentsCard, SceneContext,
 };
+pub use shade::{shade_reveal_travel, ShadeStatus};
 pub use software::SdfSoftwareRenderer;
 
 /// High-level shell scene rendered either live on `Wayland` or offscreen to a snapshot.
@@ -273,7 +278,7 @@ pub trait RendererBackend {
 #[derive(Debug)]
 pub enum ActiveRenderer {
     /// Zero-`unsafe` CPU analytic SDF rasterizer.
-    Software(SdfSoftwareRenderer),
+    Software(Box<SdfSoftwareRenderer>),
     /// Hardware-accelerated Vulkan/GLES `wgpu` WGSL SDF renderer.
     #[cfg(feature = "wgpu")]
     Wgpu(Box<WgpuRenderer>),
@@ -290,9 +295,9 @@ impl ActiveRenderer {
     /// and cannot be initialized.
     pub fn new(pref: RendererPreference, context: SceneContext) -> Result<Self, RenderError> {
         match pref {
-            RendererPreference::Software => {
-                Ok(Self::Software(SdfSoftwareRenderer::with_context(context)))
-            }
+            RendererPreference::Software => Ok(Self::Software(Box::new(
+                SdfSoftwareRenderer::with_context(context),
+            ))),
             RendererPreference::Auto => {
                 #[cfg(feature = "wgpu")]
                 {
@@ -302,13 +307,17 @@ impl ActiveRenderer {
                             eprintln!(
                                 "veilshell: wgpu unavailable ({err}); falling back to sdf-software"
                             );
-                            Ok(Self::Software(SdfSoftwareRenderer::with_context(context)))
+                            Ok(Self::Software(Box::new(SdfSoftwareRenderer::with_context(
+                                context,
+                            ))))
                         }
                     }
                 }
                 #[cfg(not(feature = "wgpu"))]
                 {
-                    Ok(Self::Software(SdfSoftwareRenderer::with_context(context)))
+                    Ok(Self::Software(Box::new(SdfSoftwareRenderer::with_context(
+                        context,
+                    ))))
                 }
             }
             RendererPreference::Wgpu => {
@@ -582,8 +591,14 @@ mod tests {
     }
 
     #[test]
-    fn recents_hit_test_prioritizes_close_badge_over_card_focus() {
-        let ctx = SceneContext::default();
+    fn recents_centers_a_later_window_and_draws_an_unframed_preview() {
+        let mut ctx = SceneContext::default();
+        ctx.recents_cards.extend(ctx.recents_cards.clone());
+        ctx.recents_index = 5;
+        let card = &mut ctx.recents_cards[5];
+        card.id = "last".into();
+        card.thumbnail =
+            std::sync::Arc::new(RgbaImage::new(320, 200, vec![255; 320 * 200 * 4]).unwrap()).into();
         let out = build_scene_layout(
             SceneKind::Recents,
             1280.0,
@@ -591,30 +606,17 @@ mod tests {
             &ThemePalette::default_dark(),
             &ctx,
         );
-        let close_region = out
-            .hit_regions
+        assert_eq!(
+            out.hit_test(640.0, 426.0),
+            Some(&HitTarget::FocusWindow { id: "last".into() })
+        );
+        assert!(out.draw_list.commands.iter().any(|cmd| matches!(
+            cmd, DrawCommand::Image(quad) if quad.w > 790.0 && quad.radius > 20.0)));
+        assert!(!out
+            .draw_list
+            .commands
             .iter()
-            .find(|r| matches!(r.target, HitTarget::CloseWindow { .. }))
-            .expect("close region exists");
-        let cx = close_region.rect.x + close_region.rect.w * 0.5;
-        let cy = close_region.rect.y + close_region.rect.h * 0.5;
-        assert!(matches!(
-            out.hit_test(cx, cy),
-            Some(HitTarget::CloseWindow { ref id }) if id == "0x1"
-        ));
-
-        let card_region = out
-            .hit_regions
-            .iter()
-            .find(|r| matches!(r.target, HitTarget::FocusWindow { .. }))
-            .expect("focus region exists");
-        assert!(matches!(
-            out.hit_test(
-                card_region.rect.x + card_region.rect.w * 0.5,
-                card_region.rect.y + card_region.rect.h * 0.5,
-            ),
-            Some(HitTarget::FocusWindow { ref id }) if id == "0x1"
-        ));
+            .any(|cmd| matches!(cmd, DrawCommand::BackdropGradient { .. })));
     }
 
     #[test]
@@ -766,24 +768,28 @@ mod tests {
         let theme = ThemePalette::default_dark();
         let height = 853.0;
         let travel = shade_reveal_travel(height);
-        for distance in [50.0, 120.0, 230.0] {
+        let frost_alpha = |distance: f32| {
             let ctx = SceneContext {
                 overlay_progress: distance / travel,
                 ..SceneContext::default()
             };
             let shade = build_scene_layout(SceneKind::Shade, 1280.0, height, &theme, &ctx);
-            let panel = shade
+            let alpha = shade
                 .draw_list
                 .commands
                 .iter()
                 .find_map(|cmd| match cmd {
-                    DrawCommand::Rect(rect) => Some(rect),
+                    DrawCommand::BackdropGradient { top, .. } => Some(top.a),
                     _ => None,
                 })
                 .unwrap();
-            assert!((panel.y + panel.h - distance).abs() < 0.01);
+            // No half-pulled panel: controls only become tappable once open.
             assert_eq!(shade.hit_regions, []);
-        }
+            alpha
+        };
+        let quarter = frost_alpha(travel * 0.33);
+        assert!(quarter > 0.0, "frost should be established at 33% pull");
+        assert!(frost_alpha(travel * 0.1) < quarter);
     }
 
     #[test]

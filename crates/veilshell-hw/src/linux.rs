@@ -87,37 +87,54 @@ impl LinuxHardware {
 
 impl HardwareBackend for LinuxHardware {
     fn snapshot(&self) -> HardwareSnapshot {
-        let (wifi_radio, wwan_radio) = run_stdout("nmcli", &["-t", "-f", "WIFI,WWAN", "general"])
-            .and_then(|out| parse_nmcli_general(&out))
-            .unwrap_or((false, false));
+        let radios = run_stdout("nmcli", &["-t", "-f", "WIFI,WWAN", "general"])
+            .and_then(|out| parse_nmcli_general(&out));
 
-        let (wifi_ssid, gsm_signal) = run_stdout(
+        let devices = run_stdout(
             "nmcli",
             &["-t", "-f", "TYPE,STATE,CONNECTION", "dev", "status"],
         )
-        .map_or((None, None), |out| parse_nmcli_devices(&out));
+        .unwrap_or_default();
+        let (wifi_ssid, gsm_signal) = parse_nmcli_devices(&devices);
+        let wifi_radio = radios
+            .map(|(wifi, _)| wifi)
+            .filter(|_| devices.lines().any(|line| line.starts_with("wifi:")));
+        let mobile_radio = radios.map(|(_, mobile)| mobile).filter(|_| {
+            devices
+                .lines()
+                .any(|line| line.starts_with("gsm:") || line.starts_with("wwan:"))
+        });
 
-        let wifi_connected = wifi_radio && wifi_ssid.is_some();
-        let lte_signal_pct = if wwan_radio { gsm_signal } else { None };
+        let wifi_connected = wifi_radio == Some(true) && wifi_ssid.is_some();
+        let lte_signal_pct = if mobile_radio == Some(true) {
+            gsm_signal
+        } else {
+            None
+        };
 
-        let bluetooth_enabled = read_bluetooth_enabled();
+        let bluetooth = read_bluetooth_enabled();
         let (battery_pct, charging) = read_sysfs_battery().unwrap_or((100, false));
-        let brightness_pct = read_sysfs_backlight().unwrap_or(80);
-        let (volume_pct, muted) = run_stdout("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"])
-            .and_then(|out| parse_wpctl_volume(&out))
-            .unwrap_or((50, false));
+        let brightness = read_sysfs_backlight();
+        let volume = run_stdout("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"])
+            .and_then(|out| parse_wpctl_volume(&out));
+        let (volume_pct, muted) = volume.unwrap_or((50, false));
         let night_light = read_hyprsunset_enabled();
         let keyboard_attached = self.detect_keyboard_attached();
 
         HardwareSnapshot {
             wifi_connected,
+            wifi_radio,
             wifi_ssid,
-            bluetooth_enabled,
+            bluetooth_enabled: bluetooth.unwrap_or(false),
+            bluetooth_available: bluetooth.is_some(),
             lte_signal_pct,
+            mobile_radio,
             battery_pct,
             charging,
-            brightness_pct,
+            brightness_pct: brightness.unwrap_or(80),
+            brightness_available: brightness.is_some(),
             volume_pct,
+            volume_available: volume.is_some(),
             muted,
             night_light,
             keyboard_attached,
@@ -475,7 +492,7 @@ impl Drop for SensorGuard {
     }
 }
 
-fn read_bluetooth_enabled() -> bool {
+fn read_bluetooth_enabled() -> Option<bool> {
     // Fast-path check via rfkill sysfs: if hard or soft blocked, BlueZ cannot be powered.
     if let Ok(entries) = fs::read_dir(SYSFS_RFKILL) {
         let mut saw_bt = false;
@@ -493,13 +510,11 @@ fn read_bluetooth_enabled() -> bool {
             }
         }
         if saw_bt && !all_unblocked {
-            return false;
+            return Some(false);
         }
     }
 
-    run_stdout("bluetoothctl", &["show"])
-        .and_then(|out| parse_bluetoothctl_powered(&out))
-        .unwrap_or(false)
+    run_stdout("bluetoothctl", &["show"]).and_then(|out| parse_bluetoothctl_powered(&out))
 }
 
 fn read_hyprsunset_enabled() -> bool {
