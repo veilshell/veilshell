@@ -9,9 +9,16 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 
+[features]
+default = ["wgpu"]
+wgpu = ["dep:bytemuck", "dep:pollster", "dep:wgpu"]
+
 [dependencies]
+bytemuck = { workspace = true, optional = true }
 png.workspace = true
+pollster = { workspace = true, optional = true }
 veilshell-core.workspace = true
+wgpu = { workspace = true, optional = true }
 
 [lints]
 workspace = true

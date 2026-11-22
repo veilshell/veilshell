@@ -9,10 +9,27 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 
+[features]
+default = ["wgpu"]
+wgpu = ["dep:raw-window-handle", "dep:wayland-client", "dep:wgpu", "veilshell-render/wgpu"]
+
 [dependencies]
+raw-window-handle = { workspace = true, optional = true }
 smithay-client-toolkit.workspace = true
 veilshell-core.workspace = true
 veilshell-render.workspace = true
+wayland-client = { workspace = true, optional = true }
+wgpu = { workspace = true, optional = true }
 
-[lints]
-workspace = true
+# Allow a single isolated raw-window-handle bridge for zero-copy wgpu::Surface creation
+# while denying unsafe_code everywhere else in this crate.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"

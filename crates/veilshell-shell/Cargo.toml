@@ -17,6 +17,10 @@ path = "src/bin/veilshell.rs"
 name = "veilctl"
 path = "src/bin/veilctl.rs"
 
+[features]
+default = ["wgpu"]
+wgpu = ["veilshell-render/wgpu", "veilshell-wayland/wgpu"]
+
 [dependencies]
 veilshell-compositor.workspace = true
 veilshell-core.workspace = true

@@ -9,7 +9,8 @@ use veilshell_compositor::{CompositorBackend, HyprlandBackend, MockBackend};
 use veilshell_core::{ModePolicy, Orientation};
 use veilshell_hw::MockHardware;
 use veilshell_render::{
-    RendererBackend, SceneContext, SceneKind, SdfSoftwareRenderer, SnapshotSpec, ViewportSize,
+    ActiveRenderer, RendererBackend, RendererPreference, SceneContext, SceneKind, SnapshotSpec,
+    ViewportSize, WallpaperImage,
 };
 use veilshell_shell::apps::{apps_to_tiles, current_clock_hhmm, discover_desktop_apps};
 use veilshell_shell::ipc::{default_socket_path, send_daemon_command};
@@ -37,6 +38,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "show" => cmd_show(args.get(1).map(String::as_str)),
+        "wallpaper" => cmd_wallpaper(args.get(1).map(String::as_str)),
         "reload-theme" => cmd_daemon_simple("reload-theme"),
         "quit" => cmd_daemon_simple("quit"),
         "apps" => {
@@ -84,6 +86,31 @@ fn cmd_show(arg: Option<&str>) -> ExitCode {
     };
     let sock = default_socket_path();
     match send_daemon_command(&sock, &format!("show {}", scene.as_str())) {
+        Ok(reply) => {
+            print!("{reply}");
+            if reply.starts_with("err") {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "veilshell daemon is not running at {}: {err}",
+                sock.display()
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_wallpaper(arg: Option<&str>) -> ExitCode {
+    let Some(path) = arg else {
+        eprintln!("usage: veilctl wallpaper <PNG_PATH|clear>");
+        return ExitCode::FAILURE;
+    };
+    let sock = default_socket_path();
+    match send_daemon_command(&sock, &format!("wallpaper {path}")) {
         Ok(reply) => {
             print!("{reply}");
             if reply.starts_with("err") {
@@ -246,6 +273,7 @@ fn cmd_mode(arg: Option<&str>) -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn cmd_snapshot(args: &[String]) -> ExitCode {
     let demo = args.iter().any(|a| a == "--demo");
     let scene_name = parse_flag(args, "--scene").unwrap_or_else(|| "home".to_owned());
@@ -291,6 +319,26 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
         }
         None => 1.0,
     };
+    let renderer_pref = match parse_flag(args, "--renderer") {
+        Some(raw) => {
+            let Some(parsed) = RendererPreference::parse_name(&raw) else {
+                eprintln!("invalid --renderer '{raw}' (expected: auto, wgpu, software)");
+                return ExitCode::FAILURE;
+            };
+            parsed
+        }
+        None => RendererPreference::Auto,
+    };
+    let wallpaper = match parse_flag(args, "--wallpaper") {
+        Some(path) => match WallpaperImage::load_png(&path) {
+            Ok(img) => Some(img),
+            Err(err) => {
+                eprintln!("failed to load --wallpaper '{path}': {err}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
     let out_path = PathBuf::from(
         parse_flag(args, "--out").unwrap_or_else(|| format!("veilshell-{}.png", scene.as_str())),
     );
@@ -305,7 +353,20 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
         }
     }
 
-    let mut renderer = SdfSoftwareRenderer::with_context(ctx);
+    let mut renderer = match ActiveRenderer::new(renderer_pref, ctx) {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("renderer init failed: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(wp) = &wallpaper {
+        if let Err(err) = renderer.set_wallpaper(Some(wp)) {
+            eprintln!("wallpaper blur failed: {err}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let backend_label = renderer.backend_label();
     let spec = SnapshotSpec {
         scene,
         viewport: ViewportSize {
@@ -322,10 +383,11 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
     {
         Ok(frame) => {
             println!(
-                "Saved {} snapshot ({}x{}, theme: {}) -> {}",
+                "Saved {} snapshot ({}x{}, renderer: {}, theme: {}) -> {}",
                 scene.as_str(),
                 frame.width,
                 frame.height,
+                backend_label,
                 palette.name,
                 out_path.display()
             );
@@ -354,12 +416,14 @@ fn print_help() {
          \tstatus                            Show shell mode, theme, compositor, and daemon state\n\
          \tshow <pill|home|recents|shade|osk> Switch the running daemon's active surface\n\
          \tmode <auto|laptop|tablet|toggle>  Evaluate or apply the Laptop/Tablet mode policy\n\
+         \twallpaper <PNG_PATH|clear>        Update or clear the GPU pre-blurred glass wallpaper\n\
          \treload-theme                      Reload colors.toml in the running daemon\n\
          \tquit                              Stop the running daemon cleanly\n\
          \tapps                              List discovered .desktop applications\n\
          \ttheme                             Inspect the resolved color palette and WCAG contrast\n\
          \tsnapshot [OPTIONS]                Render an offscreen glassmorphic PNG snapshot\n\
-         \t  --scene <pill|home|recents|shade|osk> --width <PX> --height <PX> --out <PATH> [--demo]\n\
+         \t  --scene <pill|home|recents|shade|osk> --renderer <auto|wgpu|software> [--wallpaper <PNG>]\n\
+         \t  --width <PX> --height <PX> --out <PATH> [--demo]\n\
          \thelp                              Print this help message",
         env!("CARGO_PKG_VERSION")
     );

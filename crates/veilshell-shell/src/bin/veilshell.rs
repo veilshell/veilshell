@@ -11,7 +11,9 @@ use veilshell_compositor::{
 };
 use veilshell_core::{ModeEvent, ModePolicy, ModeStateMachine, Orientation, ShellMode};
 use veilshell_hw::MockHardware;
-use veilshell_render::{RecentsCard, SceneContext, SceneKind};
+use veilshell_render::{
+    ActiveRenderer, RecentsCard, RendererPreference, SceneContext, SceneKind, WallpaperImage,
+};
 use veilshell_shell::apps::{apps_to_tiles, current_clock_hhmm, discover_desktop_apps};
 use veilshell_shell::ipc::{default_socket_path, spawn_ipc_listener};
 use veilshell_shell::ShellState;
@@ -207,6 +209,7 @@ impl ShellActionHandler for LiveActionHandler {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
@@ -232,6 +235,26 @@ fn main() -> ExitCode {
 
     let output_name = parse_flag(&args, "--output");
     let socket_path = parse_flag(&args, "--socket").map_or_else(default_socket_path, PathBuf::from);
+    let renderer_pref = match parse_flag(&args, "--renderer") {
+        Some(raw) => {
+            let Some(parsed) = RendererPreference::parse_name(&raw) else {
+                eprintln!("invalid --renderer '{raw}' (expected: auto, wgpu, software)");
+                return ExitCode::FAILURE;
+            };
+            parsed
+        }
+        None => RendererPreference::Auto,
+    };
+    let wallpaper = match parse_flag(&args, "--wallpaper") {
+        Some(path) => match WallpaperImage::load_png(&path) {
+            Ok(img) => Some(img),
+            Err(err) => {
+                eprintln!("failed to load --wallpaper '{path}': {err}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
 
     let exit_after_ms = match parse_flag(&args, "--exit-after-ms") {
         Some(raw) => {
@@ -269,6 +292,10 @@ fn main() -> ExitCode {
         let state = ShellState::new(MockBackend::default(), MockHardware::default(), palette);
         print!("{}", state.status_report());
         println!("  scene      : {}", scene.as_str());
+        match ActiveRenderer::new(renderer_pref, scene_ctx.clone()) {
+            Ok(active) => println!("  renderer   : {}", active.backend_label()),
+            Err(err) => println!("  renderer   : unavailable ({err})"),
+        }
         println!("  apps       : {}", scene_ctx.home_apps.len());
         println!("  windows    : {}", scene_ctx.recents_cards.len());
         println!("  socket     : {}", socket_path.display());
@@ -291,6 +318,8 @@ fn main() -> ExitCode {
         output_name,
         preferred_scale: 1.0,
         exit_after_ms,
+        renderer: renderer_pref,
+        wallpaper,
     };
 
     let result = run_shell_daemon(&config, scene, palette, scene_ctx, cmd_rx, handler);
@@ -319,6 +348,8 @@ fn print_help() {
          \tveilshell [OPTIONS]\n\n\
          OPTIONS:\n\
          \t--scene <pill|home|recents|shade|osk>  Initial surface scene (default: pill)\n\
+         \t--renderer <auto|wgpu|software>        Rendering backend (default: auto)\n\
+         \t--wallpaper <PNG_PATH>                 Static PNG wallpaper for pre-blurred GPU glass\n\
          \t--output <NAME>                        Bind surfaces to a specific Wayland output\n\
          \t--socket <PATH>                        Override Unix control socket path\n\
          \t--exit-after-ms <MS>                   Exit cleanly after MS milliseconds (for CI tests)\n\

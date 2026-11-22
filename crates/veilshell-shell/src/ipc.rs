@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use veilshell_render::SceneKind;
+use veilshell_render::{SceneKind, WallpaperImage};
 use veilshell_theme::load_best_available;
 use veilshell_wayland::channel::Sender;
 use veilshell_wayland::DaemonCommand;
@@ -106,18 +106,20 @@ fn handle_client(mut stream: UnixStream, cmd_tx: &Sender<DaemonCommand>) -> bool
             let _ = cmd_tx.send(DaemonCommand::UpdatePalette(palette));
             let _ = writeln!(stream, "ok theme {name}");
         }
+        "wallpaper" => handle_wallpaper_cmd(&mut stream, trimmed, cmd_tx),
         "status" => {
             let (tx, rx) = mpsc::channel();
             if cmd_tx.send(DaemonCommand::QueryStatus(tx)).is_ok() {
                 if let Ok(st) = rx.recv_timeout(Duration::from_secs(1)) {
                     let _ = writeln!(
                         stream,
-                        "daemon     : running (scene: {}, visible: {}, output: {} {}x{})",
+                        "daemon     : running (scene: {}, visible: {}, output: {} {}x{}, renderer: {})",
                         st.active_scene.as_str(),
                         st.visible,
                         st.output_name.as_deref().unwrap_or("default"),
                         st.width,
-                        st.height
+                        st.height,
+                        st.renderer
                     );
                 } else {
                     let _ = writeln!(stream, "err status timeout");
@@ -150,4 +152,25 @@ fn handle_client(mut stream: UnixStream, cmd_tx: &Sender<DaemonCommand>) -> bool
         }
     }
     false
+}
+
+fn handle_wallpaper_cmd(stream: &mut UnixStream, trimmed: &str, cmd_tx: &Sender<DaemonCommand>) {
+    let arg = trimmed.strip_prefix("wallpaper").map_or("", str::trim);
+    if arg.is_empty() {
+        let _ = writeln!(stream, "err usage: wallpaper <PATH|clear>");
+    } else if arg.eq_ignore_ascii_case("clear") || arg.eq_ignore_ascii_case("none") {
+        let _ = cmd_tx.send(DaemonCommand::SetWallpaper(None));
+        let _ = writeln!(stream, "ok wallpaper cleared");
+    } else {
+        match WallpaperImage::load_png(arg) {
+            Ok(img) => {
+                let (w, h) = (img.width, img.height);
+                let _ = cmd_tx.send(DaemonCommand::SetWallpaper(Some(img)));
+                let _ = writeln!(stream, "ok wallpaper {arg} ({w}x{h})");
+            }
+            Err(err) => {
+                let _ = writeln!(stream, "err wallpaper '{arg}': {err}");
+            }
+        }
+    }
 }

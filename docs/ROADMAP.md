@@ -12,8 +12,8 @@
 ## Resolved Architectural Decisions
 
 - **Organization & Repository:** Hosted under the dedicated **`github.com/veilshell`** organization (`https://github.com/veilshell/veilshell`) to welcome community maintainers and future companion repos.
-- **License & Clean-Room Policy:** **`GPL-3.0-or-later`** (matching `denialwm/denial`), written from scratch in pure Rust with `#![forbid(unsafe_code)]` across all workspace crates and explicit upstream attribution in [NOTICE.md](../NOTICE.md).
-- **Renderer Architecture:** Shared renderer-agnostic glassmorphic `DrawList` + hit-test `SceneOutput` (`veilshell-render`), backed today by a zero-`unsafe` cached-backdrop analytic antialiased CPU SDF rasterizer + PNG snapshot exporter (`SdfSoftwareRenderer`, ~0.5s full-screen render + PNG encode even in debug builds), with a `wgpu` Vulkan GPU shader backend consuming the exact same `DrawList` in Phase 3 so offscreen snapshots and live GPU frames stay pixel-consistent.
+- **License & Clean-Room Policy:** **`GPL-3.0-or-later`** (matching `denialwm/denial`), written from scratch in pure Rust with `#![forbid(unsafe_code)]` across 6 of 7 workspace crates (and `unsafe_code = "deny"` in `veilshell-wayland` permitting only a single isolated `raw-window-handle` `wgpu::Surface` bridge) and explicit upstream attribution in [NOTICE.md](../NOTICE.md).
+- **Renderer Architecture:** Shared renderer-agnostic glassmorphic `DrawList` + hit-test `SceneOutput` (`veilshell-render`), backed by both a hardware-accelerated `wgpu` Vulkan/GLES WGSL instanced SDF renderer (`WgpuRenderer`, zero-copy `wgpu::Surface` Wayland presentation + blur-once GPU static wallpaper glass cache) and a zero-`unsafe` CPU analytic SDF fallback (`SdfSoftwareRenderer`), selectable via `--renderer auto|wgpu|software` with automated GPU-vs-CPU pixel-parity tests.
 - **Minimum Supported Rust Version:** `1.86+` (aligned with `smithay-client-toolkit 0.21`).
 
 ## Phased Roadmap
@@ -48,7 +48,7 @@
 - [ ] Live Aether `colors.toml` file watcher (`inotify`) + Omarchy `adapters/omarchy/hooks/30-veilshell-theme` reload hook + optional `systemd --user` unit
 
 ### Phase 3 — GPU (`wgpu`) Acceleration & Built-In Touch OSK
-- [ ] `wgpu` Vulkan/GLES WGSL SDF renderer backend consuming the existing `DrawList` + pre-blurred static wallpaper glass cache (blur once on wallpaper change)
+- [x] `wgpu` Vulkan/GLES WGSL SDF renderer backend consuming the existing `DrawList` + pre-blurred static wallpaper glass cache (blur once on wallpaper change) + zero-copy `wgpu::Surface` Wayland presentation & automatic `SdfSoftwareRenderer` fallback
 - [ ] TrueType/FreeType font atlas (`swash` / `cosmic-text`) and app icon theme loader replacing the bitmap HUD font & initials badges
 - [ ] `zwp_input_method_v2` + `zwp_virtual_keyboard_v1` protocol integration in `veilshell-wayland` powering the multi-layout Touch OSK surface
 - [ ] Live window thumbnails via `hyprland-toplevel-export-v1` in the Recents Deck

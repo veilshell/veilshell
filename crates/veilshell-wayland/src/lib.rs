@@ -1,6 +1,8 @@
 //! `Wayland` `wlr-layer-shell` surface descriptors, touch models, and multi-surface daemon runtime.
 
 pub mod client;
+#[cfg(feature = "wgpu")]
+mod gpu;
 
 pub use client::{
     run_layer_surface, run_shell_daemon, DaemonCommand, RuntimeStatus, ShellAction,
@@ -179,6 +181,8 @@ pub struct WaylandRuntimeConfig {
     pub output_name: Option<String>,
     pub preferred_scale: f32,
     pub exit_after_ms: Option<u64>,
+    pub renderer: veilshell_render::RendererPreference,
+    pub wallpaper: Option<veilshell_render::WallpaperImage>,
 }
 
 impl Default for WaylandRuntimeConfig {
@@ -188,6 +192,8 @@ impl Default for WaylandRuntimeConfig {
             output_name: None,
             preferred_scale: 1.0,
             exit_after_ms: None,
+            renderer: veilshell_render::RendererPreference::Auto,
+            wallpaper: None,
         }
     }
 }

@@ -17,8 +17,9 @@ keybindings, or desktop workflow — engineered specifically for **older 5W /
   native Omarchy Aether `colors.toml` theme sync and zero interference with your
   desktop session.
 - **Edge performance budget:** Event-driven `calloop` main loop (`0%` idle CPU
-  when dormant), lazy overlay SHM allocation, fast cached SDF rendering, and
-  `#![forbid(unsafe_code)]` across the entire workspace.
+  when dormant), single-pass `wgpu` Vulkan/GLES instanced WGSL SDF rendering
+  with zero-copy `Wayland` swapchains + blur-once GPU wallpaper glass cache,
+  lazy overlay surface allocation, and automatic zero-`unsafe` CPU SDF fallback.
 - **Automated visual & headless UX testing:** Built-in offscreen glassmorphic PNG
   snapshots (`veilctl snapshot`) and a live Hyprland virtual-output + `grim`
   visual harness so contributors and AI agents can visually verify UI changes
@@ -31,8 +32,8 @@ keybindings, or desktop workflow — engineered specifically for **older 5W /
 | [`veilshell-core`](crates/veilshell-core) | Pure-Rust state machine, critically damped spring physics, gesture classifier, `.desktop` parser, orientation/rotation lock, WCAG theme primitives | Sprint 2A (Done) |
 | [`veilshell-theme`](crates/veilshell-theme) | `ThemeProvider` trait + live Omarchy Aether `colors.toml` loader + WCAG AA dark fallback | Phase 0 (Done) |
 | [`veilshell-compositor`](crates/veilshell-compositor) | `CompositorBackend` trait + live Hyprland Unix-socket IPC (Lua `eval` + legacy `keyword` fallback, recency-sorted `j/clients`, `j/monitors`, workspace switch, app launch) + `MockBackend` | Sprint 2A (Done) |
-| [`veilshell-render`](crates/veilshell-render) | Renderer-agnostic glassmorphic `DrawList` + `SceneOutput` hit-testing for all 5 scenes, cached-backdrop analytic SDF rasterizer, `ARGB8888` encoder, and `PNG` exporter | Sprint 2A (Done) |
-| [`veilshell-wayland`](crates/veilshell-wayland) | Event-driven `calloop` + `smithay-client-toolkit` multi-surface `wlr-layer-shell` runtime (`BottomPill`, `TopStrip`, lazy `Overlay`), output pinning (`--output`), `wl_touch`/`wl_pointer` gestures & hit routing | Sprint 2A (Done) |
+| [`veilshell-render`](crates/veilshell-render) | Renderer-agnostic glassmorphic `DrawList` + `SceneOutput` hit-testing for all 5 scenes, `wgpu` Vulkan/GLES WGSL SDF backend + blur-once GPU wallpaper glass cache, CPU SDF fallback, `ARGB8888` encoder, and `PNG` exporter | Phase 3 (`wgpu` Done) |
+| [`veilshell-wayland`](crates/veilshell-wayland) | Event-driven `calloop` + `smithay-client-toolkit` multi-surface `wlr-layer-shell` runtime (`BottomPill`, `TopStrip`, lazy `Overlay`), zero-copy `wgpu::Surface` Vulkan/GLES presentation + `wl_shm` fallback, output pinning (`--output`), `wl_touch`/`wl_pointer` gestures & hit routing | Phase 3 (`wgpu` Done) |
 | [`veilshell-hw`](crates/veilshell-hw) | `HardwareSnapshot`, `HardwareBackend` trait, and declarative `hardware-profiles/*.toml` parser (live `zbus` D-Bus backends in Sprint 2B) | Phase 0–1 (In Progress) |
 | [`veilshell-shell`](crates/veilshell-shell) | `ShellState` orchestration, `.desktop` discovery, `veilctl` Unix IPC socket, `veilshell` daemon & `veilctl` CLI | Sprint 2A (Done) |
 

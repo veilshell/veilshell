@@ -1,14 +1,22 @@
-//! Rendering scene models, analytic SDF glassmorphic renderer, and `PNG` snapshot export.
+//! Rendering scene models, analytic SDF glassmorphic renderers (`wgpu` GPU + CPU software),
+//! pre-blurred static wallpaper glass cache, and `PNG` snapshot export.
 
 pub mod font;
+#[cfg(feature = "wgpu")]
+pub mod gpu;
 pub mod primitives;
 pub mod scene;
 pub mod software;
 
 use std::fmt;
+use std::fs::File;
+use std::io::BufReader;
+use std::path::Path;
 
 use veilshell_core::{Orientation, ThemePalette};
 
+#[cfg(feature = "wgpu")]
+pub use gpu::WgpuRenderer;
 pub use primitives::{
     DrawCommand, DrawList, HitRect, HitRegion, HitTarget, RoundedRect, SceneOutput, TextAlign,
     TextLabel,
@@ -56,6 +64,41 @@ impl SceneKind {
     }
 }
 
+/// User or runtime preference for selecting the rendering backend.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum RendererPreference {
+    /// Prefer `wgpu` Vulkan/GLES when available, falling back seamlessly to `SdfSoftwareRenderer`.
+    #[default]
+    Auto,
+    /// Require the `wgpu` Vulkan/GLES GPU renderer (error if unavailable).
+    Wgpu,
+    /// Force the zero-`unsafe` CPU analytic SDF rasterizer.
+    Software,
+}
+
+impl RendererPreference {
+    /// Parse a CLI renderer flag (`auto`, `wgpu`, `gpu`, `software`, `cpu`).
+    #[must_use]
+    pub fn parse_name(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "wgpu" | "gpu" | "vulkan" => Some(Self::Wgpu),
+            "software" | "cpu" | "sdf" => Some(Self::Software),
+            _ => None,
+        }
+    }
+
+    /// Canonical lowercase renderer preference name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Wgpu => "wgpu",
+            Self::Software => "software",
+        }
+    }
+}
+
 /// Logical viewport dimensions and scale factor.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewportSize {
@@ -91,15 +134,82 @@ pub struct RenderFrame {
     pub rgba: Vec<u8>,
 }
 
+/// Decoded static `RGBA8` wallpaper image fed into the GPU blur-once glass backdrop cache.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WallpaperImage {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl WallpaperImage {
+    /// Load a `PNG` wallpaper image from disk and normalize it to straight `RGBA8`.
+    ///
+    /// # Errors
+    /// Returns [`RenderError::Io`] or [`RenderError::Encode`] if reading or decoding fails.
+    pub fn load_png(path: impl AsRef<Path>) -> Result<Self, RenderError> {
+        let file = File::open(path)?;
+        let mut decoder = png::Decoder::new(BufReader::new(file));
+        decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+        let mut reader = decoder
+            .read_info()
+            .map_err(|e| RenderError::Encode(format!("png header: {e}")))?;
+        let buf_len = reader
+            .output_buffer_size()
+            .ok_or_else(|| RenderError::Encode("png buffer size overflow".to_owned()))?;
+        let mut buf = vec![0_u8; buf_len];
+        let info = reader
+            .next_frame(&mut buf)
+            .map_err(|e| RenderError::Encode(format!("png decode: {e}")))?;
+        let bytes = &buf[..info.buffer_size()];
+        let rgba = match info.color_type {
+            png::ColorType::Rgba => bytes.to_vec(),
+            png::ColorType::Rgb => {
+                let mut out = Vec::with_capacity((info.width * info.height * 4) as usize);
+                for rgb in bytes.chunks_exact(3) {
+                    out.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+                }
+                out
+            }
+            png::ColorType::Grayscale => {
+                let mut out = Vec::with_capacity((info.width * info.height * 4) as usize);
+                for &g in bytes {
+                    out.extend_from_slice(&[g, g, g, 255]);
+                }
+                out
+            }
+            png::ColorType::GrayscaleAlpha => {
+                let mut out = Vec::with_capacity((info.width * info.height * 4) as usize);
+                for ga in bytes.chunks_exact(2) {
+                    out.extend_from_slice(&[ga[0], ga[0], ga[0], ga[1]]);
+                }
+                out
+            }
+            png::ColorType::Indexed => {
+                return Err(RenderError::Encode(
+                    "indexed PNG could not be expanded".to_owned(),
+                ));
+            }
+        };
+        Ok(Self {
+            width: info.width,
+            height: info.height,
+            rgba,
+        })
+    }
+}
+
 /// Errors returned during rendering or offscreen snapshot capture.
 #[derive(Debug)]
 pub enum RenderError {
     /// Requested viewport had a zero dimension or invalid scale.
     InvalidViewport,
-    /// Underlying filesystem error while saving a snapshot.
+    /// Underlying filesystem error while loading or saving an image.
     Io(std::io::Error),
-    /// Image encoding error.
+    /// Image encoding or decoding error.
     Encode(String),
+    /// GPU (`wgpu`) initialization, surface, or readback error.
+    Gpu(String),
 }
 
 impl fmt::Display for RenderError {
@@ -108,8 +218,9 @@ impl fmt::Display for RenderError {
             Self::InvalidViewport => {
                 write!(f, "viewport width, height, and scale must be positive")
             }
-            Self::Io(err) => write!(f, "snapshot I/O error: {err}"),
-            Self::Encode(msg) => write!(f, "snapshot encode error: {msg}"),
+            Self::Io(err) => write!(f, "image I/O error: {err}"),
+            Self::Encode(msg) => write!(f, "image codec error: {msg}"),
+            Self::Gpu(msg) => write!(f, "wgpu renderer error: {msg}"),
         }
     }
 }
@@ -129,7 +240,7 @@ impl From<std::io::Error> for RenderError {
     }
 }
 
-/// Trait implemented by rendering backends (`SdfSoftwareRenderer`, and `WgpuRenderer` next).
+/// Trait implemented by rendering backends ([`SdfSoftwareRenderer`] and [`WgpuRenderer`]).
 pub trait RendererBackend {
     /// Human-readable renderer backend name.
     fn name(&self) -> &'static str;
@@ -137,12 +248,213 @@ pub trait RendererBackend {
     /// Render a single deterministic frame of the requested scene.
     ///
     /// # Errors
-    /// Returns [`RenderError::InvalidViewport`] when dimensions are zero.
+    /// Returns [`RenderError::InvalidViewport`] when dimensions are zero or [`RenderError::Gpu`]
+    /// if GPU execution fails.
     fn render_snapshot(
         &mut self,
         spec: &SnapshotSpec,
         palette: &ThemePalette,
     ) -> Result<RenderFrame, RenderError>;
+}
+
+/// Runtime-selected renderer combining GPU (`wgpu`) and CPU (`SdfSoftwareRenderer`) backends.
+#[derive(Debug)]
+pub enum ActiveRenderer {
+    /// Zero-`unsafe` CPU analytic SDF rasterizer.
+    Software(SdfSoftwareRenderer),
+    /// Hardware-accelerated Vulkan/GLES `wgpu` WGSL SDF renderer.
+    #[cfg(feature = "wgpu")]
+    Wgpu(Box<WgpuRenderer>),
+}
+
+impl ActiveRenderer {
+    /// Construct an [`ActiveRenderer`] honoring [`RendererPreference`].
+    ///
+    /// In [`RendererPreference::Auto`] mode, initializes `WgpuRenderer` when compiled and a
+    /// compatible GPU adapter is present, otherwise falls back cleanly to `SdfSoftwareRenderer`.
+    ///
+    /// # Errors
+    /// Returns [`RenderError::Gpu`] only when [`RendererPreference::Wgpu`] is explicitly requested
+    /// and cannot be initialized.
+    pub fn new(pref: RendererPreference, context: SceneContext) -> Result<Self, RenderError> {
+        match pref {
+            RendererPreference::Software => {
+                Ok(Self::Software(SdfSoftwareRenderer::with_context(context)))
+            }
+            RendererPreference::Auto => {
+                #[cfg(feature = "wgpu")]
+                {
+                    match WgpuRenderer::with_context(context.clone()) {
+                        Ok(gpu) => Ok(Self::Wgpu(Box::new(gpu))),
+                        Err(err) => {
+                            eprintln!(
+                                "veilshell: wgpu unavailable ({err}); falling back to sdf-software"
+                            );
+                            Ok(Self::Software(SdfSoftwareRenderer::with_context(context)))
+                        }
+                    }
+                }
+                #[cfg(not(feature = "wgpu"))]
+                {
+                    Ok(Self::Software(SdfSoftwareRenderer::with_context(context)))
+                }
+            }
+            RendererPreference::Wgpu => {
+                #[cfg(feature = "wgpu")]
+                {
+                    WgpuRenderer::with_context(context).map(|gpu| Self::Wgpu(Box::new(gpu)))
+                }
+                #[cfg(not(feature = "wgpu"))]
+                {
+                    let _ = context;
+                    Err(RenderError::Gpu(
+                        "veilshell-render was compiled without the `wgpu` feature".to_owned(),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Borrow the active [`SceneContext`].
+    #[must_use]
+    pub const fn context(&self) -> &SceneContext {
+        match self {
+            Self::Software(sw) => &sw.context,
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(gpu) => &gpu.context,
+        }
+    }
+
+    /// Mutably borrow the active [`SceneContext`].
+    pub fn context_mut(&mut self) -> &mut SceneContext {
+        match self {
+            Self::Software(sw) => &mut sw.context,
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(gpu) => &mut gpu.context,
+        }
+    }
+
+    /// Human-readable description of the active backend (including GPU adapter name when active).
+    #[must_use]
+    pub fn backend_label(&self) -> String {
+        match self {
+            Self::Software(_) => "sdf-software".to_owned(),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(gpu) => format!("wgpu-sdf ({})", gpu.adapter_summary()),
+        }
+    }
+
+    /// Access the underlying [`WgpuRenderer`] when running on the GPU backend.
+    #[cfg(feature = "wgpu")]
+    #[must_use]
+    pub fn as_wgpu(&self) -> Option<&WgpuRenderer> {
+        match self {
+            Self::Wgpu(gpu) => Some(gpu),
+            Self::Software(_) => None,
+        }
+    }
+
+    /// Mutably access the underlying [`WgpuRenderer`] when running on the GPU backend.
+    #[cfg(feature = "wgpu")]
+    pub fn as_wgpu_mut(&mut self) -> Option<&mut WgpuRenderer> {
+        match self {
+            Self::Wgpu(gpu) => Some(gpu),
+            Self::Software(_) => None,
+        }
+    }
+
+    /// Upload and pre-blur a static wallpaper image when backed by `wgpu`.
+    ///
+    /// # Errors
+    /// Returns [`RenderError`] if the image dimensions are invalid.
+    pub fn set_wallpaper(&mut self, wallpaper: Option<&WallpaperImage>) -> Result<(), RenderError> {
+        match self {
+            Self::Software(_) => Ok(()),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(gpu) => {
+                if let Some(img) = wallpaper {
+                    gpu.set_wallpaper(img)
+                } else {
+                    gpu.clear_wallpaper();
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// Build scene layout (hit-test regions) and rasterize an offscreen frame.
+    ///
+    /// # Errors
+    /// Returns [`RenderError`] if dimensions are zero or GPU rendering fails.
+    pub fn render_interactive(
+        &mut self,
+        scene: SceneKind,
+        width: u32,
+        height: u32,
+        palette: &ThemePalette,
+    ) -> Result<(RenderFrame, SceneOutput), RenderError> {
+        match self {
+            Self::Software(sw) => sw.render_interactive(scene, width, height, palette),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(gpu) => gpu.render_interactive(scene, width, height, palette),
+        }
+    }
+
+    /// Render the top pull handle strip offscreen.
+    ///
+    /// # Errors
+    /// Returns [`RenderError`] if dimensions are zero or GPU rendering fails.
+    pub fn render_top_strip(
+        &mut self,
+        width: u32,
+        height: u32,
+        palette: &ThemePalette,
+    ) -> Result<RenderFrame, RenderError> {
+        match self {
+            Self::Software(sw) => sw.render_top_strip(width, height, palette),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(gpu) => gpu.render_top_strip(width, height, palette),
+        }
+    }
+
+    /// Rasterize a [`DrawList`] offscreen into an `RGBA8` [`RenderFrame`].
+    ///
+    /// # Errors
+    /// Returns [`RenderError`] if dimensions are zero or GPU rendering fails.
+    pub fn rasterize(
+        &mut self,
+        width: u32,
+        height: u32,
+        list: &DrawList,
+    ) -> Result<RenderFrame, RenderError> {
+        match self {
+            Self::Software(sw) => sw.rasterize(width, height, list),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(gpu) => gpu.rasterize(width, height, list),
+        }
+    }
+}
+
+impl RendererBackend for ActiveRenderer {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Software(sw) => sw.name(),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(gpu) => gpu.name(),
+        }
+    }
+
+    fn render_snapshot(
+        &mut self,
+        spec: &SnapshotSpec,
+        palette: &ThemePalette,
+    ) -> Result<RenderFrame, RenderError> {
+        match self {
+            Self::Software(sw) => sw.render_snapshot(spec, palette),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(gpu) => gpu.render_snapshot(spec, palette),
+        }
+    }
 }
 
 /// Backwards-compatible alias for [`SdfSoftwareRenderer`].
@@ -223,7 +535,37 @@ mod tests {
         frame.save_png(&out).expect("png saved");
         let bytes = std::fs::read(&out).expect("png readable");
         assert_eq!(&bytes[0..8], b"\x89PNG\r\n\x1a\n");
+
+        let reloaded = WallpaperImage::load_png(&out).expect("png reloads cleanly");
+        assert_eq!(reloaded.width, 240);
+        assert_eq!(reloaded.height, 28);
+        assert_eq!(reloaded.rgba, frame.rgba);
         let _ = std::fs::remove_file(out);
+    }
+
+    #[test]
+    fn renderer_preference_parses_aliases() {
+        assert_eq!(
+            RendererPreference::parse_name("auto"),
+            Some(RendererPreference::Auto)
+        );
+        assert_eq!(
+            RendererPreference::parse_name("wgpu"),
+            Some(RendererPreference::Wgpu)
+        );
+        assert_eq!(
+            RendererPreference::parse_name("gpu"),
+            Some(RendererPreference::Wgpu)
+        );
+        assert_eq!(
+            RendererPreference::parse_name("software"),
+            Some(RendererPreference::Software)
+        );
+        assert_eq!(
+            RendererPreference::parse_name("cpu"),
+            Some(RendererPreference::Software)
+        );
+        assert_eq!(RendererPreference::parse_name("unknown"), None);
     }
 
     #[test]
@@ -347,5 +689,132 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[cfg(feature = "wgpu")]
+    #[test]
+    fn wgpu_matches_software_sdf_pixel_parity() {
+        let Ok(mut gpu) = WgpuRenderer::new() else {
+            eprintln!("skipping wgpu GPU parity test: no Vulkan/GLES adapter available");
+            return;
+        };
+        let mut sw = SdfSoftwareRenderer::default();
+        let palette = ThemePalette::default_dark();
+
+        for scene in [
+            SceneKind::Pill,
+            SceneKind::Home,
+            SceneKind::Recents,
+            SceneKind::Shade,
+            SceneKind::Osk,
+        ] {
+            let spec = SnapshotSpec {
+                scene,
+                viewport: ViewportSize {
+                    width: 480,
+                    height: if scene == SceneKind::Pill { 28 } else { 320 },
+                    scale: 1.0,
+                },
+                orientation: Orientation::Normal,
+            };
+            let sw_frame = sw.render_snapshot(&spec, &palette).expect("sw renders");
+            let gpu_frame = gpu.render_snapshot(&spec, &palette).expect("gpu renders");
+            assert_eq!(sw_frame.width, gpu_frame.width);
+            assert_eq!(sw_frame.height, gpu_frame.height);
+            assert_eq!(sw_frame.rgba.len(), gpu_frame.rgba.len());
+
+            // Compare in premultiplied channel space so transparent RGB noise is weighted by alpha.
+            let mut sum_abs_diff = 0_u64;
+            let pixel_count = u64::from(sw_frame.width * sw_frame.height);
+            for (s, g) in sw_frame
+                .rgba
+                .chunks_exact(4)
+                .zip(gpu_frame.rgba.chunks_exact(4))
+            {
+                let sa = u32::from(s[3]);
+                let ga = u32::from(g[3]);
+                sum_abs_diff += u64::from(sa.abs_diff(ga));
+                for c in 0..3 {
+                    let sp = (u32::from(s[c]) * sa + 127) / 255;
+                    let gp = (u32::from(g[c]) * ga + 127) / 255;
+                    sum_abs_diff += u64::from(sp.abs_diff(gp));
+                }
+            }
+            let mean_diff = sum_abs_diff as f64 / (pixel_count * 4) as f64;
+            assert!(
+                mean_diff < 2.0,
+                "scene {scene:?} GPU vs CPU mean channel diff too high: {mean_diff:.3} (adapter: {})",
+                gpu.adapter_summary()
+            );
+        }
+    }
+
+    #[cfg(feature = "wgpu")]
+    #[test]
+    fn wgpu_preblurred_wallpaper_applies_to_backdrop_only() {
+        let Ok(mut gpu) = WgpuRenderer::new() else {
+            eprintln!("skipping wgpu wallpaper test: no Vulkan/GLES adapter available");
+            return;
+        };
+        let palette = ThemePalette::default_dark();
+
+        let wp_w = 128_u32;
+        let wp_h = 96_u32;
+        let mut wp_rgba = vec![0_u8; (wp_w * wp_h * 4) as usize];
+        for y in 0..wp_h {
+            for x in 0..wp_w {
+                let idx = ((y * wp_w + x) * 4) as usize;
+                wp_rgba[idx] = if x < wp_w / 2 { 255 } else { 40 };
+                wp_rgba[idx + 1] = if y < wp_h / 2 { 180 } else { 240 };
+                wp_rgba[idx + 2] = 220;
+                wp_rgba[idx + 3] = 255;
+            }
+        }
+        let home_spec = SnapshotSpec {
+            scene: SceneKind::Home,
+            viewport: ViewportSize {
+                width: 320,
+                height: 220,
+                scale: 1.0,
+            },
+            orientation: Orientation::Normal,
+        };
+        let plain_home = gpu
+            .render_snapshot(&home_spec, &palette)
+            .expect("plain home");
+
+        gpu.set_wallpaper(&WallpaperImage {
+            width: wp_w,
+            height: wp_h,
+            rgba: wp_rgba,
+        })
+        .expect("wallpaper blur succeeds");
+        assert!(gpu.has_blurred_wallpaper());
+
+        let frosted_home = gpu
+            .render_snapshot(&home_spec, &palette)
+            .expect("frosted home");
+        assert_ne!(
+            plain_home.rgba, frosted_home.rgba,
+            "pre-blurred wallpaper should tint the overlay backdrop"
+        );
+
+        let pill_spec = SnapshotSpec {
+            scene: SceneKind::Pill,
+            viewport: ViewportSize {
+                width: 320,
+                height: 28,
+                scale: 1.0,
+            },
+            orientation: Orientation::Normal,
+        };
+        let pill = gpu.render_snapshot(&pill_spec, &palette).expect("pill");
+        assert_eq!(
+            pill.rgba[3], 0,
+            "pill surface corners must remain transparent even when wallpaper is cached"
+        );
+
+        gpu.clear_wallpaper();
+        assert!(!gpu.has_blurred_wallpaper());
     }
 }
