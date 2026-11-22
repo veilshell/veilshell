@@ -3,9 +3,18 @@ hl.monitor({ output = "", mode = "preferred", position = "auto", scale = "auto" 
 hl.config({
     -- GSettings is shared by the user's other desktops.
     cursor = { sync_gsettings_theme = false },
+    input = {
+        touchpad = {
+            natural_scroll = true,
+            clickfinger_behavior = true,
+            scroll_factor = 0.4,
+        },
+    },
     misc = {
         disable_hyprland_logo = true,
         disable_splash_rendering = true,
+        key_press_enables_dpms = true,
+        mouse_move_enables_dpms = true,
     },
 })
 
