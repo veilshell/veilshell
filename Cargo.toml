@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/veilshell-core",
+    "crates/veilshell-lock-input",
     "crates/veilshell-compositor",
     "crates/veilshell-hw",
     "crates/veilshell-theme",
