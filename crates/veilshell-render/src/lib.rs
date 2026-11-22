@@ -817,4 +817,35 @@ mod tests {
         gpu.clear_wallpaper();
         assert!(!gpu.has_blurred_wallpaper());
     }
+
+    #[test]
+    fn osk_hit_test_resolves_keys_across_all_layers() {
+        for (layer, expected_id) in [
+            (veilshell_core::OskLayer::Letters, "q"),
+            (veilshell_core::OskLayer::Numbers, "@"),
+            (veilshell_core::OskLayer::Symbols, "~"),
+        ] {
+            let mut ctx = SceneContext::default();
+            ctx.osk_state.layer = layer;
+            let out = build_scene_layout(
+                SceneKind::Osk,
+                1280.0,
+                284.0,
+                &ThemePalette::default_dark(),
+                &ctx,
+            );
+            let region = out
+                .hit_regions
+                .iter()
+                .find(|r| matches!(r.target, HitTarget::OskKey { label } if label == expected_id))
+                .expect("expected OSK key hit region");
+            assert_eq!(
+                out.hit_test(
+                    region.rect.x + region.rect.w * 0.5,
+                    region.rect.y + region.rect.h * 0.5,
+                ),
+                Some(&HitTarget::OskKey { label: expected_id })
+            );
+        }
+    }
 }

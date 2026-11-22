@@ -3,6 +3,7 @@
 pub mod client;
 #[cfg(feature = "wgpu")]
 mod gpu;
+mod osk;
 
 pub use client::{
     run_layer_surface, run_shell_daemon, DaemonCommand, RuntimeStatus, ShellAction,

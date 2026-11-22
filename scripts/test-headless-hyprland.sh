@@ -88,34 +88,34 @@ print(added[-1] if added else "")
 
     echo "[4/5] Driving live surface transitions via veilctl & capturing grim screenshots..."
     PREV_PNG=""
-    for scene in home shade recents pill; do
+    for scene in home shade recents osk pill; do
         "$VEILCTL_BIN" show "$scene"
-        bytes=0
         out_png="$OUT_DIR/hyprland-$scene.png"
-        if [[ "$scene" == "pill" ]]; then
-            # Two captures spaced apart ensure lazy headless screencopy flushes the dismissed overlay
-            sleep 0.25
-            grim -o "$HEADLESS_NAME" "$out_png"
+        case "$scene" in
+            pill) min_bytes=1500 ;;
+            osk)  min_bytes=12000 ;;
+            *)    min_bytes=25000 ;;
+        esac
+
+        # First capture wakes Hyprland's lazy headless screencopy pipeline so stale frames flush out.
+        sleep 0.25
+        grim -o "$HEADLESS_NAME" "$out_png"
+
+        bytes=0
+        stale=1
+        for _ in $(seq 1 5); do
             sleep 0.25
             grim -o "$HEADLESS_NAME" "$out_png"
             bytes="$(stat -c%s "$out_png")"
-            min_bytes=1500
-        else
-            min_bytes=25000
-            stale=1
-            for _ in $(seq 1 6); do
-                sleep 0.3
-                grim -o "$HEADLESS_NAME" "$out_png"
-                bytes="$(stat -c%s "$out_png")"
-                if (( bytes >= min_bytes )) && { [[ -z "$PREV_PNG" ]] || ! cmp -s "$out_png" "$PREV_PNG"; }; then
-                    stale=0
-                    break
-                fi
-            done
-            if (( stale != 0 )); then
-                echo "ERROR: Screenshot $out_png stayed identical to previous capture $PREV_PNG!" >&2
-                exit 1
+            if (( bytes >= min_bytes )) && { [[ -z "$PREV_PNG" ]] || ! cmp -s "$out_png" "$PREV_PNG"; }; then
+                stale=0
+                break
             fi
+        done
+
+        if (( stale != 0 )); then
+            echo "ERROR: Screenshot $out_png stayed identical to previous capture $PREV_PNG!" >&2
+            exit 1
         fi
         echo "  -> Captured $out_png ($bytes bytes)"
         if (( bytes < min_bytes )); then

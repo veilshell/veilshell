@@ -47,10 +47,17 @@
 - [x] Live Quick Settings hardware telemetry & controls (`HardwareController`): `nmcli` Wi-Fi & WWAN/LTE, `bluetoothctl`/`rfkill` Bluetooth, `sysfs` battery (filtering peripheral `scope=Device` stylus batteries) & backlight slider (clamped >= 5%), `wpctl` PipeWire volume, Night Light (`/usr/share/omarchy/bin/omarchy-toggle-nightlight` with `hyprctl hyprsunset` fallback), and `veilctl hw` inspection
 - [x] Adaptive Laptop/Tablet startup (`veilshell --policy <auto|laptop|tablet>`, `initial_visible: false` in Laptop Mode), live Aether `colors.toml` mtime watcher, Omarchy `adapters/omarchy/hooks/30-veilshell-theme` reload hook, and optional `adapters/omarchy/systemd/veilshell.service` user unit
 
-### Phase 3 — GPU (`wgpu`) Acceleration & Built-In Touch OSK (In Progress)
+### Phase 3 — Built-In Touch OSK, GPU (`wgpu`) Acceleration & Native Visual Polish
+
+#### Sprint 3A — Built-In Touch OSK (`zwp_input_method_v2` + `zwp_virtual_keyboard_v1`) (Complete)
+- [x] `veilshell-core::osk`: pure-Rust `OskState` across `Letters` (Shift OneShot / CapsLock / one-shot Ctrl), `Numbers`, and `Symbols` layers, `char_to_evdev` mapping, and `xkbcli`-validated self-contained `US_QWERTY_XKB_KEYMAP`
+- [x] `veilshell-render`: dynamic `ctx.osk_state` rendering + active modifier accent highlights and full 5×7 symbol glyph set (`@`, `#`, `$`, `&`, `*`, `=`, quotes, brackets, braces, `~`, `` ` ``, `^`, etc.)
+- [x] `veilshell-wayland`: `zwp_input_method_v2` + `zwp_virtual_keyboard_v1` integration (auto-pop on text focus in Tablet Mode, numeric layer switch on `ContentPurpose`, direct `commit_string` + virtual-keyboard fallback for special keys & Ctrl combos, non-overlapping bottom-pill hide during `TouchOsk`, downward-swipe dismiss)
+- [x] Tier 3 live Hyprland verification updated to capture & verify all 5 surfaces (`home`, `shade`, `recents`, `osk`, `pill`) cleanly
+
+#### Sprint 3B — GPU (`wgpu`) Acceleration, Typography/Icons & Live Recents Thumbnails (In Progress)
 - [x] `wgpu` Vulkan/GLES WGSL SDF renderer backend consuming the existing `DrawList` + pre-blurred static wallpaper glass cache (blur once on wallpaper change) + zero-copy `wgpu::Surface` Wayland presentation & automatic `SdfSoftwareRenderer` fallback
-- [ ] TrueType/FreeType font atlas (`swash` / `cosmic-text`) and app icon theme loader replacing the bitmap HUD font & initials badges
-- [ ] `zwp_input_method_v2` + `zwp_virtual_keyboard_v1` protocol integration in `veilshell-wayland` powering the multi-layout Touch OSK surface
+- [ ] TrueType/FreeType font atlas (`swash` / `cosmic-text`) and `.desktop` app icon theme loader replacing the bitmap HUD font & initials badges
 - [ ] Live window thumbnails via `hyprland-toplevel-export-v1` in the Recents Deck
 
 ### Phase 4 — Packaging, Multi-Compositor Ports & `v0.1.0` Release

@@ -1,6 +1,6 @@
 //! Glassmorphic scene layout builders and interactive hit-testing for all `VeilShell` surfaces.
 
-use veilshell_core::{Rgba, ThemePalette};
+use veilshell_core::{OskState, Rgba, ShiftState, ThemePalette};
 
 use crate::primitives::{DrawList, HitRect, HitTarget, RoundedRect, SceneOutput, TextAlign};
 use crate::SceneKind;
@@ -51,6 +51,8 @@ pub struct SceneContext {
     pub home_page: usize,
     /// Open windows shown in the `Recents` deck.
     pub recents_cards: Vec<RecentsCard>,
+    /// Multi-layer touch keyboard state and modifier latches.
+    pub osk_state: OskState,
 }
 
 impl Default for SceneContext {
@@ -92,6 +94,7 @@ impl Default for SceneContext {
                     focused: false,
                 },
             ],
+            osk_state: OskState::default(),
         }
     }
 }
@@ -147,7 +150,7 @@ pub fn build_scene_layout(
         SceneKind::Home => build_home(&mut out, width, height, palette, ctx),
         SceneKind::Recents => build_recents(&mut out, width, height, palette, ctx),
         SceneKind::Shade => build_shade(&mut out, width, height, palette, ctx),
-        SceneKind::Osk => build_osk(&mut out, width, height, palette),
+        SceneKind::Osk => build_osk(&mut out, width, height, palette, ctx),
     }
     out
 }
@@ -906,7 +909,13 @@ fn push_slider(
     out.push_hit(rect, HitTarget::ShadeSlider { id, rect });
 }
 
-fn build_osk(out: &mut SceneOutput, width: f32, height: f32, palette: &ThemePalette) {
+fn build_osk(
+    out: &mut SceneOutput,
+    width: f32,
+    height: f32,
+    palette: &ThemePalette,
+    ctx: &SceneContext,
+) {
     out.draw_list.push_rect(
         RoundedRect::filled(
             0.0,
@@ -919,45 +928,32 @@ fn build_osk(out: &mut SceneOutput, width: f32, height: f32, palette: &ThemePale
         .with_glass_border(palette.foreground.with_alpha(0.16), 1.5, 0.10),
     );
 
-    let rows: [&[&str]; 4] = [
-        &["Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"],
-        &["A", "S", "D", "F", "G", "H", "J", "K", "L"],
-        &["SHF", "Z", "X", "C", "V", "B", "N", "M", "DEL"],
-        &["123", "SPACE", "ENTER"],
-    ];
-
+    let rows = ctx.osk_state.rows();
     let pad = 12.0;
     let gap = 8.0;
-    let row_h = ((height - pad * 2.0 - gap * 3.0) / 4.0).max(28.0);
+    let row_count = rows.len().max(1);
+    let row_h = ((height - pad * 2.0 - gap * (row_count.saturating_sub(1)) as f32)
+        / row_count as f32)
+        .max(28.0);
 
     for (r_idx, row) in rows.iter().enumerate() {
         let y = pad + r_idx as f32 * (row_h + gap);
-        let total_units: f32 = row
-            .iter()
-            .map(|k| match *k {
-                "SPACE" => 5.0,
-                "ENTER" | "123" | "SHF" | "DEL" => 1.5,
-                _ => 1.0,
-            })
-            .sum();
+        let total_units: f32 = row.iter().map(|k| k.width_units).sum();
         let avail_w = width - pad * 2.0 - gap * (row.len().saturating_sub(1)) as f32;
-        let unit_w = avail_w / total_units;
+        let unit_w = avail_w / total_units.max(1.0);
         let mut cursor_x = pad;
 
-        for key in *row {
-            let units = match *key {
-                "SPACE" => 5.0,
-                "ENTER" | "123" | "SHF" | "DEL" => 1.5,
-                _ => 1.0,
-            };
-            let kw = unit_w * units;
-            let is_accent = *key == "ENTER";
-            let fill = if is_accent {
+        for key in row {
+            let kw = unit_w * key.width_units;
+            let active_mod = (key.id == "shf" && ctx.osk_state.shift != ShiftState::Off)
+                || (key.id == "ctl" && ctx.osk_state.ctrl);
+            let highlighted = key.is_accent || active_mod;
+            let fill = if highlighted {
                 palette.accent.with_alpha(0.90)
             } else {
                 palette.background.with_alpha(0.78)
             };
-            let fg = if is_accent {
+            let fg = if highlighted {
                 palette.background
             } else {
                 palette.foreground
@@ -973,14 +969,14 @@ fn build_osk(out: &mut SceneOutput, width: f32, height: f32, palette: &ThemePale
             out.draw_list.push_text(
                 cursor_x + kw * 0.5,
                 y + (row_h - 14.0) * 0.5,
-                *key,
+                key.label,
                 2,
                 fg,
                 TextAlign::Center,
             );
             out.push_hit(
                 HitRect::new(cursor_x, y, kw, row_h),
-                HitTarget::OskKey { label: key },
+                HitTarget::OskKey { label: key.id },
             );
             cursor_x += kw + gap;
         }

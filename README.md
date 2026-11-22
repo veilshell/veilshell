@@ -29,11 +29,11 @@ keybindings, or desktop workflow — engineered specifically for **older 5W /
 
 | Crate | Purpose | Status |
 |---|---|---|
-| [`veilshell-core`](crates/veilshell-core) | Pure-Rust state machine, critically damped spring physics, gesture classifier, `.desktop` parser, orientation/rotation lock, WCAG theme primitives | Sprint 2A (Done) |
+| [`veilshell-core`](crates/veilshell-core) | Pure-Rust state machine, critically damped spring physics, gesture classifier, `.desktop` parser, orientation/rotation lock, WCAG theme primitives, multi-layer Touch OSK state & XKB keymap | Sprint 3A (Done) |
 | [`veilshell-theme`](crates/veilshell-theme) | `ThemeProvider` trait + live Omarchy Aether `colors.toml` loader + WCAG AA dark fallback | Phase 0 (Done) |
 | [`veilshell-compositor`](crates/veilshell-compositor) | `CompositorBackend` trait + live Hyprland Unix-socket IPC (Lua `eval` + legacy `keyword` fallback, recency-sorted `j/clients`, `j/monitors`, workspace switch, app launch) + `MockBackend` | Sprint 2A (Done) |
-| [`veilshell-render`](crates/veilshell-render) | Renderer-agnostic glassmorphic `DrawList` + `SceneOutput` hit-testing for all 5 scenes, `wgpu` Vulkan/GLES WGSL SDF backend + blur-once GPU wallpaper glass cache, CPU SDF fallback, `ARGB8888` encoder, and `PNG` exporter | Phase 3 (`wgpu` Done) |
-| [`veilshell-wayland`](crates/veilshell-wayland) | Event-driven `calloop` + `smithay-client-toolkit` multi-surface `wlr-layer-shell` runtime (`BottomPill`, `TopStrip`, reused `Overlay`), zero-copy `wgpu::Surface` Vulkan/GLES presentation + `wl_shm` fallback, output pinning (`--output`), `wl_touch`/`wl_pointer` gestures & hit routing | Phase 3 (`wgpu` Done) |
+| [`veilshell-render`](crates/veilshell-render) | Renderer-agnostic glassmorphic `DrawList` + `SceneOutput` hit-testing for all 5 scenes (incl. 3-layer OSK), `wgpu` Vulkan/GLES WGSL SDF backend + blur-once GPU wallpaper glass cache, CPU SDF fallback, 5×7 glyph renderer, `ARGB8888` encoder, and `PNG` exporter | Phase 3 (`wgpu` Done) |
+| [`veilshell-wayland`](crates/veilshell-wayland) | Event-driven `calloop` + `smithay-client-toolkit` multi-surface `wlr-layer-shell` runtime (`BottomPill`, `TopStrip`, `TouchOsk`, reused `Overlay`), zero-copy `wgpu::Surface` Vulkan/GLES presentation + `wl_shm` fallback, `zwp_input_method_v2` + `zwp_virtual_keyboard_v1` OSK, output pinning (`--output`), `wl_touch`/`wl_pointer` gestures | Sprint 3A (`wgpu` + OSK Done) |
 | [`veilshell-hw`](crates/veilshell-hw) | `HardwareSnapshot`, `HardwareBackend` + `HardwareController` traits, pure zero-dep Linux `sysfs`/CLI telemetry (`LinuxHardware`, `SensorGuard`), DMI matcher, and declarative `hardware-profiles/*.toml` parser | Sprint 2B (Done) |
 | [`veilshell-shell`](crates/veilshell-shell) | `ShellState` orchestration, `.desktop` discovery, `veilctl` Unix IPC socket, live hardware/theme watcher, `veilshell` daemon & `veilctl` CLI | Sprint 2B (Done) |
 
@@ -61,13 +61,14 @@ cargo run -p veilshell-shell --bin veilctl -- apps
 
 # Launch the adaptive daemon (--policy auto hides in Laptop Mode & wakes on keyboard detach)
 cargo run -p veilshell-shell --bin veilshell -- --policy auto
-# Or force visible tablet UI for testing (--scene pill|home|recents|shade)
+# Or force visible tablet UI for testing (--scene pill|home|recents|shade|osk)
 cargo run -p veilshell-shell --bin veilshell -- --policy tablet --scene pill
 
 # Control the running daemon via veilctl Unix socket IPC
 veilctl show home        # Open paged .desktop app launcher
 veilctl show recents     # Open live Hyprland window deck (tap to focus, X to close)
 veilctl show shade       # Open Quick Settings shade
+veilctl show osk         # Open multi-layer Touch OSK (auto-opens on text focus in Tablet Mode)
 veilctl show pill        # Dismiss overlays back to the bottom gesture pill
 veilctl mode toggle      # Toggle Laptop (hidden / 0% CPU) <-> Tablet Mode
 veilctl reload-theme     # Hot-reload Aether colors.toml

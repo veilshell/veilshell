@@ -29,8 +29,8 @@ use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
 
 use veilshell_core::{
-    classify_bottom_pill, GestureAction, GestureSample, GestureThresholds, Spring, SpringParams,
-    ThemePalette,
+    classify_bottom_pill, GestureAction, GestureSample, GestureThresholds, Orientation, OskEmit,
+    Spring, SpringParams, ThemePalette,
 };
 use veilshell_render::{
     build_scene, build_scene_layout, build_top_strip_scene, ActiveRenderer, DrawList, HitTarget,
@@ -39,6 +39,7 @@ use veilshell_render::{
 
 #[cfg(feature = "wgpu")]
 use crate::gpu::WgpuWaylandSurface;
+use crate::osk::OskWaylandState;
 use crate::{LayerRole, LayerSurfaceSpec, WaylandRuntimeConfig};
 
 /// Errors raised while connecting to or running the `Wayland` layer-shell client.
@@ -386,8 +387,8 @@ pub(crate) struct LayerApp {
     output_name: Option<String>,
     viewport_w: u32,
     viewport_h: u32,
-    visible: bool,
-    active_scene: SceneKind,
+    pub(crate) visible: bool,
+    pub(crate) active_scene: SceneKind,
     pill: Option<ManagedSurface>,
     top_strip: Option<ManagedSurface>,
     overlay: Option<ManagedSurface>,
@@ -395,10 +396,11 @@ pub(crate) struct LayerApp {
     overlay_spring: Spring,
     last_anim_tick: Instant,
     palette: ThemePalette,
-    renderer: ActiveRenderer,
+    pub(crate) renderer: ActiveRenderer,
     pointer: Option<wl_pointer::WlPointer>,
     touch: Option<wl_touch::WlTouch>,
     drag: Option<ActiveDrag>,
+    pub(crate) osk: OskWaylandState,
     handler: Box<dyn ShellActionHandler>,
     exit: bool,
     // SAFETY ORDERING: `conn` MUST remain the last field so `wl_display` outlives all
@@ -417,7 +419,9 @@ impl LayerApp {
             return;
         }
 
-        if self.pill.is_none() {
+        if self.active_scene == SceneKind::Osk {
+            self.pill = None;
+        } else if self.pill.is_none() {
             match ManagedSurface::create(self, LayerRole::BottomPill) {
                 Ok(surf) => self.pill = Some(surf),
                 Err(err) => eprintln!("veilshell: failed to create bottom pill surface: {err}"),
@@ -444,7 +448,7 @@ impl LayerApp {
         }
     }
 
-    fn show_scene(&mut self, scene: SceneKind, animate: bool) {
+    pub(crate) fn show_scene(&mut self, scene: SceneKind, animate: bool) {
         if scene != SceneKind::Pill {
             self.visible = true;
             self.handler.on_action(
@@ -804,6 +808,20 @@ impl LayerApp {
                     return;
                 }
 
+                if self.active_scene == SceneKind::Osk {
+                    if dy >= 60.0 && vy >= 220.0 {
+                        self.osk.auto_opened = false;
+                        self.show_scene(SceneKind::Pill, false);
+                        return;
+                    }
+                    if dist < 24.0 {
+                        self.handle_overlay_tap(drag.last_x, drag.last_y);
+                    } else {
+                        self.draw_overlay();
+                    }
+                    return;
+                }
+
                 // Bottom pill swipe inside overlay behaves identically to the bottom pill
                 if drag.start_y >= (self.viewport_h as f32 - 52.0) && dist >= 20.0 {
                     let sample = GestureSample {
@@ -946,9 +964,17 @@ impl LayerApp {
                 );
                 self.draw_overlay();
             }
-            HitTarget::OskKey { label } => {
-                eprintln!("veilshell: osk key {label} (Phase 3 input-method-v2)");
-            }
+            HitTarget::OskKey { label } => match self.renderer.context_mut().osk_state.press(label)
+            {
+                OskEmit::Dismiss => {
+                    self.osk.auto_opened = false;
+                    self.show_scene(SceneKind::Pill, false);
+                }
+                emit => {
+                    self.osk.emit(emit);
+                    self.draw_overlay();
+                }
+            },
         }
     }
 }
@@ -1051,6 +1077,7 @@ pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
         pointer: None,
         touch: None,
         drag: None,
+        osk: OskWaylandState::bind_globals(&globals, &qh),
         handler: Box::new(handler),
         exit: false,
         conn: conn.clone(),
@@ -1063,6 +1090,10 @@ pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
     event_queue
         .roundtrip(&mut app)
         .map_err(|e| WaylandError::Runtime(e.to_string()))?;
+
+    if let Some(seat) = app.seat_state.seats().next() {
+        app.osk.attach_seat(&seat, &qh);
+    }
 
     let matched = app.output_state.outputs().find_map(|out| {
         let info = app.output_state.info(&out)?;
@@ -1099,6 +1130,7 @@ pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
     let mut event_loop: EventLoop<LayerApp> =
         EventLoop::try_new().map_err(|e| WaylandError::Runtime(e.to_string()))?;
     let loop_handle: LoopHandle<'static, LayerApp> = event_loop.handle();
+    let flush_conn = conn.clone();
 
     WaylandSource::new(conn, event_queue)
         .insert(loop_handle.clone())
@@ -1129,6 +1161,9 @@ pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
             .dispatch(None, &mut app)
             .map_err(|e| WaylandError::Runtime(e.to_string()))?;
     }
+
+    app.osk.destroy();
+    let _ = flush_conn.flush();
 
     // Explicitly tear down all Wayland + wgpu surfaces before the event loop drops.
     app.overlay = None;
@@ -1292,7 +1327,9 @@ impl LayerShellHandler for LayerApp {
                     self.viewport_w = w;
                 }
                 if let Some(h) = new_h {
-                    self.viewport_h = h;
+                    if self.active_scene != SceneKind::Osk {
+                        self.viewport_h = h;
+                    }
                 }
                 self.draw_overlay();
             }
@@ -1305,7 +1342,9 @@ impl SeatHandler for LayerApp {
         &mut self.seat_state
     }
 
-    fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {}
+    fn new_seat(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        self.osk.attach_seat(&seat, qh);
+    }
 
     fn new_capability(
         &mut self,
