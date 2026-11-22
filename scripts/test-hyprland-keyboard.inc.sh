@@ -29,6 +29,9 @@ keyboard_has_typed() {
 
 test_keyboard_workflow() {
     local mode keys baseline others log daemon terminal
+    # Pin the nested parent output rather than comparing the position of an
+    # auto-placed monitor, which Hyprland can relocate when the fixture rotates.
+    [[ $(nested_ctl eval 'hl.monitor({ output = "WAYLAND-1", mode = "preferred", position = "0x0", scale = "auto" })') == ok ]]
     for mode in overlay standalone; do
         if [[ $mode == standalone ]]; then
             # Same session marker as the standalone launcher, without SDDM,
@@ -57,12 +60,19 @@ test_keyboard_workflow() {
         daemon=$!
         PIDS+=("$daemon")
         wait_for "resting pill in $mode" keyboard_scene pill 960x640
+        if [[ $mode == standalone ]]; then
+            baseline="$(jq -ec 'map(if .name == "veil-smoke" then .reserved[1] = 48 else . end)' <<<"$baseline")"
+            wait_for "standalone tablet status reservation" keyboard_monitors_match "$baseline"
+        fi
         # A drag starting on the keyboard button must not open Home or the OSK.
         pointer 624 616 525
         keyboard_scene pill 960x640
         pointer 624 616
         wait_for "keyboard opened by its button in $mode" keyboard_scene osk 960x640
         wait_for "landscape work area reserved" keyboard_reserved 213
+        if [[ $mode == standalone ]]; then
+            json_matches monitors 'any(.[]; .name == "veil-smoke" and .reserved[1] == 48)'
+        fi
         pointer 54 458
         wait_for "q delivered to the original terminal" keyboard_has_typed q
         json_matches activewindow '.class == "veil-typing"'

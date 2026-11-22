@@ -21,6 +21,8 @@ pub enum LayerRole {
     BottomPill,
     /// Subtle top-center pull handle for Quick Settings.
     TopStrip,
+    /// Standalone Tablet status bar, above the app work area.
+    TabletStatus,
     /// Standalone desktop panel, reserved above the work area.
     DeskPanel,
     /// Non-interactive standalone wallpaper.
@@ -60,9 +62,11 @@ impl LayerRole {
     #[must_use]
     pub const fn to_scene(self) -> veilshell_render::SceneKind {
         match self {
-            Self::BottomPill | Self::TopStrip | Self::DeskPanel | Self::Wallpaper => {
-                veilshell_render::SceneKind::Pill
-            }
+            Self::BottomPill
+            | Self::TopStrip
+            | Self::TabletStatus
+            | Self::DeskPanel
+            | Self::Wallpaper => veilshell_render::SceneKind::Pill,
             Self::HomeGrid => veilshell_render::SceneKind::Home,
             Self::DesktopLauncher => veilshell_render::SceneKind::Launcher,
             Self::Settings => veilshell_render::SceneKind::Settings,
@@ -151,6 +155,18 @@ impl LayerSurfaceSpec {
                 width: 220,
                 height: EDGE_HANDLE_DEPTH,
                 exclusive_zone: 0,
+                keyboard_interactivity: false,
+            },
+            LayerRole::TabletStatus => Self {
+                role,
+                anchor: Anchor {
+                    left: true,
+                    right: true,
+                    ..Anchor::top_center()
+                },
+                width: viewport_w,
+                height: EDGE_HANDLE_DEPTH,
+                exclusive_zone: 48,
                 keyboard_interactivity: false,
             },
             LayerRole::Wallpaper => Self {

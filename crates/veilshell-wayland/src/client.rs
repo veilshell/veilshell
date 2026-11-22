@@ -98,10 +98,14 @@ pub enum DaemonCommand {
     },
     /// Apply a freshly loaded color palette and redraw active surfaces.
     UpdatePalette(ThemePalette),
+    UpdateTabletStatus(veilshell_render::TabletStatus),
     /// Upload and pre-blur a new static wallpaper on the GPU (or `None` to clear).
     SetWallpaper(Option<WallpaperImage>),
     /// Deliver the result of a session action without blocking Wayland dispatch.
-    PowerFinished { action: PowerAction, success: bool },
+    PowerFinished {
+        action: PowerAction,
+        success: bool,
+    },
     /// Deliver an optional shade service result from a background worker.
     ShadeFinished {
         ticket: u64,
@@ -244,10 +248,11 @@ impl RegionRect {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum EdgeHandle {
     Bottom,
     Top,
+    TabletStatus,
     Desk,
 }
 
@@ -271,7 +276,7 @@ impl EdgeHandle {
     fn bounds(self, width: f32, height: f32) -> HitRect {
         match self {
             Self::Bottom => bottom_pill_bounds(width, height),
-            Self::Top | Self::Desk => top_handle_bounds(width, height),
+            Self::Top | Self::TabletStatus | Self::Desk => top_handle_bounds(width, height),
         }
     }
 
@@ -369,9 +374,17 @@ struct ManagedSurface {
 
 fn surface_layer(role: LayerRole) -> Layer {
     match role {
-        LayerRole::DeskPanel => Layer::Top,
+        LayerRole::DeskPanel | LayerRole::TabletStatus => Layer::Top,
         LayerRole::Wallpaper => Layer::Background,
         _ => Layer::Overlay,
+    }
+}
+
+fn layer_for(app: &LayerApp, role: LayerRole) -> Layer {
+    if role == LayerRole::BottomPill && app.uses_tablet_status() {
+        Layer::Top
+    } else {
+        surface_layer(role)
     }
 }
 
@@ -395,7 +408,7 @@ impl ManagedSurface {
         let layer = app.layer_shell.create_layer_surface(
             &app.qh,
             wl_surface,
-            surface_layer(role),
+            layer_for(app, role),
             Some("veilshell"),
             app.target_output.as_ref(),
         );
@@ -451,6 +464,7 @@ impl ManagedSurface {
         let handle_input = match role {
             LayerRole::BottomPill => Some(EdgeHandle::Bottom),
             LayerRole::TopStrip => Some(EdgeHandle::Top),
+            LayerRole::TabletStatus => Some(EdgeHandle::TabletStatus),
             LayerRole::DeskPanel => Some(EdgeHandle::Desk),
             _ => None,
         }
@@ -721,27 +735,35 @@ pub(crate) struct LayerApp {
 impl LayerApp {
     fn sync_top_strip(&mut self) {
         let desk = self.uses_desk_panel();
+        let tablet = self.uses_tablet_status();
         let keep_pull_origin = self
             .drag
             .as_ref()
             .is_some_and(|drag| drag.surface == SurfaceKind::TopStrip);
-        if desk || self.active_scene == SceneKind::Pill {
+        if desk || tablet || self.active_scene == SceneKind::Pill {
+            let (role, handle) = if desk {
+                (LayerRole::DeskPanel, EdgeHandle::Desk)
+            } else if tablet {
+                (LayerRole::TabletStatus, EdgeHandle::TabletStatus)
+            } else {
+                (LayerRole::TopStrip, EdgeHandle::Top)
+            };
             let right_role = self
                 .top_strip
                 .as_ref()
                 .and_then(|s| s.handle_input.as_ref())
-                .is_some_and(|input| matches!(input.handle, EdgeHandle::Desk) == desk);
+                .is_some_and(|input| input.handle == handle);
             if !right_role {
-                let role = if desk {
-                    LayerRole::DeskPanel
-                } else {
-                    LayerRole::TopStrip
-                };
                 self.top_strip = Some(ManagedSurface::create(self, role));
             }
         } else if !keep_pull_origin {
             self.top_strip = None;
         }
+    }
+
+    fn uses_tablet_status(&self) -> bool {
+        let ctx = self.renderer.context();
+        ctx.power_menu.is_some() && ctx.tablet_mode
     }
 
     fn uses_desk_panel(&self) -> bool {
@@ -764,6 +786,15 @@ impl LayerApp {
             return;
         }
 
+        let pill_layer = if self.uses_tablet_status() {
+            Layer::Top
+        } else {
+            Layer::Overlay
+        };
+        if let Some(pill) = &self.pill {
+            // Layer mutations are applied with the next buffer commit.
+            pill.layer.set_layer(pill_layer);
+        }
         if self.wallpaper.is_none() && self.renderer.context().settings.is_some() {
             self.wallpaper = Some(ManagedSurface::create(self, LayerRole::Wallpaper));
         }
@@ -1001,6 +1032,7 @@ impl LayerApp {
 
     fn draw_top_strip(&mut self) {
         let desk = self.uses_desk_panel();
+        let tablet = self.uses_tablet_status();
         let Some(surf) = &mut self.top_strip else {
             return;
         };
@@ -1020,13 +1052,13 @@ impl LayerApp {
             .drag
             .as_ref()
             .is_some_and(|drag| drag.surface == SurfaceKind::TopStrip);
-        let list = build_top_strip_scene(
-            surf.width as f32,
-            surf.height as f32,
-            &self.palette,
-            self.renderer.context().top_drag_y,
-            self.renderer.context().top_pressed,
-        );
+        let ctx = self.renderer.context();
+        let (w, h) = (surf.width as f32, surf.height as f32);
+        let list = if tablet {
+            veilshell_render::build_tablet_status(w, h, &self.palette, ctx)
+        } else {
+            build_top_strip_scene(w, h, &self.palette, ctx.top_drag_y, ctx.top_pressed)
+        };
         self.present_surface(SurfaceKind::TopStrip, &list, false);
     }
 
@@ -1320,6 +1352,7 @@ impl LayerApp {
                     self.draw_overlay();
                 }
             }
+            DaemonCommand::UpdateTabletStatus(status) => self.update_tablet_status(status),
             DaemonCommand::SetWallpaper(wallpaper) => {
                 if let Err(err) = self.renderer.set_wallpaper(wallpaper.as_ref()) {
                     eprintln!("veilshell: set_wallpaper failed: {err}");
@@ -1365,6 +1398,16 @@ impl LayerApp {
                 let _ = reply.send(msg);
             }
             DaemonCommand::Quit => self.exit = true,
+        }
+    }
+
+    fn update_tablet_status(&mut self, status: veilshell_render::TabletStatus) {
+        self.renderer.context_mut().tablet_status = status;
+        if self.uses_tablet_status() {
+            self.draw_top_strip();
+            if self.active_scene == SceneKind::Home {
+                self.draw_overlay();
+            }
         }
     }
 
@@ -1658,14 +1701,7 @@ impl LayerApp {
                         self.renderer.context_mut(),
                     );
                 }
-                if self.active_scene != SceneKind::Pill
-                    && !self
-                        .drag
-                        .as_ref()
-                        .is_some_and(|drag| drag.surface == SurfaceKind::TopStrip)
-                {
-                    self.top_strip = None;
-                }
+                self.sync_top_strip();
             }
         }
         self.draw_overlay();

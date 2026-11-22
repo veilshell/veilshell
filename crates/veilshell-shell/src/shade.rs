@@ -43,7 +43,8 @@ fn output(bin: &str, args: &[&str]) -> Option<String> {
     bounded_output("2s", bin, args)
 }
 
-fn bounded_output(limit: &str, bin: &str, args: &[&str]) -> Option<String> {
+#[must_use]
+pub fn bounded_output(limit: &str, bin: &str, args: &[&str]) -> Option<String> {
     let out = Command::new("timeout")
         .args(["--kill-after=1s", limit, bin])
         .args(args)

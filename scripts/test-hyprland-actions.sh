@@ -279,6 +279,7 @@ if [[ ${VEILSHELL_TEST_STANDALONE:-0} == 1 ]]; then
             --argjson height "$1"
     }
     wait_for "Desk panel reserves the work area" desk_panel_reserved 44
+    nested_ctl -j getoption general:layout | jq -e '.str == "dwindle"' >/dev/null
     nested_ctl -j getoption decoration:rounding | jq -e '.int == 8' >/dev/null
     json_matches clients 'map(.address) | sort == $windows' --argjson windows "$saved_windows"
     pointer 60 22
@@ -315,11 +316,50 @@ if [[ ${VEILSHELL_TEST_STANDALONE:-0} == 1 ]]; then
     pointer 480 410
     wait_for "Settings Back returns to Quick Settings" in_scene shade
     [[ $("$BIN/veilctl" mode tablet) == "Mode set to Tablet "* ]]
-    wait_for "Tablet removes desktop reservation" desk_panel_reserved 0
+    wait_for "Tablet status replaces desktop reservation" desk_panel_reserved 48
     "$BIN/veilctl" status | grep -F 'session    : standalone (Tablet)' >/dev/null
-    nested_ctl -j getoption decoration:rounding | jq -e '.int == 14' >/dev/null
+    nested_ctl -j getoption decoration:rounding | jq -e '.int == 0' >/dev/null
+    nested_ctl -j getoption general:layout | jq -e '.str == "monocle"' >/dev/null
     json_matches clients 'map(.address) | sort == $windows' --argjson windows "$saved_windows"
-    echo "Desk pills opened their surfaces and the reservation cleared on return to Tablet."
+    show pill
+    nested_ctl eval "hl.dispatch(hl.dsp.focus({ window = \"address:$home_address\" }))" >/dev/null
+    show pill # Focus can trigger the fixture terminal's automatic keyboard.
+    wait_for "Tablet app fills the usable area" json_matches activewindow \
+        '.address == $id and .at == [3000,48] and .size == [960,592]' --arg id "$home_address" ||
+        { nested_ctl -j activewindow; nested_ctl -j monitors; exit 1; }
+    pointer 480 24 120
+    wait_for "Tablet status pull opens Quick Settings" in_scene shade
+    desk_panel_reserved 48
+    show pill
+    nested_ctl eval "hl.dispatch(hl.dsp.window.fullscreen({ mode = \"fullscreen\", action = \"set\", window = \"address:$home_address\" }))" >/dev/null
+    wait_for "True fullscreen fills the whole output" json_matches activewindow \
+        '.address == $id and .at == [3000,0] and .size == [960,640]' --arg id "$home_address"
+    if command -v grim >/dev/null && command -v python3 >/dev/null; then
+        # Both points are in the terminal's flat background in immersive mode.
+        # The upper point would be distinctly tinted if the status row were on top.
+        timeout 5 grim -o veil-smoke -t ppm "$ROOT/fullscreen.ppm"
+        python3 - "$ROOT/fullscreen.ppm" <<'PY'
+import sys
+with open(sys.argv[1], "rb") as f:
+    assert f.readline().strip() == b"P6"
+    width, _ = map(int, f.readline().split())
+    assert f.readline().strip() == b"255"
+    pixels = f.read()
+def pixel(x, y):
+    i = 3 * (y * width + x)
+    return pixels[i:i+3]
+assert pixel(5, 20) == pixel(5, 80), "status tint still visible in fullscreen"
+assert pixel(width // 2, 628) == pixel(5, 628), "navigation pill still visible in fullscreen"
+PY
+    fi
+    nested_ctl eval "hl.dispatch(hl.dsp.window.fullscreen({ mode = \"fullscreen\", action = \"unset\", window = \"address:$home_address\" }))" >/dev/null
+    show pill
+    wait_for "Leaving fullscreen restores tablet work area" json_matches activewindow \
+        '.address == $id and .at == [3000,48] and .size == [960,592]' --arg id "$home_address"
+    nested_ctl eval 'hl.monitor({ output = "veil-smoke", mode = "960x640@60", position = "3000x0", scale = 1, transform = 1 })' >/dev/null
+    wait_for "Portrait keeps the same status inset" json_matches activewindow \
+        '.address == $id and .at == [3000,48] and .size == [640,912]' --arg id "$home_address"
+    echo "Desk pills, Tablet app stage, status pull and fullscreen geometry passed."
     timeout 5 "$BIN/veilctl" quit >/dev/null
     exit 0
 fi

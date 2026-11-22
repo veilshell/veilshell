@@ -534,10 +534,10 @@ impl CompositorBackend for HyprlandBackend {
     fn apply_shell_mode(&mut self, mode: ShellMode) -> Result<(), CompositorError> {
         let lua = match mode {
             ShellMode::Tablet => {
-                "hl.config({ general = { gaps_in = 6, gaps_out = 10 }, decoration = { rounding = 14 } })"
+                "hl.config({ general = { layout = \"monocle\", gaps_in = 0, gaps_out = 0, border_size = 0 }, decoration = { rounding = 0 } })"
             }
             ShellMode::Laptop => {
-                "hl.config({ general = { gaps_in = 4, gaps_out = 8 }, decoration = { rounding = 8 } })"
+                "hl.config({ general = { layout = \"dwindle\", gaps_in = 4, gaps_out = 8, border_size = 1 }, decoration = { rounding = 8 } })"
             }
         };
         if self.eval_lua(lua).is_ok() {
@@ -545,10 +545,10 @@ impl CompositorBackend for HyprlandBackend {
         }
         let batch = match mode {
             ShellMode::Tablet => {
-                "[[BATCH]]keyword general:gaps_in 6;keyword general:gaps_out 10;keyword decoration:rounding 14"
+                "[[BATCH]]keyword general:layout monocle;keyword general:gaps_in 0;keyword general:gaps_out 0;keyword general:border_size 0;keyword decoration:rounding 0"
             }
             ShellMode::Laptop => {
-                "[[BATCH]]keyword general:gaps_in 4;keyword general:gaps_out 8;keyword decoration:rounding 8"
+                "[[BATCH]]keyword general:layout dwindle;keyword general:gaps_in 4;keyword general:gaps_out 8;keyword general:border_size 1;keyword decoration:rounding 8"
             }
         };
         let reply = self.send_request(batch)?;

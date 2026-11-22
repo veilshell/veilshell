@@ -128,7 +128,8 @@ Mode, which simply hides VeilShell.
 - [x] Switch between standalone Desk and Tablet layouts without closing apps or changing the overlay. Suppress automatic app keyboard in Desk Mode.
 - [x] Add a Desk Mode panel with launch, Recents and Quick Settings pills.
 - [x] Built-in standalone Settings for startup mode, panel visibility, wallpaper presets and shortcut profile.
-- [ ] Add standalone Tablet window defaults, taskbar, Dashboard, Welcome, and broader system settings. See the [Denial out-of-box gaps](DENIAL_CALL_MAP.md#out-of-box-gap-map).
+- [x] Standalone Tablet uses a gapless one-app layout with its own status strip; true fullscreen covers the shell chrome.
+- [ ] Add taskbar, Dashboard, Welcome, and broader system settings. See the [Denial out-of-box gaps](DENIAL_CALL_MAP.md#out-of-box-gap-map).
 
 ### Shared tablet experience
 

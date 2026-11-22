@@ -151,6 +151,7 @@ impl<C: CompositorBackend> LiveActionHandler<C> {
         let snap = self.hw.snapshot();
         ctx.battery_pct = snap.battery_pct;
         ctx.wifi_connected = snap.wifi_connected;
+        ctx.tablet_status.wifi = snap.wifi_radio.map(|_| snap.wifi_connected);
         ctx.bluetooth_enabled = snap.bluetooth_enabled;
         ctx.lte_connected = snap.lte_signal_pct.is_some();
         ctx.night_light = snap.night_light;
@@ -529,6 +530,10 @@ fn spawn_hardware_watchers(
             let mut last_theme_mtime = read_mtime(session.desktop_theme_path().as_ref());
             let mut last_bat = read_sysfs_battery().map(|(pct, _)| pct);
             let mut last_minute = unix_minute();
+            let status_worker = session
+                .owns_compositor()
+                .then(|| spawn_tablet_status_watcher(Arc::clone(&stop), poll_tx.clone()))
+                .flatten();
 
             let mut ticks = 0;
             while !stop.load(Ordering::Relaxed) {
@@ -568,10 +573,54 @@ fn spawn_hardware_watchers(
                 thread::sleep(Duration::from_millis(250));
                 ticks += 1;
             }
+            if let Some(worker) = status_worker {
+                worker.thread().unpark();
+                let _ = worker.join();
+            }
         })
         .ok();
 
     (sensor_guard, handle)
+}
+
+fn spawn_tablet_status_watcher(
+    stop: Arc<AtomicBool>,
+    tx: Sender<DaemonCommand>,
+) -> Option<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("veilshell-tablet-status".into())
+        .spawn(move || {
+            let mut last = None;
+            while !stop.load(Ordering::Relaxed) {
+                let status = tablet_status();
+                if last != Some(status) {
+                    last = Some(status);
+                    if tx.send(DaemonCommand::UpdateTabletStatus(status)).is_err() {
+                        break;
+                    }
+                }
+                thread::park_timeout(Duration::from_secs(4));
+            }
+        })
+        .ok()
+}
+
+fn tablet_status() -> veilshell_render::TabletStatus {
+    let wifi = shade::bounded_output(
+        "1s",
+        "nmcli",
+        &["-t", "-f", "TYPE,STATE,CONNECTION", "dev", "status"],
+    )
+    .filter(|devices| devices.lines().any(|line| line.starts_with("wifi:")))
+    .map(|devices| {
+        veilshell_hw::linux::parse_nmcli_devices(&devices)
+            .0
+            .is_some()
+    });
+    veilshell_render::TabletStatus {
+        battery: read_sysfs_battery(),
+        wifi,
+    }
 }
 
 fn unix_minute() -> u64 {
@@ -763,6 +812,7 @@ fn initial_scene(
     ctx.shade.quiet = None;
     if let Some(view) = &mut ctx.settings {
         ctx.session_wallpaper = load_session_wallpaper(view);
+        ctx.tablet_status.battery = read_sysfs_battery();
     }
     ctx
 }

@@ -40,6 +40,7 @@ pub struct RecentsCard {
 #[allow(clippy::struct_excessive_bools)]
 pub struct SceneContext {
     pub settings: Option<crate::SettingsView>,
+    pub tablet_status: crate::TabletStatus,
     pub session_wallpaper: Option<Arc<RgbaImage>>,
     pub launcher: crate::LauncherState,
     pub clock_text: String,
@@ -88,6 +89,7 @@ impl Default for SceneContext {
     fn default() -> Self {
         Self {
             settings: None,
+            tablet_status: crate::TabletStatus::default(),
             session_wallpaper: None,
             launcher: crate::LauncherState::default(),
             clock_text: "12:00".into(),
@@ -498,7 +500,12 @@ fn build_home(
         HitTarget::DismissOverlay,
     );
     let fg = HOME_FOREGROUND.with_alpha(progress);
-    push_home_status(&mut out.draw_list, width, height, ctx, fg);
+    if ctx.settings.is_some() && ctx.tablet_mode {
+        let strip = crate::build_tablet_status(width, 48.0, palette, ctx);
+        out.draw_list.commands.extend(strip.commands);
+    } else {
+        push_home_status(&mut out.draw_list, width, height, ctx, fg);
+    }
 
     let apps = &ctx.home_apps;
     let grid = HomeGrid::new(width, height);

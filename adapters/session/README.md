@@ -60,6 +60,16 @@ works. Tablet is the default at login unless you change it in Settings.
 There is not yet a taskbar or Dashboard. This does not change the overlay's
 Laptop Mode, which hides VeilShell without changing the host layout.
 
+### Tablet app layout
+
+Tablet Mode uses Hyprland's one-window-at-a-time layout. Normal apps fill
+the space below a 48-logical-pixel status strip, with no window gaps or
+borders. Other apps stay open in Recents. The strip shows the time and
+available Wi-Fi and battery status; pull down from the center handle for
+Quick Settings. The strip stays reserved while the shade is open and while
+typing. True fullscreen, such as when a player requests it, covers the strip
+and bottom pill; exiting fullscreen restores the tablet layout.
+
 ### Settings
 
 Open **Quick Settings → Settings**, press `Super+Ctrl+Alt+I`, or run

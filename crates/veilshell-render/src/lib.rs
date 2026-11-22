@@ -16,6 +16,8 @@ mod settings;
 pub use settings::{build_wallpaper, SettingsAction, SettingsView, WallpaperPreset};
 mod shade;
 mod shade_glyphs;
+mod tablet_status;
+pub use tablet_status::{build_tablet_status, TabletStatus};
 pub mod software;
 
 use std::fmt;
