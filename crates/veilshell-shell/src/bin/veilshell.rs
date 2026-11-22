@@ -25,7 +25,9 @@ use veilshell_render::{
     ActiveRenderer, RecentsCard, RendererPreference, SceneContext, SceneKind, ShadeAction,
     ShadePage, WallpaperImage,
 };
-use veilshell_shell::apps::{apps_to_tiles, current_clock_hhmm, discover_desktop_apps};
+use veilshell_shell::apps::{
+    apps_to_tiles, current_clock_hhmm, discover_desktop_apps, running_app_window,
+};
 use veilshell_shell::ipc::{default_socket_path, spawn_ipc_listener};
 use veilshell_shell::session::ShellSession;
 use veilshell_shell::shade;
@@ -38,6 +40,7 @@ use veilshell_wayland::{
 
 struct LiveActionHandler<C> {
     compositor: C,
+    desktop_apps: Vec<veilshell_core::DesktopApp>,
     hw: LinuxHardware,
     session: ShellSession,
     mode_sm: ModeStateMachine,
@@ -49,6 +52,34 @@ struct LiveActionHandler<C> {
 }
 
 impl<C: CompositorBackend> LiveActionHandler<C> {
+    fn activate_home_app(&mut self, id: &str, exec: &str) {
+        if self.session.owns_compositor() {
+            if let Some(app) = self.desktop_apps.iter().find(|app| app.id == id) {
+                match self.compositor.list_windows() {
+                    Ok(windows) => {
+                        if let Some(window) = running_app_window(app, &windows) {
+                            match self.compositor.focus_window(window) {
+                                Ok(()) => return,
+                                Err(veilshell_compositor::CompositorError::NotFound(_)) => {}
+                                Err(err) => {
+                                    eprintln!("veilshell: could not focus '{id}': {err}");
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("veilshell: could not check for an open '{id}': {err}");
+                        return;
+                    }
+                }
+            }
+        }
+        if let Err(err) = self.compositor.launch_command(exec) {
+            eprintln!("veilshell: launch '{id}' failed: {err}");
+        }
+    }
+
     fn apply_mode_layout(&mut self, mode: ShellMode) {
         if self.session.owns_compositor() {
             if let Err(err) = self.compositor.apply_shell_mode(mode) {
@@ -286,11 +317,7 @@ impl<C: CompositorBackend> ShellActionHandler for LiveActionHandler<C> {
                     ctx.recents_cards.retain(|card| card.id != id);
                 }
             }
-            ShellAction::LaunchApp { exec } => {
-                if let Err(err) = self.compositor.launch_command(&exec) {
-                    eprintln!("veilshell: launch '{exec}' failed: {err}");
-                }
-            }
+            ShellAction::LaunchApp { id, exec } => self.activate_home_app(&id, &exec),
             ShellAction::SwitchWorkspace(delta) => {
                 if let Err(err) = self.compositor.switch_workspace_relative(delta) {
                     eprintln!("veilshell: switch_workspace failed: {err}");
@@ -636,6 +663,23 @@ fn watch_shutdown_signals(cmd_tx: Sender<DaemonCommand>) -> std::io::Result<()> 
     Ok(())
 }
 
+fn initial_scene(
+    session: ShellSession,
+    apps: &[veilshell_core::DesktopApp],
+    visible: bool,
+) -> SceneContext {
+    let mut ctx = SceneContext {
+        clock_text: current_clock_hhmm(),
+        tablet_mode: visible,
+        home_apps: apps_to_tiles(apps),
+        power_menu: session.owns_compositor().then_some(PowerMenu::default()),
+        ..SceneContext::default()
+    };
+    ctx.shade.auto_rotate_available = false;
+    ctx.shade.quiet = None;
+    ctx
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let opts = match parse_cli(&args) {
@@ -666,15 +710,7 @@ fn main() -> ExitCode {
     let initial_visible =
         mode_sm.effective_mode() == ShellMode::Tablet || opts.scene != SceneKind::Pill;
 
-    let mut scene_ctx = SceneContext {
-        clock_text: current_clock_hhmm(),
-        tablet_mode: initial_visible,
-        home_apps: apps_to_tiles(&discovered),
-        power_menu: session.owns_compositor().then_some(PowerMenu::default()),
-        ..SceneContext::default()
-    };
-    scene_ctx.shade.auto_rotate_available = false;
-    scene_ctx.shade.quiet = None;
+    let mut scene_ctx = initial_scene(session, &discovered, initial_visible);
 
     let Some(compositor) = compositor else {
         print_dry_run(&opts, hw, palette, scene_ctx, initial_visible);
@@ -688,6 +724,7 @@ fn main() -> ExitCode {
     }
     let mut handler = LiveActionHandler {
         compositor,
+        desktop_apps: discovered,
         hw: hw.clone(),
         session,
         mode_sm,
@@ -869,6 +906,7 @@ mod tests {
     fn handler(session: ShellSession) -> LiveActionHandler<MockBackend> {
         LiveActionHandler {
             compositor: MockBackend::default(),
+            desktop_apps: Vec::new(),
             hw: LinuxHardware::new(None),
             session,
             mode_sm: ModeStateMachine::new(ModePolicy::Auto, true),
@@ -878,6 +916,60 @@ mod tests {
             session_tx: None,
             shade_tx: None,
         }
+    }
+
+    #[test]
+    fn standalone_home_focuses_an_open_app_instead_of_launching_again() {
+        let mut shell = handler(ShellSession::Standalone);
+        let id = "example-browser.desktop";
+        shell.desktop_apps.push(
+            veilshell_core::parse_desktop_entry(
+                "[Desktop Entry]\nType=Application\nName=Browser\nExec=browser\nStartupWMClass=Chromium",
+                id,
+            )
+            .unwrap(),
+        );
+
+        shell.activate_home_app(id, "browser");
+
+        let windows = shell.compositor.list_windows().unwrap();
+        assert!(windows.iter().any(|w| w.id.0 == "0x2" && w.focused));
+        assert_eq!(shell.compositor.launched_commands(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn standalone_home_launches_when_only_a_different_browser_app_is_open() {
+        let mut shell = handler(ShellSession::Standalone);
+        let id = "example-web-app.desktop";
+        let exec = "chromium --app=https://example.org";
+        shell.desktop_apps.push(
+            veilshell_core::parse_desktop_entry(
+                &format!("[Desktop Entry]\nType=Application\nName=Web App\nExec={exec}"),
+                id,
+            )
+            .unwrap(),
+        );
+
+        shell.activate_home_app(id, exec);
+
+        assert_eq!(shell.compositor.launched_commands(), [exec]);
+    }
+
+    #[test]
+    fn overlay_home_keeps_launching_even_if_an_app_is_open() {
+        let mut shell = handler(ShellSession::Overlay);
+        let id = "chromium.desktop";
+        shell.desktop_apps.push(
+            veilshell_core::parse_desktop_entry(
+                "[Desktop Entry]\nType=Application\nName=Chromium\nExec=chromium",
+                id,
+            )
+            .unwrap(),
+        );
+
+        shell.activate_home_app(id, "chromium");
+
+        assert_eq!(shell.compositor.launched_commands(), ["chromium"]);
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub struct DesktopApp {
     pub name: String,
     pub exec: String,
     pub icon: Option<String>,
+    pub startup_wm_class: Option<String>,
     pub terminal: bool,
     pub categories: Vec<String>,
 }
@@ -23,6 +24,7 @@ pub fn parse_desktop_entry(src: &str, id: &str) -> Option<DesktopApp> {
     let mut name: Option<String> = None;
     let mut exec: Option<String> = None;
     let mut icon: Option<String> = None;
+    let mut startup_wm_class = None;
     let mut terminal = false;
     let mut categories = Vec::new();
 
@@ -60,6 +62,7 @@ pub fn parse_desktop_entry(src: &str, id: &str) -> Option<DesktopApp> {
                 }
             }
             "Icon" if icon.is_none() && !val.is_empty() => icon = Some(val.to_owned()),
+            "StartupWMClass" if !val.is_empty() => startup_wm_class = Some(val.to_owned()),
             "Terminal" => terminal = val.eq_ignore_ascii_case("true"),
             "Categories" => {
                 categories = val
@@ -82,6 +85,7 @@ pub fn parse_desktop_entry(src: &str, id: &str) -> Option<DesktopApp> {
         name: name?,
         exec: exec?,
         icon,
+        startup_wm_class,
         terminal,
         categories,
     })

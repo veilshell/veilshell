@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+use veilshell_compositor::{WindowId, WindowInfo};
 use veilshell_core::{app_badge, parse_desktop_entry, DesktopApp, Rgba};
 use veilshell_render::{AppTile, RgbaImage};
 
@@ -14,6 +15,24 @@ mod xdg;
 
 use icons::IconLookup;
 use xdg::DataDirs;
+
+/// Resolve a running Home app in compositor focus order. Do not guess from
+/// its command, icon, or title: multiple web apps may share a browser.
+#[must_use]
+pub fn running_app_window<'a>(app: &DesktopApp, windows: &'a [WindowInfo]) -> Option<&'a WindowId> {
+    let desktop_id = app.id.strip_suffix(".desktop").unwrap_or(&app.id);
+    app.startup_wm_class
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(desktop_id))
+        .filter(|id| !id.is_empty())
+        .find_map(|id| {
+            windows
+                .iter()
+                .find(|window| window.app_id.eq_ignore_ascii_case(id))
+                .map(|window| &window.id)
+        })
+}
 
 const PINNED_ORDER: &[&str] = &[
     "foot",

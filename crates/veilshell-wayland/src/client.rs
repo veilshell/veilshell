@@ -147,8 +147,8 @@ pub enum ShellAction {
     FocusWindow(String),
     /// Request closing a compositor window.
     CloseWindow(String),
-    /// Launch a desktop application command.
-    LaunchApp { exec: String },
+    /// Activate a Home entry, retaining its desktop-file ID for session policy.
+    LaunchApp { id: String, exec: String },
     /// Switch to the adjacent workspace (`+1` next, `-1` prev).
     SwitchWorkspace(i32),
     /// Toggle a Quick Settings tile (`wifi`, `bluetooth`, `lte`, `autorotate`, `tablet_mode`, `night_light`).
@@ -1829,9 +1829,11 @@ impl LayerApp {
             }
             HitTarget::LaunchApp { index } => {
                 if let Some(app) = self.renderer.context().home_apps.get(index) {
-                    let exec = app.exec.clone();
-                    self.handler
-                        .on_action(ShellAction::LaunchApp { exec }, self.renderer.context_mut());
+                    let action = ShellAction::LaunchApp {
+                        id: app.id.clone(),
+                        exec: app.exec.clone(),
+                    };
+                    self.handler.on_action(action, self.renderer.context_mut());
                     self.show_scene(SceneKind::Pill, false);
                 }
             }

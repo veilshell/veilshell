@@ -181,6 +181,14 @@ foot --hold --app-id=veil-other --title=VeilOther true >"$ROOT/foot.log" 2>&1 &
 PIDS+=("$!")
 wait_for "underlying fixture focused" json_matches activewindow '.class == "veil-other"'
 
+if [[ ${VEILSHELL_TEST_STANDALONE:-0} == 1 ]]; then
+    # Exercise standalone policy without starting SDDM or host services.
+    export VEILSHELL_SESSION_DIR="$XDG_RUNTIME_DIR/standalone"
+    mkdir -m 700 "$VEILSHELL_SESSION_DIR"
+    printf '%s\n' "$WAYLAND_DISPLAY" "$HYPRLAND_INSTANCE_SIGNATURE" >"$VEILSHELL_SESSION_DIR/display"
+    export VEILSHELL_SOCKET="$VEILSHELL_SESSION_DIR/control.sock"
+fi
+
 WAYLAND_DEBUG="${VEILSHELL_TEST_WAYLAND_DEBUG:-0}" \
     "$BIN/veilshell" --no-watchers --policy tablet --output veil-smoke --renderer software \
     >"$ROOT/veilshell.log" 2>&1 &
@@ -214,6 +222,25 @@ pointer 110 110
 wait_for "Home launched its fixture" json_matches clients \
     'map(.class) | sort == ["veil-home", "veil-other"]'
 echo "Home launch passed."
+
+if [[ ${VEILSHELL_TEST_STANDALONE:-0} == 1 ]]; then
+    # Focus a different window first so that a no-op can't pass.
+    home_address="$(nested_ctl -j clients | jq -er '.[] | select(.class == "veil-home") | .address')"
+    other_address="$(nested_ctl -j clients | jq -er '.[] | select(.class == "veil-other") | .address')"
+    nested_ctl eval "hl.dispatch(hl.dsp.focus({ window = \"address:$other_address\" }))" >/dev/null
+    wait_for "other window focused before reactivation" json_matches activewindow '.address == $id' --arg id "$other_address"
+    show pill
+    pointer 480 600 516
+    wait_for "second bottom swipe opened Home" in_scene home
+    sleep 0.8
+    pointer 110 110
+    wait_for "standalone Home focused the existing address" json_matches activewindow \
+        '.address == $id' --arg id "$home_address"
+    json_matches clients 'map(.class) | sort == ["veil-home", "veil-other"]'
+    echo "Standalone Home focused the existing app without a duplicate."
+    timeout 5 "$BIN/veilctl" quit >/dev/null
+    exit 0
+fi
 
 # Recents centers the most recently focused client. Tap its neighbor so a
 # no-op focus dispatcher cannot pass.
