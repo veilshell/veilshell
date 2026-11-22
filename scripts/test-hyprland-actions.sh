@@ -48,7 +48,55 @@ export LIBSEAT_BACKEND=seatd SEATD_SOCK="$ROOT/no-seat"
 export DBUS_SESSION_BUS_ADDRESS="unix:path=$ROOT/no-user-bus"
 export DBUS_SYSTEM_BUS_ADDRESS="unix:path=$ROOT/no-system-bus" GSETTINGS_BACKEND=memory
 export XDG_CURRENT_DESKTOP=Hyprland VEILSHELL_SOCKET="$XDG_RUNTIME_DIR/veil.sock"
-unset DISPLAY WAYLAND_DISPLAY WAYLAND_SOCKET HYPRLAND_INSTANCE_SIGNATURE NOTIFY_SOCKET VEILSHELL_SESSION_DIR
+unset DISPLAY WAYLAND_DISPLAY WAYLAND_SOCKET HYPRLAND_INSTANCE_SIGNATURE NOTIFY_SOCKET VEILSHELL_SESSION_DIR OMARCHY_PATH
+
+# Never send these test taps to real radios or audio. The fixture records the
+# outgoing commands and reports the applied state to the same panel.
+export VEIL_TEST_STATE="$ROOT"
+mkdir "$ROOT/tools"
+cat >"$ROOT/tools/nmcli" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  '-t -f WIFI,WWAN general') echo 'enabled:disabled' ;;
+  '-t -f TYPE,STATE,CONNECTION dev status') echo 'wifi:connected:Home' ;;
+  '-t -e yes -f UUID,TYPE,NAME,DEVICE connection show')
+    if [[ -e "$VEIL_TEST_STATE/wifi-connected" ]]; then
+      echo 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:802-11-wireless:Home:'
+      echo '11111111-2222-3333-4444-555555555555:802-11-wireless:Guest:wlan0'
+    else
+      echo 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:802-11-wireless:Home:wlan0'
+      echo '11111111-2222-3333-4444-555555555555:802-11-wireless:Guest:'
+    fi ;;
+  '--wait 14 connection up uuid 11111111-2222-3333-4444-555555555555') touch "$VEIL_TEST_STATE/wifi-connected" ;;
+  'radio wifi '*) touch "$VEIL_TEST_STATE/wifi-radio-toggled" ;;
+  *) exit 1 ;;
+esac
+EOF
+cat >"$ROOT/tools/wpctl" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  get-volume)
+    if [[ -e "$VEIL_TEST_STATE/muted" ]]; then echo 'Volume: 0.50 [MUTED]'; else echo 'Volume: 0.50'; fi ;;
+  set-mute)
+    [[ $2 == @DEFAULT_AUDIO_SINK@ && $3 == 1 ]] || exit 1
+    touch "$VEIL_TEST_STATE/muted" ;;
+  *) exit 1 ;;
+esac
+EOF
+cat >"$ROOT/tools/pactl" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  'get-default-sink') if [[ -e "$VEIL_TEST_STATE/headphones" ]]; then echo headphones; else echo speakers; fi ;;
+  '--format=json list sinks') echo '[{"name":"speakers","description":"Speakers"},{"name":"headphones","description":"Headphones"}]' ;;
+  'set-default-sink headphones') touch "$VEIL_TEST_STATE/headphones" ;;
+  *) exit 1 ;;
+esac
+EOF
+for tool in bluetoothctl playerctl powerprofilesctl; do
+    printf '#!/bin/sh\nexit 1\n' >"$ROOT/tools/$tool"
+done
+chmod +x "$ROOT"/tools/*
+export PATH="$ROOT/tools:$PATH"
 
 cat >"$ROOT/hyprland.lua" <<'EOF'
 hl.config({
@@ -179,4 +227,21 @@ pointer 480 320 145
 wait_for "Recents closed only the focused fixture" json_matches clients \
     'map(.address) == [$id]' --arg id "$other"
 echo "Recents close passed."
+
+show shade
+# Detail tiles and the actual device commands, against fixture services.
+pointer 100 244
+sleep 0.2
+pointer 480 152
+wait_for "saved Wi-Fi activated by UUID" test -e "$ROOT/wifi-connected"
+[[ ! -e "$ROOT/wifi-radio-toggled" ]]
+pointer 228 46
+sleep 0.5
+pointer 595 401
+wait_for "audio muted" test -e "$ROOT/muted"
+pointer 818 401
+sleep 0.2
+pointer 480 152
+wait_for "default output changed" test -e "$ROOT/headphones"
+echo "Quick Settings saved Wi-Fi, mute, and audio output passed."
 timeout 5 "$BIN/veilctl" quit >/dev/null

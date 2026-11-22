@@ -99,6 +99,15 @@ another app page, or swipe up again from Home's bottom edge to open Recents.
 In Recents, swipe across to browse windows and swipe up on a card to close it.
 A horizontal swipe on the bottom pill still changes workspaces.
 
+**Quick Settings:** Use the separate **Wi-Fi Networks**, **Bluetooth Devices**,
+and **Audio Output** buttons to reconnect to saved networks or paired devices,
+or to change the default sound output. The radio switches are separate.
+Available controls depend on NetworkManager (`nmcli`), BlueZ (`bluetoothctl`),
+WirePlumber (`wpctl`), and the PulseAudio-compatible `pactl` interface.
+**More** shows playback controls when a player is available. On Omarchy it
+can also open notification history or take a screenshot. New network
+credentials and Bluetooth pairing stay with the host settings panels.
+
 For Omarchy users, optional instant theme-hook (`adapters/omarchy/hooks/30-veilshell-theme`)
 and `systemd --user` (`adapters/omarchy/systemd/veilshell.service`) integration guides live in [`adapters/omarchy/README.md`](adapters/omarchy/README.md).
 Set `VEILSHELL_ICON_THEME` before starting VeilShell to override icon lookup

@@ -30,7 +30,9 @@ pub use scene::{
     bottom_pill_bounds, build_scene, build_scene_layout, build_top_strip_scene, default_demo_apps,
     home_page_count, home_reveal_travel, top_handle_bounds, AppTile, RecentsCard, SceneContext,
 };
-pub use shade::{shade_reveal_travel, ShadeStatus};
+pub use shade::{
+    shade_reveal_travel, ShadeAction, ShadeChoice, ShadeExtras, ShadePage, ShadeStatus,
+};
 pub use software::SdfSoftwareRenderer;
 
 /// High-level shell scene rendered either live on `Wayland` or offscreen to a snapshot.

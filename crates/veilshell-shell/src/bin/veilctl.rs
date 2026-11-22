@@ -433,7 +433,8 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
         veilshell_shell::shade::apply_hardware(&mut ctx, &snap);
         ctx.shade.auto_rotate_available = false;
         if scene == SceneKind::Shade {
-            veilshell_shell::shade::refresh_optional(&mut ctx, session);
+            ctx.shade.quiet = None;
+            veilshell_shell::shade::refresh_optional(&mut ctx);
         }
         ctx.home_apps = apps_to_tiles(&discover_desktop_apps());
     }

@@ -365,6 +365,8 @@ pub enum HitTarget {
     FocusWindow { id: String },
     /// Tapping a Quick Settings tile toggles `id` (`wifi`, `bluetooth`, etc.).
     ShadeToggle { id: &'static str },
+    /// A detail, device, or host-service action in the touch shade.
+    ShadeAction(crate::ShadeAction),
     /// Tapping or dragging inside a Quick Settings slider updates `id`.
     ShadeSlider { id: &'static str, rect: HitRect },
     /// Standalone session power menu input.

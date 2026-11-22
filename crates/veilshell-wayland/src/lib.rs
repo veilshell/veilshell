@@ -9,7 +9,7 @@ mod osk;
 mod scale;
 
 pub use client::{
-    run_layer_surface, run_shell_daemon, DaemonCommand, RuntimeStatus, ShellAction,
+    run_layer_surface, run_shell_daemon, DaemonCommand, RuntimeStatus, ShadeReply, ShellAction,
     ShellActionHandler, WaylandError,
 };
 pub use smithay_client_toolkit::reexports::calloop::channel;

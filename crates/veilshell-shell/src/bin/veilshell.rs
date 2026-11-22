@@ -22,7 +22,8 @@ use veilshell_hw::linux::{read_sysfs_backlight, read_sysfs_battery};
 use veilshell_hw::{HardwareBackend, HardwareController, LinuxHardware, SensorGuard};
 use veilshell_render::power::{PowerAction, PowerMenu};
 use veilshell_render::{
-    ActiveRenderer, RecentsCard, RendererPreference, SceneContext, SceneKind, WallpaperImage,
+    ActiveRenderer, RecentsCard, RendererPreference, SceneContext, SceneKind, ShadeAction,
+    ShadePage, WallpaperImage,
 };
 use veilshell_shell::apps::{apps_to_tiles, current_clock_hhmm, discover_desktop_apps};
 use veilshell_shell::ipc::{default_socket_path, spawn_ipc_listener};
@@ -43,6 +44,7 @@ struct LiveActionHandler<C> {
     target_output: Option<String>,
     auto_rotate: bool,
     session_tx: Option<Sender<DaemonCommand>>,
+    shade_tx: Option<Sender<DaemonCommand>>,
 }
 
 impl<C: CompositorBackend> LiveActionHandler<C> {
@@ -123,8 +125,11 @@ impl<C: CompositorBackend> LiveActionHandler<C> {
         ctx.clock_text = current_clock_hhmm();
         if scene == SceneKind::Shade {
             self.sync_hardware_snapshot(ctx);
-            shade::refresh_optional(ctx, self.session);
+            shade::refresh_optional(ctx);
             ctx.shade.feedback = None;
+            if let Some(tx) = &self.shade_tx {
+                shade::request(ctx, tx, self.session, None);
+            }
         } else {
             self.sync_fast_sysfs(ctx);
         }
@@ -291,6 +296,17 @@ impl<C: CompositorBackend> ShellActionHandler for LiveActionHandler<C> {
                 }
             }
             ShellAction::ToggleSetting(id) => self.toggle_setting(id, ctx),
+            ShellAction::Shade(action) => {
+                if let Some(tx) = &self.shade_tx {
+                    let action = if action == ShadeAction::Show(ShadePage::Main) {
+                        self.sync_hardware_snapshot(ctx);
+                        None
+                    } else {
+                        Some(action)
+                    };
+                    shade::request(ctx, tx, self.session, action);
+                }
+            }
             ShellAction::SetSlider { id, pct } => self.set_slider(id, pct, ctx),
             ShellAction::HomePageChanged(page) => {
                 ctx.home_page = page;
@@ -642,6 +658,7 @@ fn main() -> ExitCode {
         ..SceneContext::default()
     };
     scene_ctx.shade.auto_rotate_available = false;
+    scene_ctx.shade.quiet = None;
 
     let Some(compositor) = compositor else {
         print_dry_run(&opts, hw, palette, scene_ctx, initial_visible);
@@ -662,6 +679,7 @@ fn main() -> ExitCode {
         target_output: opts.output_name.clone(),
         auto_rotate: false,
         session_tx: session.owns_compositor().then(|| cmd_tx.clone()),
+        shade_tx: Some(cmd_tx.clone()),
     };
     handler.sync_hardware_snapshot(&mut scene_ctx);
 
@@ -820,6 +838,7 @@ mod tests {
             target_output: Some("eDP-1".to_owned()),
             auto_rotate: true,
             session_tx: None,
+            shade_tx: None,
         }
     }
 

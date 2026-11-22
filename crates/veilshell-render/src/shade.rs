@@ -11,6 +11,87 @@ use crate::{
 
 const TOUCH_SIZE: f32 = 44.0;
 
+/// Pages of the touch shade. Details can be used without a desktop bar.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ShadePage {
+    #[default]
+    Main,
+    Wifi,
+    Bluetooth,
+    Audio,
+    More,
+}
+
+impl ShadePage {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Main => "Quick Settings",
+            Self::Wifi => "Wi-Fi Networks",
+            Self::Bluetooth => "Bluetooth Devices",
+            Self::Audio => "Audio Output",
+            Self::More => "More",
+        }
+    }
+}
+
+/// Extra actions separate from the existing radio and slider hit targets.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ShadeAction {
+    Show(ShadePage),
+    Page(usize),
+    Select(ShadePage, String),
+    Host(ShadePage),
+    Mute,
+    Quiet,
+    Previous,
+    PlayPause,
+    Next,
+    Screenshot,
+    Notifications,
+}
+
+/// Saved connection, paired device, or audio output.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShadeChoice {
+    pub id: String,
+    pub label: String,
+    pub active: bool,
+}
+
+/// Capabilities and state read from optional desktop services.
+#[derive(Clone, Debug, Default, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // Independent service capabilities.
+pub struct ShadeExtras {
+    pub host_wifi: bool,
+    pub host_bluetooth: bool,
+    pub host_audio: bool,
+    pub wifi: bool,
+    pub bluetooth: bool,
+    pub audio: bool,
+    pub muted: Option<bool>,
+    pub bluetooth_name: Option<String>,
+    pub media: Option<String>,
+    pub screenshot: bool,
+    pub notifications: bool,
+}
+
+impl ShadeExtras {
+    /// Whether the corresponding host panel was found.
+    #[must_use]
+    pub fn host_panel(&self, page: ShadePage) -> bool {
+        match page {
+            ShadePage::Wifi => self.host_wifi,
+            ShadePage::Bluetooth => self.host_bluetooth,
+            ShadePage::Audio => self.host_audio,
+            _ => false,
+        }
+    }
+
+    fn has_more(&self) -> bool {
+        self.media.is_some() || self.screenshot || self.notifications
+    }
+}
+
 /// Host capabilities and state for the mobile control center.
 #[derive(Clone, Debug, PartialEq)]
 #[allow(clippy::struct_excessive_bools)]
@@ -27,6 +108,11 @@ pub struct ShadeStatus {
     pub power_profile: Option<String>,
     pub quiet: Option<bool>,
     pub feedback: Option<String>,
+    pub extras: ShadeExtras,
+    pub page: ShadePage,
+    pub page_offset: usize,
+    pub choices: Vec<ShadeChoice>,
+    pub pending: Option<u64>,
 }
 
 impl Default for ShadeStatus {
@@ -44,6 +130,11 @@ impl Default for ShadeStatus {
             power_profile: Some("Balanced".into()),
             quiet: Some(false),
             feedback: None,
+            extras: ShadeExtras::default(),
+            page: ShadePage::Main,
+            page_offset: 0,
+            choices: Vec::new(),
+            pending: None,
         }
     }
 }
@@ -79,6 +170,16 @@ pub(crate) fn build_shade(
         HitTarget::DismissOverlay,
     );
 
+    let style = ShadeStyle { palette, progress };
+    if ctx.shade.page != ShadePage::Main {
+        draw_details(out, &style, ctx, width, height);
+        push_bottom_pill_bar(&mut out.draw_list, width, height, palette, ctx);
+        if progress < 1.0 {
+            out.hit_regions.clear();
+        }
+        return;
+    }
+
     let connectivity = connectivity_group(ctx);
     let display = display_group(ctx);
     let device = device_group(ctx);
@@ -95,19 +196,25 @@ pub(crate) fn build_shade(
         [&portrait, &[]]
     };
     let layout = ShadeLayout::new(width, height, split, panes, progress);
-    let style = ShadeStyle { palette, progress };
     layout.draw_header(out, &style, ctx);
     for (index, pane) in panes.into_iter().enumerate() {
         layout.draw_pane(out, &style, index, pane);
     }
-    layout.draw_feedback(out, &style, ctx.shade.feedback.as_deref());
+    layout.draw_feedback(
+        out,
+        &style,
+        ctx.shade
+            .feedback
+            .as_deref()
+            .or(ctx.shade.pending.map(|_| "Working...")),
+    );
     push_bottom_pill_bar(&mut out.draw_list, width, height, palette, ctx);
     if progress < 1.0 {
         out.hit_regions.clear();
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Tile<'a> {
     id: &'static str,
     glyph: Glyph,
@@ -115,6 +222,7 @@ struct Tile<'a> {
     short_title: &'static str,
     detail: &'a str,
     value: Option<bool>,
+    action: Option<ShadeAction>,
 }
 
 impl<'a> Tile<'a> {
@@ -131,6 +239,7 @@ impl<'a> Tile<'a> {
             short_title: title,
             detail,
             value,
+            action: None,
         }
     }
 
@@ -143,6 +252,11 @@ impl<'a> Tile<'a> {
 
     fn detail(self, detail: &'a str) -> Self {
         Self { detail, ..self }
+    }
+
+    fn action(mut self, action: ShadeAction) -> Self {
+        self.action = Some(action);
+        self
     }
 }
 
@@ -158,7 +272,7 @@ struct Level {
 struct Group<'a> {
     title: &'static str,
     levels: [Option<Level>; 2],
-    tiles: [Option<Tile<'a>>; 3],
+    tiles: Vec<Option<Tile<'a>>>,
 }
 
 impl Group<'_> {
@@ -180,6 +294,7 @@ impl Group<'_> {
 
 fn connectivity_group(ctx: &SceneContext) -> Group<'_> {
     let status = &ctx.shade;
+    let extra = &status.extras;
     let mut wifi = Tile::new("wifi", Glyph::Wifi, "Wi-Fi", status.wifi_radio);
     if wifi.value == Some(true) {
         if let Some(name) = status
@@ -200,22 +315,53 @@ fn connectivity_group(ctx: &SceneContext) -> Group<'_> {
             tile
         }
     });
+    let bluetooth = Tile::new(
+        "bluetooth",
+        Glyph::Bluetooth,
+        "Bluetooth",
+        status.bluetooth_available.then_some(ctx.bluetooth_enabled),
+    )
+    .short_title("BT");
+    let wifi_details = status.wifi_radio.is_some() && (extra.wifi || extra.host_wifi);
+    let bt_details = status.bluetooth_available && (extra.bluetooth || extra.host_bluetooth);
+    let mut tiles = Vec::new();
+    if wifi_details {
+        tiles.push(Some(
+            Tile::new("", Glyph::Wifi, "Wi-Fi Networks", Some(false))
+                .short_title("Networks")
+                .detail(wifi.detail)
+                .action(ShadeAction::Show(ShadePage::Wifi)),
+        ));
+        wifi.title = "Wi-Fi Radio";
+        wifi.detail = if wifi.value == Some(true) {
+            "On"
+        } else {
+            "Off"
+        };
+        wifi.short_title = "Wi-Fi Radio";
+    }
+    let mut bluetooth = bluetooth;
+    if bt_details {
+        tiles.push(Some(
+            Tile::new("", Glyph::Bluetooth, "Bluetooth Devices", Some(false))
+                .short_title("BT Devices")
+                .detail(
+                    extra
+                        .bluetooth_name
+                        .as_deref()
+                        .filter(|_| ctx.bluetooth_enabled)
+                        .unwrap_or("Paired devices"),
+                )
+                .action(ShadeAction::Show(ShadePage::Bluetooth)),
+        ));
+        bluetooth.title = "Bluetooth Radio";
+        bluetooth.short_title = "BT Radio";
+    }
+    tiles.extend([Some(wifi), Some(bluetooth), mobile]);
     Group {
         title: "Connectivity",
         levels: [None; 2],
-        tiles: [
-            Some(wifi),
-            Some(
-                Tile::new(
-                    "bluetooth",
-                    Glyph::Bluetooth,
-                    "Bluetooth",
-                    status.bluetooth_available.then_some(ctx.bluetooth_enabled),
-                )
-                .short_title("BT"),
-            ),
-            mobile,
-        ],
+        tiles,
     }
 }
 
@@ -239,7 +385,24 @@ fn display_group(ctx: &SceneContext) -> Group<'_> {
                 value: ctx.volume_pct,
             }),
         ],
-        tiles: [
+        tiles: vec![
+            status.extras.muted.map(|muted| {
+                Tile::new(
+                    "",
+                    Glyph::Volume,
+                    if muted { "Unmute" } else { "Mute" },
+                    Some(muted),
+                )
+                .action(ShadeAction::Mute)
+            }),
+            (status.volume_available && (status.extras.audio || status.extras.host_audio)).then(
+                || {
+                    Tile::new("", Glyph::Volume, "Audio Output", Some(false))
+                        .short_title("Output")
+                        .detail("Choose device")
+                        .action(ShadeAction::Show(ShadePage::Audio))
+                },
+            ),
             status.night_light_available.then_some(Tile::new(
                 "night_light",
                 Glyph::Moon,
@@ -247,7 +410,13 @@ fn display_group(ctx: &SceneContext) -> Group<'_> {
                 Some(ctx.night_light),
             )),
             status.quiet.map(|on| {
-                Tile::new("quiet", Glyph::Bell, "Do not disturb", Some(on)).short_title("Quiet")
+                let tile = Tile::new("quiet", Glyph::Bell, "Do not disturb", Some(on))
+                    .short_title("Quiet");
+                if status.extras.notifications {
+                    tile.action(ShadeAction::Quiet)
+                } else {
+                    tile
+                }
             }),
             None,
         ],
@@ -259,7 +428,7 @@ fn device_group(ctx: &SceneContext) -> Group<'_> {
     Group {
         title: "Device",
         levels: [None; 2],
-        tiles: [
+        tiles: vec![
             status.auto_rotate_available.then_some(
                 Tile::new(
                     "autorotate",
@@ -288,6 +457,11 @@ fn device_group(ctx: &SceneContext) -> Group<'_> {
                 )
                 .short_title("Desktop"),
             ),
+            status.extras.has_more().then(|| {
+                Tile::new("", Glyph::Desktop, "More", Some(false))
+                    .detail("Media and tools")
+                    .action(ShadeAction::Show(ShadePage::More))
+            }),
         ],
     }
 }
@@ -316,6 +490,13 @@ impl Metrics {
         tile_h: 70.0,
         level_h: 148.0,
     };
+    const DENSE: Self = Self {
+        heading_h: 13.0,
+        group_gap: 7.0,
+        row_gap: 5.0,
+        tile_h: TOUCH_SIZE,
+        level_h: 48.0,
+    };
 
     fn level_height(self, count: usize) -> f32 {
         match count {
@@ -328,9 +509,13 @@ impl Metrics {
     fn fit(panes: [&[&Group<'_>]; 2], columns: usize, available: f32) -> Self {
         let compact = pane_height(panes, columns, Self::COMPACT);
         if available < compact {
-            // Extremely short viewports still fit without overlapping. Try an extra
-            // column first (see `ShadeLayout::new`) to preserve touch sizing.
-            return Self::COMPACT.scale(available / compact);
+            // Use less space between controls before shrinking their hit targets.
+            let dense = pane_height(panes, columns, Self::DENSE);
+            return if available >= dense {
+                Self::DENSE
+            } else {
+                Self::DENSE.scale((available / dense).max(0.0))
+            };
         }
         let roomy = pane_height(panes, columns, Self::ROOMY);
         let t = ((available - compact) / (roomy - compact).max(1.0)).min(1.0);
@@ -558,7 +743,7 @@ impl ShadeLayout {
             let mut tiles = group.tiles.iter().flatten();
             while count > 0 {
                 let columns = count.min(self.columns);
-                for (rect, &tile) in
+                for (rect, tile) in
                     row(x, y, self.pane_w, metrics.tile_h, gap, columns).zip(tiles.by_ref())
                 {
                     style.tile(out, rect, tile);
@@ -637,7 +822,7 @@ impl ShadeStyle<'_> {
         );
     }
 
-    fn tile(&self, out: &mut SceneOutput, rect: HitRect, tile: Tile<'_>) {
+    fn tile(&self, out: &mut SceneOutput, rect: HitRect, tile: &Tile<'_>) {
         let active = tile.value == Some(true);
         let enabled = tile.value.is_some();
         self.surface(out, rect, active, enabled);
@@ -661,7 +846,13 @@ impl ShadeStyle<'_> {
             rect.w >= 136.0 || rect.h < TOUCH_SIZE,
         );
         if enabled {
-            out.push_hit(rect, HitTarget::ShadeToggle { id: tile.id });
+            out.push_hit(
+                rect,
+                tile.action.clone().map_or(
+                    HitTarget::ShadeToggle { id: tile.id },
+                    HitTarget::ShadeAction,
+                ),
+            );
         }
     }
 
@@ -708,6 +899,223 @@ impl ShadeStyle<'_> {
             ink: self.foreground(),
         };
         draw_face(&mut out.draw_list, label_area, face, label_area.w >= 136.0);
+    }
+}
+
+fn draw_details(
+    out: &mut SceneOutput,
+    style: &ShadeStyle<'_>,
+    ctx: &SceneContext,
+    width: f32,
+    height: f32,
+) {
+    let status = &ctx.shade;
+    let page = status.page;
+    let w = (width * 0.92).min(580.0);
+    let x = (width - w) * 0.5;
+    let start = 20.0;
+    let h = 52.0;
+    let step = h + 8.0;
+    let button = |title, glyph, action| Tile::new("", glyph, title, Some(false)).action(action);
+    style.tile(
+        out,
+        HitRect::new(x, start, 76.0, h),
+        &button("Back", Glyph::Desktop, ShadeAction::Show(ShadePage::Main)),
+    );
+    out.draw_list.push_text(
+        x + 88.0,
+        start + 17.0,
+        font::fit_text(page.title(), 2, w - 90.0),
+        2,
+        style.foreground(),
+        TextAlign::Left,
+    );
+    let mut y = start + step;
+    if page == ShadePage::More {
+        if let Some(track) = &status.extras.media {
+            out.draw_list.push_text(
+                x,
+                y + 5.0,
+                font::fit_text(track, 1, w),
+                1,
+                style.foreground(),
+                TextAlign::Left,
+            );
+            y += 25.0;
+            for (rect, (title, action)) in row(x, y, w, h, 8.0, 3).zip([
+                ("Previous", ShadeAction::Previous),
+                ("Play/Pause", ShadeAction::PlayPause),
+                ("Next", ShadeAction::Next),
+            ]) {
+                style.tile(out, rect, &button(title, Glyph::Volume, action));
+            }
+            y += step;
+        }
+        let tools = [
+            status.extras.screenshot.then_some((
+                "Screenshot",
+                Glyph::Desktop,
+                ShadeAction::Screenshot,
+            )),
+            status.extras.notifications.then_some((
+                "Notifications",
+                Glyph::Bell,
+                ShadeAction::Notifications,
+            )),
+        ];
+        let count = tools.iter().flatten().count();
+        if count > 0 {
+            for (rect, (title, glyph, action)) in
+                row(x, y, w, h, 8.0, count).zip(tools.into_iter().flatten())
+            {
+                style.tile(out, rect, &button(title, glyph, action));
+            }
+        }
+    } else {
+        draw_choices(out, style, ctx, (x, y, w, height));
+    }
+    if let Some(message) = status
+        .feedback
+        .as_deref()
+        .or(status.pending.map(|_| "Working..."))
+    {
+        out.draw_list.push_text(
+            x,
+            height - 41.0,
+            font::fit_text(message, 1, w),
+            1,
+            style.foreground(),
+            TextAlign::Left,
+        );
+    }
+}
+
+fn draw_choices(
+    out: &mut SceneOutput,
+    style: &ShadeStyle<'_>,
+    ctx: &SceneContext,
+    (x, mut y, w, height): (f32, f32, f32, f32),
+) {
+    let status = &ctx.shade;
+    let page = status.page;
+    let h = 44.0;
+    let step = h + 6.0;
+    let glyph = match page {
+        ShadePage::Wifi => Glyph::Wifi,
+        ShadePage::Bluetooth => Glyph::Bluetooth,
+        _ => Glyph::Volume,
+    };
+    let host_available = status.extras.host_panel(page);
+    if host_available {
+        let host = Tile::new("", glyph, "Open Omarchy Settings", Some(false))
+            .short_title("Omarchy Settings")
+            .action(ShadeAction::Host(page));
+        style.tile(out, HitRect::new(x, y, w, h), &host);
+        y += step;
+    }
+    if status.choices.is_empty()
+        || (page == ShadePage::Wifi && status.wifi_radio == Some(false))
+        || (page == ShadePage::Bluetooth && !ctx.bluetooth_enabled)
+    {
+        let message = match page {
+            _ if status.pending.is_some() => "Loading devices...",
+            ShadePage::Wifi if status.wifi_radio == Some(false) => {
+                "Wi-Fi is off. Turn it on in Quick Settings."
+            }
+            ShadePage::Wifi => "No saved Wi-Fi connections available.",
+            ShadePage::Bluetooth => "No paired devices available. Check that Bluetooth is on.",
+            _ => "No audio outputs available.",
+        };
+        out.draw_list.push_text(
+            x,
+            y + 8.0,
+            font::fit_text(message, 1, w),
+            1,
+            style.muted(),
+            TextAlign::Left,
+        );
+        return;
+    }
+    let capacity = ((height - y - 46.0) / step).max(0.0) as usize;
+    let paged = status.choices.len() > capacity;
+    let count = if paged {
+        capacity.saturating_sub(1)
+    } else {
+        capacity
+    };
+    if count == 0 {
+        return;
+    }
+    let offset = status
+        .page_offset
+        .min(status.choices.len().saturating_sub(1));
+    for choice in status.choices.iter().skip(offset).take(count) {
+        let rect = HitRect::new(x, y, w, h);
+        style.choice(out, rect, glyph, choice, status.pending.is_none());
+        if !choice.active && status.pending.is_none() {
+            out.push_hit(
+                rect,
+                HitTarget::ShadeAction(ShadeAction::Select(page, choice.id.clone())),
+            );
+        }
+        y += step;
+    }
+    if paged {
+        for (rect, (title, destination)) in row(x, y, w, h, 8.0, 2).zip([
+            (
+                "Previous",
+                (offset > 0).then(|| offset.saturating_sub(count)),
+            ),
+            (
+                "Next",
+                (offset + count < status.choices.len()).then_some(offset + count),
+            ),
+        ]) {
+            let mut tile = Tile::new("", Glyph::Desktop, title, destination.map(|_| false));
+            if let Some(destination) = destination {
+                tile = tile.action(ShadeAction::Page(destination));
+            }
+            style.tile(out, rect, &tile);
+        }
+    }
+}
+
+impl ShadeStyle<'_> {
+    fn choice(
+        &self,
+        out: &mut SceneOutput,
+        rect: HitRect,
+        glyph: Glyph,
+        choice: &ShadeChoice,
+        enabled: bool,
+    ) {
+        self.surface(out, rect, choice.active, enabled);
+        let ink = if choice.active {
+            self.palette.background.with_alpha(self.progress)
+        } else {
+            self.foreground()
+        };
+        draw(
+            &mut out.draw_list,
+            glyph,
+            rect.x + 22.0,
+            rect.y + rect.h * 0.5,
+            21.0,
+            ink,
+        );
+        let label = if choice.active {
+            format!("{} (active)", choice.label)
+        } else {
+            choice.label.clone()
+        };
+        out.draw_list.push_text(
+            rect.x + 42.0,
+            rect.y + 16.0,
+            font::fit_text(&label, 1, rect.w - 52.0),
+            1,
+            ink,
+            TextAlign::Left,
+        );
     }
 }
 
@@ -822,6 +1230,91 @@ mod tests {
             .iter()
             .find(|hit| control_id(hit) == Some(id))
             .unwrap()
+    }
+
+    #[test]
+    fn daily_details_are_distinct_from_radio_toggles() {
+        let mut ctx = SceneContext::default();
+        ctx.shade.extras = ShadeExtras {
+            host_bluetooth: true,
+            wifi: true,
+            audio: true,
+            muted: Some(false),
+            notifications: true,
+            ..ShadeExtras::default()
+        };
+        for (w, h) in [
+            (390.0, 518.0),
+            (518.0, 390.0),
+            (853.0, 1280.0),
+            (1280.0, 853.0),
+        ] {
+            let output = scene(w, h, &ctx);
+            for (page, toggle) in [
+                (ShadePage::Wifi, "wifi"),
+                (ShadePage::Bluetooth, "bluetooth"),
+                (ShadePage::Audio, "volume"),
+            ] {
+                let target = HitTarget::ShadeAction(ShadeAction::Show(page));
+                let rect = output
+                    .hit_regions
+                    .iter()
+                    .find(|r| r.target == target)
+                    .unwrap()
+                    .rect;
+                assert!(
+                    rect.h >= TOUCH_SIZE - 0.01 && rect.w >= TOUCH_SIZE,
+                    "{page:?} {rect:?} at {w}x{h}"
+                );
+                assert_eq!(
+                    output.hit_test(rect.x + rect.w / 2.0, rect.y + rect.h / 2.0),
+                    Some(&target)
+                );
+                assert_ne!(rect, control(&output, toggle).rect);
+            }
+            assert!(output
+                .hit_regions
+                .iter()
+                .any(|r| r.target == HitTarget::ShadeAction(ShadeAction::Mute)));
+            assert!(output
+                .hit_regions
+                .iter()
+                .any(|r| r.target == HitTarget::ShadeAction(ShadeAction::Quiet)));
+        }
+    }
+
+    #[test]
+    fn saved_connections_page_claims_only_inactive_rows_and_disallows_writes_when_busy() {
+        let mut ctx = SceneContext::default();
+        ctx.shade.page = ShadePage::Wifi;
+        ctx.shade.extras.host_wifi = true;
+        ctx.shade.choices = (0..16)
+            .map(|i| ShadeChoice {
+                id: i.to_string(),
+                label: format!("Network {i}"),
+                active: i == 0,
+            })
+            .collect();
+        let actions = |ctx: &SceneContext| {
+            scene(320.0, 480.0, ctx)
+                .hit_regions
+                .into_iter()
+                .map(|hit| hit.target)
+                .collect::<Vec<_>>()
+        };
+        let first = actions(&ctx);
+        assert!(first.contains(&HitTarget::ShadeAction(ShadeAction::Host(ShadePage::Wifi))));
+        assert!(!first.contains(&HitTarget::ShadeAction(ShadeAction::Select(
+            ShadePage::Wifi,
+            "0".into()
+        ))));
+        assert!(first
+            .iter()
+            .any(|hit| matches!(hit, HitTarget::ShadeAction(ShadeAction::Page(_)))));
+        ctx.shade.pending = Some(1);
+        assert!(!actions(&ctx)
+            .iter()
+            .any(|hit| matches!(hit, HitTarget::ShadeAction(ShadeAction::Select(_, _)))));
     }
 
     #[test]

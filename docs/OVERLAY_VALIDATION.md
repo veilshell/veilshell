@@ -107,6 +107,14 @@ zone should still reach the underlying app.
 
 ### Safe, reversible Quick Settings (QS) check
 
+From the shade, open **Wi-Fi Networks**, **Bluetooth Devices**, and **Audio
+Output** where available. Opening a details page must not toggle a radio.
+Check that the current device is marked active. If it's safe to do so,
+reconnect a paired headset, switch to it, and restore the original output;
+do not switch Wi-Fi networks while testing over a remote connection. On
+Omarchy, verify that **Open Omarchy Settings** opens the matching panel
+without tapping the bar, and that **Do Not Disturb** agrees with the bar.
+
 The shade can change **real host state**. Use a small brightness or volume
 change with a known restore path. Don't toggle Wi-Fi, WWAN, Bluetooth, Night
 Light, power profiles, or Do Not Disturb for this smoke test. Never depend on

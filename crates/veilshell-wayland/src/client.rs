@@ -38,7 +38,8 @@ use veilshell_render::power::{PowerAction, PowerInput, PowerMenu};
 use veilshell_render::{
     bottom_pill_bounds, build_scene, build_scene_layout, build_top_strip_scene, home_page_count,
     home_reveal_travel, recents_stride, shade_reveal_travel, top_handle_bounds, ActiveRenderer,
-    DrawList, HitRect, HitTarget, SceneContext, SceneKind, SceneOutput, WallpaperImage,
+    DrawList, HitRect, HitTarget, SceneContext, SceneKind, SceneOutput, ShadeAction, ShadeChoice,
+    ShadeExtras, ShadePage, WallpaperImage,
 };
 
 use crate::capture::ToplevelCaptureState;
@@ -94,6 +95,11 @@ pub enum DaemonCommand {
     SetWallpaper(Option<WallpaperImage>),
     /// Deliver the result of a session action without blocking Wayland dispatch.
     PowerFinished { action: PowerAction, success: bool },
+    /// Deliver an optional shade service result from a background worker.
+    ShadeFinished {
+        ticket: u64,
+        result: Result<ShadeReply, String>,
+    },
     /// Query live daemon runtime status for `veilctl status`.
     QueryStatus(mpsc::Sender<RuntimeStatus>),
     /// Forward a domain command (such as `mode ...`) to [`ShellActionHandler::on_custom_command`].
@@ -116,6 +122,18 @@ pub struct RuntimeStatus {
     pub renderer: String,
 }
 
+/// Partial state changes from a Quick Settings service operation.
+#[derive(Debug)]
+pub enum ShadeReply {
+    Discovered(ShadeExtras, Option<bool>),
+    Choices(Vec<ShadeChoice>),
+    AudioOutput(Vec<ShadeChoice>, Option<bool>),
+    Muted(bool),
+    Quiet(bool),
+    Media(Option<String>),
+    Dismiss,
+}
+
 /// Interactive UI events emitted by the `Wayland` shell surfaces.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ShellAction {
@@ -131,6 +149,8 @@ pub enum ShellAction {
     SwitchWorkspace(i32),
     /// Toggle a Quick Settings tile (`wifi`, `bluetooth`, `lte`, `autorotate`, `tablet_mode`, `night_light`).
     ToggleSetting(&'static str),
+    /// Navigate to or activate a Quick Settings detail or desktop tool.
+    Shade(ShadeAction),
     /// Update a Quick Settings slider (`brightness`, `volume`) to `0..=100`.
     SetSlider { id: &'static str, pct: u8 },
     /// Notify that the active Home grid page changed.
@@ -684,6 +704,7 @@ impl LayerApp {
             }
         }
         if scene != SceneKind::Shade {
+            self.reset_shade_page();
             if let Some(menu) = &mut self.renderer.context_mut().power_menu {
                 if !matches!(*menu, PowerMenu::Running(_)) {
                     *menu = PowerMenu::Closed;
@@ -734,6 +755,7 @@ impl LayerApp {
     fn set_visible(&mut self, visible: bool) {
         self.visible = visible;
         if !visible {
+            self.reset_shade_page();
             if self.active_scene == SceneKind::Recents {
                 self.capture.invalidate();
             }
@@ -1083,6 +1105,7 @@ impl LayerApp {
                     }
                 }
             }
+            DaemonCommand::ShadeFinished { ticket, result } => self.finish_shade(ticket, result),
             DaemonCommand::QueryStatus(reply) => {
                 let _ = reply.send(RuntimeStatus {
                     active_scene: self.active_scene,
@@ -1712,6 +1735,7 @@ impl LayerApp {
                     self.draw_overlay();
                 }
             }
+            HitTarget::ShadeAction(action) => self.apply_shade_action(action),
             HitTarget::ShadeSlider { id, rect } => {
                 let pct = slider_pct_for_y(y, rect);
                 self.handler.on_action(
@@ -1724,6 +1748,75 @@ impl LayerApp {
             HitTarget::PowerPanel => {}
             HitTarget::OskKey { label } => self.press_osk_key(label),
         }
+    }
+
+    fn reset_shade_page(&mut self) {
+        let shade = &mut self.renderer.context_mut().shade;
+        shade.page = ShadePage::Main;
+        shade.page_offset = 0;
+        shade.choices.clear();
+        shade.pending = None;
+    }
+
+    fn apply_shade_action(&mut self, action: ShadeAction) {
+        let shade = &mut self.renderer.context_mut().shade;
+        if shade.pending.is_some() {
+            return;
+        }
+        shade.feedback = None;
+        match action {
+            ShadeAction::Show(page) => {
+                shade.page = page;
+                shade.page_offset = 0;
+                shade.choices.clear();
+            }
+            ShadeAction::Page(offset) => {
+                shade.page_offset = offset;
+                self.draw_overlay();
+                return;
+            }
+            _ => {}
+        }
+        let capture = action == ShadeAction::Screenshot;
+        self.handler
+            .on_action(ShellAction::Shade(action), self.renderer.context_mut());
+        if capture && self.renderer.context().shade.pending.is_some() {
+            self.show_scene(SceneKind::Pill, false);
+        } else {
+            self.draw_overlay();
+        }
+    }
+
+    fn finish_shade(&mut self, ticket: u64, result: Result<ShadeReply, String>) {
+        let shade = &mut self.renderer.context_mut().shade;
+        if self.active_scene != SceneKind::Shade || shade.pending != Some(ticket) {
+            return;
+        }
+        shade.pending = None;
+        match result {
+            Ok(ShadeReply::Discovered(extras, quiet)) => {
+                shade.extras = extras;
+                shade.quiet = quiet;
+            }
+            Ok(ShadeReply::Choices(choices)) => {
+                shade.page_offset = 0;
+                shade.choices = choices;
+            }
+            Ok(ShadeReply::AudioOutput(choices, muted)) => {
+                shade.page_offset = 0;
+                shade.choices = choices;
+                shade.extras.muted = muted;
+            }
+            Ok(ShadeReply::Muted(muted)) => shade.extras.muted = Some(muted),
+            Ok(ShadeReply::Quiet(quiet)) => shade.quiet = Some(quiet),
+            Ok(ShadeReply::Media(track)) => shade.extras.media = track,
+            Ok(ShadeReply::Dismiss) => {
+                self.show_scene(SceneKind::Pill, false);
+                return;
+            }
+            Err(message) => shade.feedback = Some(message),
+        }
+        self.draw_overlay();
     }
 
     fn press_osk_key(&mut self, label: &'static str) {
