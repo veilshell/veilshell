@@ -89,12 +89,16 @@ veilctl quit             # Stop the daemon cleanly
 
 If VeilShell is running in the foreground, Ctrl+C also shuts it down cleanly.
 
-Tap the **keyboard icon** to the right of the Home pill to type in the focused
-app. Tap **HIDE** or swipe down to dismiss it. **TERM** adds Escape, Tab and the
-arrow keys; hold Backspace or an arrow to repeat. Compatible text fields can
-also open the keyboard automatically. If you use another input method, start
-VeilShell with `--osk manual` to leave it alone; manual typing requires
-Wayland virtual-keyboard support.
+Tap the **keyboard icon** near the bottom-right corner to type in the focused
+app. The typing rows stay centered around a wide spacebar. Shortcuts sit
+beside the keys in wide landscape views, or above them in portrait and on
+narrower outputs. **TERM** adds Escape, Tab and all four arrows to the letter
+layout. Hold Backspace or an arrow to repeat. Tap **HIDE** or swipe down to
+dismiss.
+
+Compatible text fields can also open the keyboard automatically. If you use
+another input method, start VeilShell with `--osk manual` to leave it alone;
+manual typing requires Wayland virtual-keyboard support.
 
 The app keyboard reflows when the compositor rotates the output. In overlay
 mode VeilShell follows that orientation without changing monitor rules. The

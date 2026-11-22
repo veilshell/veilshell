@@ -8,6 +8,7 @@ pub use desk_panel::{build_desk_panel, desk_panel_actions, DeskPanelAction, DESK
 pub mod gpu;
 mod launcher;
 pub use launcher::LauncherState;
+mod osk;
 pub mod power;
 pub mod primitives;
 mod recents;
@@ -597,17 +598,24 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_button_is_separate_from_the_pill_and_has_a_matching_hit_target() {
+    fn keyboard_button_is_translucent_and_has_a_separate_bottom_right_hit_target() {
         let palette = ThemePalette::default_dark();
         let mut ctx = SceneContext::default();
-        for width in [360.0, 640.0, 853.0, 1280.0] {
+        for width in [348.0, 360.0, 640.0, 853.0, 1280.0] {
             let pill = bottom_pill_bounds(width, 48.0);
             let button = keyboard_button_bounds(width, 48.0).unwrap();
             assert!(button.x > pill.x + pill.w + 24.0);
-            assert!(button.x + button.w <= width - 8.0);
+            assert!((width - button.x - button.w - 12.0).abs() < f32::EPSILON);
             let x = button.x + 22.0;
             ctx.keyboard_button = true;
             let layout = build_scene_layout(SceneKind::Pill, width, 48.0, &palette, &ctx);
+            let [DrawCommand::Rect(_), DrawCommand::Rect(back), DrawCommand::Image(glyph)] =
+                layout.draw_list.commands.as_slice()
+            else {
+                panic!("expected the pill and keyboard button");
+            };
+            assert!(back.fill.a <= 0.5 && glyph.alpha >= 0.9);
+            assert!(button.contains(glyph.x + glyph.w * 0.5, glyph.y + glyph.h * 0.5));
             assert_eq!(layout.hit_test(x, 24.0), Some(&HitTarget::OpenKeyboard));
             assert_eq!(
                 layout.hit_test(width * 0.5, 36.0),
@@ -1136,63 +1144,6 @@ mod tests {
 
         gpu.clear_wallpaper();
         assert!(!gpu.has_blurred_wallpaper());
-    }
-
-    #[test]
-    fn osk_hit_test_resolves_keys_across_all_layers() {
-        for (layer, expected_id) in [
-            (veilshell_core::OskLayer::Letters, "q"),
-            (veilshell_core::OskLayer::Numbers, "@"),
-            (veilshell_core::OskLayer::Symbols, "~"),
-        ] {
-            let mut ctx = SceneContext::default();
-            ctx.osk_state.layer = layer;
-            let out = build_scene_layout(
-                SceneKind::Osk,
-                1280.0,
-                284.0,
-                &ThemePalette::default_dark(),
-                &ctx,
-            );
-            let region = out
-                .hit_regions
-                .iter()
-                .find(|r| matches!(r.target, HitTarget::OskKey { label } if label == expected_id))
-                .expect("expected OSK key hit region");
-            assert_eq!(
-                out.hit_test(
-                    region.rect.x + region.rect.w * 0.5,
-                    region.rect.y + region.rect.h * 0.5,
-                ),
-                Some(&HitTarget::OskKey { label: expected_id })
-            );
-        }
-    }
-
-    #[test]
-    fn terminal_keys_fit_in_a_compact_osk() {
-        let mut ctx = SceneContext::default();
-        ctx.osk_state.terminal = true;
-        let out = build_scene_layout(
-            SceneKind::Osk,
-            390.0,
-            172.0,
-            &ThemePalette::default_dark(),
-            &ctx,
-        );
-        assert!(out.hit_regions.iter().all(|region| {
-            let rect = region.rect;
-            rect.w > 0.0 && rect.h > 0.0 && rect.x + rect.w <= 390.1 && rect.y + rect.h <= 172.1
-        }));
-        assert!(out
-            .hit_regions
-            .iter()
-            .any(|region| region.target == HitTarget::OskKey { label: "up" }));
-        assert!(out
-            .draw_list
-            .commands
-            .iter()
-            .any(|command| matches!(command, DrawCommand::Text(label) if label.text == "TERM")));
     }
 
     #[test]

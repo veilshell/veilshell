@@ -18,6 +18,10 @@ for scene in home shade recents; do
     "$VEILCTL" snapshot --demo --scene "$scene" --width 853 --height 1280 --out "$OUT_DIR/$scene-portrait.png"
 done
 
+"$VEILCTL" snapshot --demo --scene osk --terminal-osk --out "$OUT_DIR/osk-terminal-landscape.png"
+# The keyboard panel occupies a third of the full output height.
+"$VEILCTL" snapshot --demo --scene osk --terminal-osk --width 853 --height 426 --out "$OUT_DIR/osk-terminal-portrait.png"
+
 # A compact Home viewport exercises pagination with the 12 demo apps.
 "$VEILCTL" snapshot --demo --scene home --width 390 --height 518 --out "$OUT_DIR/home-compact.png"
 "$VEILCTL" snapshot --demo --scene shade --power-menu --width 390 --height 518 --out "$OUT_DIR/power-compact.png"

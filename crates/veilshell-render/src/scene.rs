@@ -2,8 +2,9 @@
 
 use std::sync::Arc;
 
-use veilshell_core::{OskState, Rgba, ShiftState, ThemePalette};
+use veilshell_core::{OskState, Rgba, ThemePalette};
 
+use crate::osk::build_osk;
 use crate::power::PowerMenu;
 use crate::primitives::{
     DrawList, HitRect, HitTarget, ImageQuad, RgbaImage, RoundedRect, SceneOutput, TextAlign,
@@ -81,7 +82,10 @@ pub struct SceneContext {
     pub recents_throw: Option<(String, f32)>,
     /// Multi-layer touch keyboard state and modifier latches.
     pub osk_state: OskState,
-    /// Whether to expose the app keyboard next to the resting navigation pill.
+    /// Full logical output size, not the height of the keyboard surface.
+    /// Offscreen previews assume their OSK panel occupies a third of the output.
+    pub osk_output_size: Option<(u32, u32)>,
+    /// Whether to expose the bottom-right keyboard opener.
     pub keyboard_button: bool,
 }
 
@@ -143,6 +147,7 @@ impl Default for SceneContext {
             recents_position: None,
             recents_throw: None,
             osk_state: OskState::default(),
+            osk_output_size: None,
             keyboard_button: true,
         }
     }
@@ -344,14 +349,15 @@ pub fn bottom_pill_bounds(width: f32, height: f32) -> HitRect {
     HitRect::new((width - w) * 0.5, height - 16.0, w, 8.0)
 }
 
-/// Surface-local hit target for the keyboard button. Leave a gap after
-/// the pill's swipe padding and keep the screen corner available to apps.
+/// Bottom-right keyboard target, inset from the edges so the corner itself
+/// still belongs to apps. Omit it if it would crowd the pill's swipe zone.
 #[must_use]
 pub fn keyboard_button_bounds(width: f32, height: f32) -> Option<HitRect> {
     const TARGET: f32 = 44.0;
+    const RIGHT_INSET: f32 = 12.0;
     let pill = bottom_pill_bounds(width, height);
-    let x = (pill.x + pill.w + 32.0).ceil();
-    (height >= TARGET && x + TARGET <= width - 8.0)
+    let x = (width - RIGHT_INSET - TARGET).floor();
+    (height >= TARGET && x >= pill.x + pill.w + 28.0)
         .then(|| HitRect::new(x, (height - TARGET - 2.0).floor().max(0.0), TARGET, TARGET))
 }
 
@@ -452,9 +458,9 @@ fn build_pill(
                 button.w - 2.0,
                 button.h - 12.0,
                 10.0,
-                palette.surface.with_alpha(0.92),
+                palette.surface.with_alpha(0.44),
             )
-            .with_glass_border(palette.foreground.with_alpha(0.22), 1.0, 0.10),
+            .with_glass_border(palette.foreground.with_alpha(0.14), 1.0, 0.06),
         );
         shade_glyphs::draw(
             &mut out.draw_list,
@@ -681,85 +687,5 @@ fn push_home_pager(
             HitTarget::HomePage { page: p },
         );
         x += w + 8.0;
-    }
-}
-
-fn build_osk(
-    out: &mut SceneOutput,
-    width: f32,
-    height: f32,
-    palette: &ThemePalette,
-    ctx: &SceneContext,
-) {
-    out.draw_list.push_rect(
-        RoundedRect::filled(
-            0.0,
-            0.0,
-            width,
-            height,
-            0.0,
-            palette.surface.with_alpha(0.92),
-        )
-        .with_glass_border(palette.foreground.with_alpha(0.16), 1.5, 0.10),
-    );
-
-    let rows = ctx.osk_state.rows();
-    let pad = 12.0_f32.min(height * 0.045);
-    let row_count = rows.len().max(1);
-    let gap = 8.0_f32.min((height - pad * 2.0) / (row_count as f32 * 5.0));
-    let row_h = ((height - pad * 2.0 - gap * (row_count.saturating_sub(1)) as f32)
-        / row_count as f32)
-        .max(1.0);
-
-    for (r_idx, row) in rows.iter().enumerate() {
-        let y = pad + r_idx as f32 * (row_h + gap);
-        let total_units: f32 = row.iter().map(|k| k.width_units).sum();
-        let avail_w = width - pad * 2.0 - gap * (row.len().saturating_sub(1)) as f32;
-        let unit_w = avail_w / total_units.max(1.0);
-        let mut cursor_x = pad;
-
-        for key in row {
-            let kw = unit_w * key.width_units;
-            let active_mod = (key.id == "shf" && ctx.osk_state.shift != ShiftState::Off)
-                || (key.id == "ctl" && ctx.osk_state.ctrl)
-                || (key.id == "term" && ctx.osk_state.terminal);
-            let highlighted = key.is_accent || active_mod;
-            let fill = if highlighted {
-                palette.accent.with_alpha(0.90)
-            } else {
-                palette.background.with_alpha(0.78)
-            };
-            let fg = if highlighted {
-                palette.background
-            } else {
-                palette.foreground
-            };
-
-            out.draw_list.push_rect(
-                RoundedRect::filled(cursor_x, y, kw, row_h, 12.0, fill).with_glass_border(
-                    palette.foreground.with_alpha(0.14),
-                    1.0,
-                    0.08,
-                ),
-            );
-            let label_scale = if kw < 50.0 && key.label.len() > 2 {
-                1
-            } else {
-                2
-            };
-            out.draw_list.push_text(
-                cursor_x + kw * 0.5,
-                y + (row_h - 7.0 * label_scale as f32) * 0.5,
-                crate::font::fit_text(key.label, label_scale, kw - 4.0),
-                label_scale,
-                fg,
-                TextAlign::Center,
-            );
-            out.push_hit(
-                HitRect::new(cursor_x, y, kw, row_h),
-                HitTarget::OskKey { label: key.id },
-            );
-            cursor_x += kw + gap;
-        }
     }
 }

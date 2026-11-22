@@ -82,12 +82,12 @@ record that blocker rather than substituting a screenshot.
 
 | Check | Touch steps and expected result |
 |---|---|
-| Home and app launch | Pull up from the bottom pill. Reverse a short pull to cancel; a full pull should settle on Home. Page sideways if there are multiple pages, then tap an installed `.desktop` app. The actual app opens under the host's normal window policy. Reopen Home and swipe down to return to the pill. With an app behind the pill, check that taps near both bottom corners reach the app instead of opening Home. |
+| Home and app launch | Pull up from the bottom pill. Reverse a short pull to cancel; a full pull should settle on Home. Page sideways if there are multiple pages, then tap an installed `.desktop` app. The actual app opens under the host's normal window policy. Reopen Home and swipe down to return to the pill. Check that taps outside the pill and the inset keyboard button reach the app. |
 | Recents list and focus | Open two distinguishable disposable windows with no unsaved work. Open Home, then swipe up from its bottom edge into Recents. Swipe sideways to browse and tap one card. The deck closes and the selected window, not its neighbor, has focus. Record live thumbnails separately from listing and focus: missing capture protocols are not proof that focus is broken, and a drawn card isn't proof that its preview is live. |
 | Recents close | Reopen Recents and swipe up on one disposable card. The matching real window closes and disappears from Recents; the other window stays open. Do not swipe away a window with valuable work. |
 | Quick Settings gesture | Pull down from the top handle; reverse a short pull to cancel, then fully open the shade. Check the controls fit and can be reached. Swipe up to dismiss. Compare a real control and its restored value using the procedure below. |
-| App keyboard (OSK) | Open a native Wayland app with working text-input support (e.g. a GTK text editor running natively, not under XWayland). Tap a blank editable field; the keyboard should open. Type a scratch string using letters, Shift, a digit and a symbol, then Backspace and an arrow. Check the **app's** text and caret, not just highlighted keys. Tap **HIDE** or swipe down, check that the work area is restored and that ordinary updates to the same editor don't reopen it. Tap the keyboard icon beside the bottom pill to reopen without losing app focus. Also check that a fresh editor activation can reopen it automatically. |
-| Manual keyboard and live reflow | Start a separate run with `--osk manual`. Focus a terminal, then tap the keyboard icon; this mode must not take the seat's input-method slot. Change the host orientation while the OSK is open and verify key positions, usable text entry, and the size of the new reservation. Check the **TERM** row using harmless input. In Auto posture mode, repeat with the Type Cover and reattach while the OSK is open: it should hide and give the space back without changing the host's monitor rules. |
+| App keyboard (OSK) | Open a native Wayland app with working text-input support (e.g. a GTK text editor running natively, not under XWayland). Tap a blank editable field; the keyboard should open. Type a scratch string using letters, Shift, a digit and a symbol, then Backspace and an arrow. Check the **app's** text and caret, not just highlighted keys. Tap **HIDE** or swipe down, check that the work area is restored and that ordinary updates to the same editor don't reopen it. Tap the bottom-right keyboard icon to reopen without losing app focus. Also check that a fresh editor activation can reopen it automatically. |
+| Manual keyboard and live reflow | Start a separate run with `--osk manual`. Focus a terminal, tap the keyboard icon, and enable **TERM**; this mode must not take the seat's input-method slot. Check Escape and Tab on the left and the arrows on the right in landscape, or in the top row on a compact output. Rotate to portrait with the keyboard open: the shortcuts should move to the top, **TERM** should stay on, and the same app should receive typing and shortcuts. Check the new reservation. In Auto posture mode, repeat with the Type Cover and reattach while the OSK is open: it should hide and give the space back without changing the host's monitor rules. |
 
 As a diagnostic only, `veilctl show` with `home`, `recents`, `shade`, `osk`,
 or `pill` can separate surface visibility problems from gesture or text-focus
@@ -106,7 +106,7 @@ the visible mark. The mark should brighten and grow as soon as it's touched;
 the panel should move before you lift your finger. Try a short pull and
 reversal, a quick flick, and a tap directly on the mark. A tap in the extra
 swipe padding should not open a panel, and contacts outside the centered
-zone should still reach the underlying app.
+zone and the keyboard button should still reach the underlying app.
 
 ### Safe, reversible Quick Settings (QS) check
 
@@ -216,8 +216,9 @@ and closes in a private Hyprland instance.
 
 Run `VEILSHELL_TEST_KEYBOARD=1 ./scripts/test-hyprland-actions.sh` to exercise app
 typing, focus, live output rotation, and keyboard dismissal in both session
-policies. It uses a disposable terminal and checks the actual bytes delivered
-to it; it does not validate physical touch, Type Cover events, or SDDM.
+policies. It checks the bytes delivered to a disposable terminal, including
+shortcuts before and after rotation. It does not validate physical touch,
+Type Cover events, or SDDM.
 
 The harness uses its own compositor config, IPC and virtual output. It checks
 that startup rejects missing or stale Hyprland IPC, that mode changes leave

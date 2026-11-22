@@ -1,4 +1,4 @@
-//! Small, independently drawn vector-style glyphs for the touch shade.
+//! Small, independently drawn vector-style glyphs for shell controls.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -18,6 +18,10 @@ pub(crate) enum Glyph {
     Moon,
     Desktop,
     Keyboard,
+    ArrowLeft,
+    ArrowRight,
+    ArrowUp,
+    ArrowDown,
     Power,
     Battery,
     Bell,
@@ -88,6 +92,7 @@ fn rasterize(glyph: Glyph, rgb: [u8; 3]) -> Arc<RgbaImage> {
 
 const NEAR_DIAGONAL: f32 = 8.0 * std::f32::consts::FRAC_1_SQRT_2;
 const FAR_DIAGONAL: f32 = 9.7 * std::f32::consts::FRAC_1_SQRT_2;
+const STROKE: f32 = 1.05;
 const SUN_RAYS: [(f32, f32, f32, f32); 4] = [
     (0.0, 8.0, 0.0, 9.7),
     (8.0, 0.0, 9.7, 0.0),
@@ -105,17 +110,33 @@ fn keyboard(x: f32, y: f32) -> bool {
             || (in_row(13.5, 15.4) && (7.0..=17.0).contains(&x)))
 }
 
+fn stroke_contains((x, y): (f32, f32), (x0, y0): (f32, f32), (x1, y1): (f32, f32)) -> bool {
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let t = ((x - x0) * dx + (y - y0) * dy) / (dx * dx + dy * dy);
+    let t = t.clamp(0.0, 1.0);
+    let rx = x - (x0 + dx * t);
+    let ry = y - (y0 + dy * t);
+    rx * rx + ry * ry <= STROKE * STROKE
+}
+
+fn arrow(glyph: Glyph, x: f32, y: f32) -> bool {
+    // Rotate the arrow's sampling coordinates around the icon center.
+    let sample = match glyph {
+        Glyph::ArrowLeft => (24.0 - y, x),
+        Glyph::ArrowRight => (y, 24.0 - x),
+        Glyph::ArrowDown => (24.0 - x, 24.0 - y),
+        _ => (x, y),
+    };
+    stroke_contains(sample, (12.0, 5.0), (12.0, 19.0))
+        || stroke_contains(sample, (6.0, 11.0), (12.0, 5.0))
+        || stroke_contains(sample, (12.0, 5.0), (18.0, 11.0))
+}
+
 fn contains(glyph: Glyph, x: f32, y: f32) -> bool {
-    const STROKE: f32 = 1.05;
     let distance_sq = |cx: f32, cy: f32| (x - cx) * (x - cx) + (y - cy) * (y - cy);
     let circle = |cx: f32, cy: f32, r: f32| distance_sq(cx, cy) <= r * r;
-    let line = |x0: f32, y0: f32, x1: f32, y1: f32| {
-        let dx = x1 - x0;
-        let dy = y1 - y0;
-        let t = ((x - x0) * dx + (y - y0) * dy) / (dx * dx + dy * dy);
-        let t = t.clamp(0.0, 1.0);
-        circle(x0 + dx * t, y0 + dy * t, STROKE)
-    };
+    let line = |x0, y0, x1, y1| stroke_contains((x, y), (x0, y0), (x1, y1));
     let ring = |cx: f32, cy: f32, r: f32| {
         distance_sq(cx, cy) >= (r - STROKE) * (r - STROKE) && circle(cx, cy, r + STROKE)
     };
@@ -178,6 +199,9 @@ fn contains(glyph: Glyph, x: f32, y: f32) -> bool {
                 || line(8.0, 20.0, 16.0, 20.0)
         }
         Glyph::Keyboard => keyboard(x, y),
+        Glyph::ArrowLeft | Glyph::ArrowRight | Glyph::ArrowUp | Glyph::ArrowDown => {
+            arrow(glyph, x, y)
+        }
         Glyph::Power => {
             (ring(12.0, 13.0, 7.7) && y >= 7.1)
                 || circle(7.0, 7.1, STROKE)

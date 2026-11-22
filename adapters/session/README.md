@@ -19,7 +19,7 @@ the account password from a keyboard, not the VeilShell OSK. Test the account's
 password and locker before relying on idle or suspend behavior.
 
 After login, the same app keyboard as the overlay is available. Tap the keyboard
-icon to the right of the Home pill to open it without a shortcut, or tap a
+icon near the bottom-right corner to open it without a shortcut, or tap a
 compatible app's text field for auto-open. This does not change Hyprlock or SDDM.
 
 ## Preview installation

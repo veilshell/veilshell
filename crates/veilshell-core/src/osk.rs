@@ -76,20 +76,42 @@ pub struct OskState {
 }
 
 impl OskState {
-    /// Build the key rows for the current layout and optional terminal shortcuts.
+    /// Four typing rows, excluding the controls that move with output orientation.
     #[must_use]
-    pub fn rows(self) -> Vec<Vec<OskKeySpec>> {
+    pub fn typing_rows(self) -> [Vec<OskKeySpec>; 4] {
         match self.layer {
-            OskLayer::Letters => {
-                let mut rows = self.letters_rows();
-                if self.terminal {
-                    rows.insert(0, terminal_utility_row());
-                }
-                rows
-            }
+            OskLayer::Letters => self.letters_rows(),
             OskLayer::Numbers => numbers_rows(),
             OskLayer::Symbols => symbols_rows(),
         }
+    }
+
+    /// Available shortcuts, independent of where the panel places them.
+    pub fn shortcut_keys(self) -> impl Iterator<Item = OskKeySpec> {
+        use OskKeyAction::{
+            ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Dismiss, Escape, Tab, ToggleCtrl,
+            ToggleTerminal,
+        };
+        [
+            mod_key("term", "TERM", 1.0, ToggleTerminal),
+            mod_key("ctl", "CTRL", 1.0, ToggleCtrl),
+            action_key("esc", "ESC", 1.0, Escape, false),
+            action_key("tab", "TAB", 1.0, Tab, false),
+            action_key("left", "<-", 1.0, ArrowLeft, false),
+            action_key("up", "UP", 1.0, ArrowUp, false),
+            action_key("down", "DOWN", 1.0, ArrowDown, false),
+            action_key("right", "->", 1.0, ArrowRight, false),
+            action_key("hide", "HIDE", 1.0, Dismiss, false),
+        ]
+        .into_iter()
+        .filter(move |key| match key.action {
+            ArrowUp | ArrowDown => self.terminal,
+            Escape | Tab | ArrowLeft | ArrowRight => {
+                // These were also available on the number and symbol pages with TERM off.
+                self.terminal || self.layer != OskLayer::Letters
+            }
+            _ => true,
+        })
     }
 
     /// Whether a held key should emit repeating, balanced key strokes.
@@ -101,9 +123,10 @@ impl OskState {
     /// Process tapping key `key_id` and emit the resulting text or virtual-key event.
     pub fn press(&mut self, key_id: &str) -> OskEmit {
         let Some(spec) = self
-            .rows()
+            .typing_rows()
             .into_iter()
             .flatten()
+            .chain(self.shortcut_keys())
             .find(|key| key.id == key_id)
         else {
             return OskEmit::None;
@@ -183,11 +206,11 @@ impl OskState {
         OskEmit::SpecialKey { evdev_code, ctrl }
     }
 
-    fn letters_rows(self) -> Vec<Vec<OskKeySpec>> {
+    fn letters_rows(self) -> [Vec<OskKeySpec>; 4] {
         let shf_label = if self.shift == ShiftState::CapsLock {
             "CAPS"
         } else {
-            "SHF"
+            "SHIFT"
         };
         let row0_keys = [
             ("q", "Q"),
@@ -222,46 +245,40 @@ impl OskState {
             ("m", "M"),
         ];
 
-        let row0 = row0_keys
-            .into_iter()
-            .map(|(id, label)| char_key(id, label, id.as_bytes()[0] as char))
-            .collect();
-        let row1 = row1_keys
-            .into_iter()
-            .map(|(id, label)| char_key(id, label, id.as_bytes()[0] as char))
-            .collect();
+        let letter = |(id, upper): (&'static str, &'static str)| {
+            let label = if self.shift == ShiftState::Off {
+                id
+            } else {
+                upper
+            };
+            char_key(id, label, id.as_bytes()[0] as char)
+        };
+        let row0 = row0_keys.into_iter().map(letter).collect();
+        let row1 = row1_keys.into_iter().map(letter).collect();
 
         let mut row2 = Vec::with_capacity(row2_letters.len() + 2);
-        row2.push(mod_key("shf", shf_label, 1.4, OskKeyAction::ToggleShift));
-        for (id, label) in row2_letters {
-            row2.push(char_key(id, label, id.as_bytes()[0] as char));
-        }
+        row2.push(mod_key("shf", shf_label, 1.5, OskKeyAction::ToggleShift));
+        row2.extend(row2_letters.into_iter().map(letter));
         row2.push(action_key(
             "del",
             "DEL",
-            1.4,
+            1.5,
             OskKeyAction::Backspace,
             false,
         ));
 
-        let row3 = vec![
-            action_key(
+        [
+            row0,
+            row1,
+            row2,
+            bottom_row(action_key(
                 "123",
                 "123",
-                1.3,
+                1.7,
                 OskKeyAction::SwitchLayer(OskLayer::Numbers),
                 false,
-            ),
-            mod_key("ctl", "CTL", 1.1, OskKeyAction::ToggleCtrl),
-            mod_key("term", "TERM", 1.55, OskKeyAction::ToggleTerminal),
-            char_key(",", ",", ','),
-            action_key("space", "SPACE", 4.0, OskKeyAction::Space, false),
-            char_key(".", ".", '.'),
-            action_key("hide", "HIDE", 1.2, OskKeyAction::Dismiss, false),
-            action_key("enter", "ENTER", 1.6, OskKeyAction::Enter, true),
-        ];
-
-        vec![row0, row1, row2, row3]
+            )),
+        ]
     }
 }
 
@@ -270,7 +287,7 @@ mod terminal_tests {
     use super::*;
 
     #[test]
-    fn terminal_row_sends_shortcuts_without_leaving_letters() {
+    fn terminal_shortcuts_work_without_leaving_letters() {
         let mut osk = OskState::default();
         assert_eq!(osk.press("up"), OskEmit::None);
         assert_eq!(osk.press("term"), OskEmit::None);
@@ -296,24 +313,48 @@ mod terminal_tests {
         assert!(!osk.terminal);
         assert_eq!(osk.press("down"), OskEmit::None);
     }
+
+    #[test]
+    fn terminal_and_ctrl_are_available_on_numbers_and_symbols() {
+        for layer in [OskLayer::Numbers, OskLayer::Symbols] {
+            let mut osk = OskState {
+                layer,
+                ..OskState::default()
+            };
+            assert_eq!(osk.press("up"), OskEmit::None);
+            assert_eq!(
+                osk.press("tab"),
+                OskEmit::SpecialKey {
+                    evdev_code: 15,
+                    ctrl: false,
+                }
+            );
+            osk.press("term");
+            osk.press("ctl");
+            assert_eq!(
+                osk.press("up"),
+                OskEmit::SpecialKey {
+                    evdev_code: 103,
+                    ctrl: true,
+                }
+            );
+            assert!(!osk.ctrl);
+            osk.press("term");
+            assert_eq!(osk.press("up"), OskEmit::None);
+        }
+    }
 }
 
-fn terminal_utility_row() -> Vec<OskKeySpec> {
+const ABC_KEY: OskKeySpec = action_key(
+    "abc",
+    "ABC",
+    1.7,
+    OskKeyAction::SwitchLayer(OskLayer::Letters),
+    false,
+);
+
+fn numbers_rows() -> [Vec<OskKeySpec>; 4] {
     [
-        ("esc", "ESC", OskKeyAction::Escape),
-        ("tab", "TAB", OskKeyAction::Tab),
-        ("left", "<-", OskKeyAction::ArrowLeft),
-        ("up", "UP", OskKeyAction::ArrowUp),
-        ("down", "DOWN", OskKeyAction::ArrowDown),
-        ("right", "->", OskKeyAction::ArrowRight),
-    ]
-    .into_iter()
-    .map(|(id, label, action)| action_key(id, label, 1.0, action, false))
-    .collect()
-}
-
-fn numbers_rows() -> Vec<Vec<OskKeySpec>> {
-    vec![
         vec![
             char_key("1", "1", '1'),
             char_key("2", "2", '2'),
@@ -342,7 +383,7 @@ fn numbers_rows() -> Vec<Vec<OskKeySpec>> {
             action_key(
                 "sym",
                 "SYM",
-                1.4,
+                1.5,
                 OskKeyAction::SwitchLayer(OskLayer::Symbols),
                 false,
             ),
@@ -353,14 +394,14 @@ fn numbers_rows() -> Vec<Vec<OskKeySpec>> {
             char_key(";", ";", ';'),
             char_key("!", "!", '!'),
             char_key("?", "?", '?'),
-            action_key("del", "DEL", 1.4, OskKeyAction::Backspace, false),
+            action_key("del", "DEL", 1.5, OskKeyAction::Backspace, false),
         ],
-        bottom_utility_row(),
+        bottom_row(ABC_KEY),
     ]
 }
 
-fn symbols_rows() -> Vec<Vec<OskKeySpec>> {
-    vec![
+fn symbols_rows() -> [Vec<OskKeySpec>; 4] {
+    [
         vec![
             char_key("~", "~", '~'),
             char_key("`", "`", '`'),
@@ -389,7 +430,7 @@ fn symbols_rows() -> Vec<Vec<OskKeySpec>> {
             action_key(
                 "123",
                 "123",
-                1.4,
+                1.5,
                 OskKeyAction::SwitchLayer(OskLayer::Numbers),
                 false,
             ),
@@ -400,28 +441,19 @@ fn symbols_rows() -> Vec<Vec<OskKeySpec>> {
             char_key("=", "=", '='),
             char_key("?", "?", '?'),
             char_key(":", ":", ':'),
-            action_key("del", "DEL", 1.4, OskKeyAction::Backspace, false),
+            action_key("del", "DEL", 1.5, OskKeyAction::Backspace, false),
         ],
-        bottom_utility_row(),
+        bottom_row(ABC_KEY),
     ]
 }
 
-fn bottom_utility_row() -> Vec<OskKeySpec> {
+fn bottom_row(layer_key: OskKeySpec) -> Vec<OskKeySpec> {
     vec![
-        action_key(
-            "abc",
-            "ABC",
-            1.3,
-            OskKeyAction::SwitchLayer(OskLayer::Letters),
-            false,
-        ),
-        action_key("esc", "ESC", 1.1, OskKeyAction::Escape, false),
-        action_key("tab", "TAB", 1.1, OskKeyAction::Tab, false),
-        action_key("space", "SPACE", 3.2, OskKeyAction::Space, false),
-        action_key("left", "<-", 0.9, OskKeyAction::ArrowLeft, false),
-        action_key("right", "->", 0.9, OskKeyAction::ArrowRight, false),
-        action_key("hide", "HIDE", 1.1, OskKeyAction::Dismiss, false),
-        action_key("enter", "ENTER", 1.4, OskKeyAction::Enter, true),
+        layer_key,
+        char_key(",", ",", ','),
+        action_key("space", "SPACE", 4.6, OskKeyAction::Space, false),
+        char_key(".", ".", '.'),
+        action_key("enter", "ENTER", 1.7, OskKeyAction::Enter, true),
     ]
 }
 
@@ -820,7 +852,7 @@ mod tests {
                 layer,
                 ..OskState::default()
             };
-            for key in state.rows().into_iter().flatten() {
+            for key in state.typing_rows().into_iter().flatten() {
                 if let OskKeyAction::Char(ch) = key.action {
                     assert!(
                         char_to_evdev(ch).is_some(),

@@ -1118,6 +1118,9 @@ impl LayerApp {
             ctx.home_page = ctx.home_page.min(total - 1);
         }
         let ctx = self.renderer.context_mut();
+        if self.active_scene == SceneKind::Osk {
+            ctx.osk_output_size = Some((self.viewport_w, self.viewport_h));
+        }
         ctx.overlay_progress = self.overlay_spring.value.clamp(0.0, 1.0);
         ctx.home_position = if self.active_scene == SceneKind::Home {
             self.home_spring.map(|spring| spring.value)
@@ -2950,8 +2953,9 @@ mod tests {
             let RegionRect(x, y, width, _) = keyboard;
             let RegionRect(left, _, pill_width, _) = pill.unwrap();
             assert!(x > left + pill_width);
-            assert!(x + width < i32::try_from(w).unwrap());
+            assert_eq!(x + width, i32::try_from(w).unwrap() - 12);
             assert!(keyboard.contains((x + 22) as f32, (y + 22) as f32));
+            assert!(!keyboard.contains((w - 4) as f32, (y + 22) as f32));
             assert_eq!(
                 EdgeHandle::Bottom.input_rects((w, 48), false),
                 [pill, None, None]
