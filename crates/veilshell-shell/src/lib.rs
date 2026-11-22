@@ -3,6 +3,7 @@
 pub mod apps;
 pub mod ipc;
 pub mod session;
+pub mod settings;
 pub mod shade;
 
 use std::fmt::Write as _;

@@ -42,6 +42,43 @@ At the next SDDM login, select **VeilShell (Preview)**. `Super+H` opens Home,
 `Super+Shift+E` ends the preview session. A shell or idle-service failure also
 ends the session instead of leaving the original greeter stopped.
 
+### Desk Mode preview
+
+Switch from **Quick Settings → Desk Mode**, or run `veilctl mode desk` from
+the standalone session. Switch back with **Tablet Mode** in the same place
+or with `veilctl mode tablet`. This changes the owned Hyprland layout's
+spacing and rounding without replacing the session or closing apps. The
+bottom handle remains available. Desk Mode adds a top panel with **Apps**,
+**Recents**, and **Controls** pills, and a clock on wider outputs. It reserves
+44 logical pixels above the work area on the shell's output; switching back
+removes that reservation and restores the Tablet pull handle. Open the
+desktop launcher with `veilctl show launcher`, or `Super+Space` with the
+optional Omarchy-style profile.
+
+Desk Mode does not auto-open the app keyboard; the keyboard button still
+works. Tablet is the default at login unless you change it in Settings.
+There is not yet a taskbar or Dashboard. This does not change the overlay's
+Laptop Mode, which hides VeilShell without changing the host layout.
+
+### Settings
+
+Open **Quick Settings → Settings**, press `Super+Ctrl+Alt+I`, or run
+`veilctl show settings` in the standalone session. Tap a setting to cycle
+through its values:
+
+| Setting | What it changes |
+|---|---|
+| Startup mode | Tablet, Desk, or Automatic (follow supported keyboard detection). Takes effect at the next login. |
+| Desk panel | Show or hide the top pills immediately. Hiding the panel restores the pull handle, so Quick Settings stays reachable. |
+| Wallpaper | Midnight, Forest, or Dusk. Built-in gradients apply immediately behind windows and on Tablet Home. No photo picker yet. |
+| Shortcut profile | Preview or Omarchy-style. Takes effect at the next login; `bindings.lua` overrides still load last. |
+
+Preferences are stored under `$XDG_CONFIG_HOME/veilshell/`, normally
+`~/.config/veilshell/`. They do not change SDDM, Omarchy, or the overlay.
+This is the built-in shell Settings surface, not a replacement for a distro's
+display, input, network, or power management. Day-to-day controls remain in
+Quick Settings; full system settings pages and Welcome are future work.
+
 The **Power** tile in Quick Settings opens Lock, Suspend, Log out, Restart, and
 Shut down. Only Lock acts without a confirmation tap. Touch Suspend checks for
 Hyprland's lock acknowledgment before requesting sleep. System power actions

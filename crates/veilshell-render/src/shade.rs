@@ -37,6 +37,7 @@ impl ShadePage {
 /// Extra actions separate from the existing radio and slider hit targets.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ShadeAction {
+    Settings,
     Show(ShadePage),
     Page(usize),
     Select(ShadePage, String),
@@ -457,6 +458,17 @@ fn device_group(ctx: &SceneContext) -> Group<'_> {
                 )
                 .short_title("Desktop"),
             ),
+            ctx.power_menu.is_some().then(|| {
+                let title = if ctx.tablet_mode {
+                    "Desk Mode"
+                } else {
+                    "Tablet Mode"
+                };
+                Tile::new("desk_mode", Glyph::Desktop, title, Some(false))
+            }),
+            ctx.settings.is_some().then(|| {
+                Tile::new("", Glyph::Desktop, "Settings", Some(false)).action(ShadeAction::Settings)
+            }),
             status.extras.has_more().then(|| {
                 Tile::new("", Glyph::Desktop, "More", Some(false))
                     .detail("Media and tools")
@@ -1421,11 +1433,11 @@ mod tests {
         assert!(disabled
             .hit_regions
             .iter()
-            .all(|hit| control_id(hit).is_none()));
+            .all(|hit| matches!(control_id(hit), None | Some("desk_mode"))));
         for text in ["Wi-Fi", "Bluetooth", "Unavailable"] {
             assert!(label(&disabled, text).is_some(), "{text} stays visible");
         }
-        for text in ["Device", "Display & Sound", "Brightness", "Volume"] {
+        for text in ["Display & Sound", "Brightness", "Volume"] {
             assert!(label(&disabled, text).is_none(), "{text} is omitted");
         }
         assert!(label(&disabled, "Home network").is_none(), "no stale SSID");
@@ -1530,7 +1542,7 @@ mod tests {
                     .iter()
                     .filter(|hit| hit.target != HitTarget::DismissOverlay)
                     .collect();
-                assert_eq!(hits.len(), 10, "all controls present (Desktop or Power)");
+                assert_eq!(hits.len(), 10 + usize::from(power_menu.is_some()));
 
                 for (i, hit) in hits.iter().enumerate() {
                     let a = hit.rect;

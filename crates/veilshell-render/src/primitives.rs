@@ -358,25 +358,39 @@ pub enum HitTarget {
     /// Tapping empty backdrop area closes the active full-screen overlay.
     DismissOverlay,
     /// Tapping an application icon launches `home_apps[index]`.
-    LaunchApp { index: usize },
+    LaunchApp {
+        index: usize,
+    },
     /// Consume clicks inside the desktop launcher without dismissing it.
     LauncherPanel,
+    Settings(crate::SettingsAction),
     /// Tapping a pagination dot switches the Home grid page.
-    HomePage { page: usize },
+    HomePage {
+        page: usize,
+    },
     /// Tapping a recents card focuses the window with identifier `id`.
-    FocusWindow { id: String },
+    FocusWindow {
+        id: String,
+    },
     /// Tapping a Quick Settings tile toggles `id` (`wifi`, `bluetooth`, etc.).
-    ShadeToggle { id: &'static str },
+    ShadeToggle {
+        id: &'static str,
+    },
     /// A detail, device, or host-service action in the touch shade.
     ShadeAction(crate::ShadeAction),
     /// Tapping or dragging inside a Quick Settings slider updates `id`.
-    ShadeSlider { id: &'static str, rect: HitRect },
+    ShadeSlider {
+        id: &'static str,
+        rect: HitRect,
+    },
     /// Standalone session power menu input.
     Power(crate::power::PowerInput),
     /// Non-interactive region that consumes taps inside a power dialog.
     PowerPanel,
     /// Tapping an OSK key emits the labeled key press.
-    OskKey { label: &'static str },
+    OskKey {
+        label: &'static str,
+    },
     /// Open the app keyboard without focusing a shell surface.
     OpenKeyboard,
     /// Bottom gesture pill region.

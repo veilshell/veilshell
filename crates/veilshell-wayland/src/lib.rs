@@ -21,10 +21,16 @@ pub enum LayerRole {
     BottomPill,
     /// Subtle top-center pull handle for Quick Settings.
     TopStrip,
+    /// Standalone desktop panel, reserved above the work area.
+    DeskPanel,
+    /// Non-interactive standalone wallpaper.
+    Wallpaper,
     /// Full-screen spring-animated app launcher grid.
     HomeGrid,
     /// Keyboard-focused desktop application launcher.
     DesktopLauncher,
+    /// Standalone preferences.
+    Settings,
     /// Horizontal recents card switcher.
     RecentsDeck,
     /// Top-pull quick settings and status shade.
@@ -41,6 +47,7 @@ impl LayerRole {
             veilshell_render::SceneKind::Pill => Self::BottomPill,
             veilshell_render::SceneKind::Home => Self::HomeGrid,
             veilshell_render::SceneKind::Launcher => Self::DesktopLauncher,
+            veilshell_render::SceneKind::Settings => Self::Settings,
             veilshell_render::SceneKind::Recents => Self::RecentsDeck,
             veilshell_render::SceneKind::Shade => Self::QuickSettings,
             veilshell_render::SceneKind::Osk => Self::TouchOsk,
@@ -53,9 +60,12 @@ impl LayerRole {
     #[must_use]
     pub const fn to_scene(self) -> veilshell_render::SceneKind {
         match self {
-            Self::BottomPill | Self::TopStrip => veilshell_render::SceneKind::Pill,
+            Self::BottomPill | Self::TopStrip | Self::DeskPanel | Self::Wallpaper => {
+                veilshell_render::SceneKind::Pill
+            }
             Self::HomeGrid => veilshell_render::SceneKind::Home,
             Self::DesktopLauncher => veilshell_render::SceneKind::Launcher,
+            Self::Settings => veilshell_render::SceneKind::Settings,
             Self::RecentsDeck => veilshell_render::SceneKind::Recents,
             Self::QuickSettings => veilshell_render::SceneKind::Shade,
             Self::TouchOsk => veilshell_render::SceneKind::Osk,
@@ -143,6 +153,27 @@ impl LayerSurfaceSpec {
                 exclusive_zone: 0,
                 keyboard_interactivity: false,
             },
+            LayerRole::Wallpaper => Self {
+                role,
+                anchor: Anchor::all(),
+                width: viewport_w,
+                height: viewport_h,
+                exclusive_zone: -1,
+                keyboard_interactivity: false,
+            },
+            LayerRole::DeskPanel => Self {
+                role,
+                anchor: Anchor {
+                    left: true,
+                    right: true,
+                    ..Anchor::top_center()
+                },
+                width: viewport_w,
+                height: veilshell_render::DESK_PANEL_HEIGHT,
+                exclusive_zone: i32::try_from(veilshell_render::DESK_PANEL_HEIGHT)
+                    .unwrap_or(i32::MAX),
+                keyboard_interactivity: false,
+            },
             LayerRole::TouchOsk => {
                 let height = (viewport_h / 3).max(1);
                 Self {
@@ -156,6 +187,7 @@ impl LayerSurfaceSpec {
             }
             LayerRole::HomeGrid
             | LayerRole::DesktopLauncher
+            | LayerRole::Settings
             | LayerRole::RecentsDeck
             | LayerRole::QuickSettings => Self {
                 role,

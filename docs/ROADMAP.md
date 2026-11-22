@@ -125,7 +125,10 @@ Mode, which simply hides VeilShell.
 - [ ] Native Denial-style lock face: wallpaper, clock/date, swipe-up touch authentication, password fallback, PIN and optional fingerprint. Require compositor-enforced locking.
 - [x] Optional session-scoped XDG autostart helper with an explicit allowlist.
 - [ ] Finish session-scoped desktop services, including polkit prompts, notifications, and file-picker and screen-sharing portals.
-- [ ] Define and test standalone window defaults and Desk Mode without changing the overlay or normal desktop.
+- [x] Switch between standalone Desk and Tablet layouts without closing apps or changing the overlay. Suppress automatic app keyboard in Desk Mode.
+- [x] Add a Desk Mode panel with launch, Recents and Quick Settings pills.
+- [x] Built-in standalone Settings for startup mode, panel visibility, wallpaper presets and shortcut profile.
+- [ ] Add standalone Tablet window defaults, taskbar, Dashboard, Welcome, and broader system settings. See the [Denial out-of-box gaps](DENIAL_CALL_MAP.md#out-of-box-gap-map).
 
 ### Shared tablet experience
 

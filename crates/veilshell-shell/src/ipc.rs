@@ -99,7 +99,7 @@ fn handle_client(
             let Some(scene_str) = parts.next() else {
                 let _ = writeln!(
                     stream,
-                    "err usage: show <pill|home|launcher|recents|shade|osk>"
+                    "err usage: show <pill|home|launcher|settings|recents|shade|osk>"
                 );
                 return false;
             };
@@ -107,7 +107,9 @@ fn handle_client(
                 let _ = writeln!(stream, "err unknown scene '{scene_str}'");
                 return false;
             };
-            if scene == SceneKind::Osk {
+            if scene == SceneKind::Settings && !session.owns_compositor() {
+                let _ = writeln!(stream, "err Settings requires a standalone session");
+            } else if scene == SceneKind::Osk {
                 let (reply, result) = mpsc::channel();
                 if cmd_tx.send(DaemonCommand::ShowKeyboard(reply)).is_err() {
                     let _ = writeln!(stream, "err daemon not running");
@@ -144,6 +146,9 @@ fn handle_client(
                         st.height,
                         st.renderer
                     );
+                    if let Some(layout) = st.standalone_layout {
+                        let _ = writeln!(stream, "  session    : standalone ({layout})");
+                    }
                 } else {
                     let _ = writeln!(stream, "err status timeout");
                 }

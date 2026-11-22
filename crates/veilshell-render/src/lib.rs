@@ -1,7 +1,9 @@
 //! Rendering scene models, analytic SDF glassmorphic renderers (`wgpu` GPU + CPU software),
 //! pre-blurred static wallpaper glass cache, and `PNG` snapshot export.
 
+mod desk_panel;
 pub mod font;
+pub use desk_panel::{build_desk_panel, desk_panel_actions, DeskPanelAction, DESK_PANEL_HEIGHT};
 #[cfg(feature = "wgpu")]
 pub mod gpu;
 mod launcher;
@@ -10,6 +12,8 @@ pub mod power;
 pub mod primitives;
 mod recents;
 pub mod scene;
+mod settings;
+pub use settings::{build_wallpaper, SettingsAction, SettingsView, WallpaperPreset};
 mod shade;
 mod shade_glyphs;
 pub mod software;
@@ -44,6 +48,7 @@ pub enum SceneKind {
     Pill,
     Home,
     Launcher,
+    Settings,
     Recents,
     Shade,
     Osk,
@@ -57,6 +62,7 @@ impl SceneKind {
             "pill" => Some(Self::Pill),
             "home" => Some(Self::Home),
             "launcher" => Some(Self::Launcher),
+            "settings" => Some(Self::Settings),
             "recents" => Some(Self::Recents),
             "shade" => Some(Self::Shade),
             "osk" => Some(Self::Osk),
@@ -71,6 +77,7 @@ impl SceneKind {
             Self::Pill => "pill",
             Self::Home => "home",
             Self::Launcher => "launcher",
+            Self::Settings => "settings",
             Self::Recents => "recents",
             Self::Shade => "shade",
             Self::Osk => "osk",

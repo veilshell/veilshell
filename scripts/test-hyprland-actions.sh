@@ -270,6 +270,48 @@ if [[ ${VEILSHELL_TEST_STANDALONE:-0} == 1 ]]; then
         '.address == $id' --arg id "$home_address"
     json_matches clients 'map(.class) | sort == ["veil-home", "veil-other"]'
     echo "Standalone Home focused the existing app without a duplicate."
+    saved_windows="$(nested_ctl -j clients | jq -c 'map(.address) | sort')"
+    [[ $("$BIN/veilctl" mode desk) == "Mode set to Desk "* ]]
+    wait_for "Desk keeps the shell visible" in_scene pill
+    "$BIN/veilctl" status | grep -F 'session    : standalone (Desk)' >/dev/null
+    desk_panel_reserved() {
+        json_matches monitors 'any(.[]; .name == "veil-smoke" and .reserved[1] == $height)' \
+            --argjson height "$1"
+    }
+    wait_for "Desk panel reserves the work area" desk_panel_reserved 44
+    nested_ctl -j getoption decoration:rounding | jq -e '.int == 8' >/dev/null
+    json_matches clients 'map(.address) | sort == $windows' --argjson windows "$saved_windows"
+    pointer 60 22
+    wait_for "Apps pill opens Launcher" in_scene launcher
+    desk_panel_reserved 44
+    show pill
+    pointer 180 22
+    wait_for "Recents pill opens the window deck" in_scene recents
+    show pill
+    pointer 900 22
+    wait_for "Controls pill opens Quick Settings" in_scene shade
+    show settings
+    in_scene settings
+    # Settings rows are centered in a 620px panel at this 960×640 viewport.
+    pointer 480 75
+    grep -x desk "$XDG_CONFIG_HOME/veilshell/startup.mode"
+    pointer 480 145
+    wait_for "Settings hides the Desk panel immediately" desk_panel_reserved 0
+    grep -x hidden "$XDG_CONFIG_HOME/veilshell/desk-panel"
+    pointer 480 215
+    grep -x Forest "$XDG_CONFIG_HOME/veilshell/wallpaper.preset"
+    pointer 480 275
+    grep -x omarchy "$XDG_CONFIG_HOME/veilshell/bindings.profile"
+    pointer 480 145
+    wait_for "Settings restores the Desk panel immediately" desk_panel_reserved 44
+    pointer 480 350
+    wait_for "Settings Back returns to Quick Settings" in_scene shade
+    [[ $("$BIN/veilctl" mode tablet) == "Mode set to Tablet "* ]]
+    wait_for "Tablet removes desktop reservation" desk_panel_reserved 0
+    "$BIN/veilctl" status | grep -F 'session    : standalone (Tablet)' >/dev/null
+    nested_ctl -j getoption decoration:rounding | jq -e '.int == 14' >/dev/null
+    json_matches clients 'map(.address) | sort == $windows' --argjson windows "$saved_windows"
+    echo "Desk pills opened their surfaces and the reservation cleared on return to Tablet."
     timeout 5 "$BIN/veilctl" quit >/dev/null
     exit 0
 fi

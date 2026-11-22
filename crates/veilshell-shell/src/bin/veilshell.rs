@@ -30,6 +30,7 @@ use veilshell_shell::apps::{
 };
 use veilshell_shell::ipc::{default_socket_path, spawn_ipc_listener};
 use veilshell_shell::session::ShellSession;
+use veilshell_shell::settings;
 use veilshell_shell::shade;
 use veilshell_shell::ShellState;
 use veilshell_wayland::channel::{self, Sender};
@@ -52,6 +53,20 @@ struct LiveActionHandler<C> {
 }
 
 impl<C: CompositorBackend> LiveActionHandler<C> {
+    fn change_setting(&self, action: veilshell_render::SettingsAction, ctx: &mut SceneContext) {
+        if !self.session.owns_compositor() {
+            return;
+        }
+        if let (Some(dir), Some(view)) = (settings::directory(), &mut ctx.settings) {
+            match settings::change(&dir, action, view) {
+                Ok(updated) => *view = updated,
+                Err(err) => {
+                    eprintln!("veilshell: could not save preferences: {err}");
+                    view.feedback = Some("Could not save this preference.".into());
+                }
+            }
+        }
+    }
     fn activate_home_app(&mut self, id: &str, exec: &str) {
         if self.session.owns_compositor() {
             if let Some(app) = self.desktop_apps.iter().find(|app| app.id == id) {
@@ -80,12 +95,28 @@ impl<C: CompositorBackend> LiveActionHandler<C> {
         }
     }
 
-    fn apply_mode_layout(&mut self, mode: ShellMode) {
+    fn apply_mode_layout(
+        &mut self,
+        mode: ShellMode,
+    ) -> Result<(), veilshell_compositor::CompositorError> {
         if self.session.owns_compositor() {
-            if let Err(err) = self.compositor.apply_shell_mode(mode) {
-                eprintln!("veilshell: apply_shell_mode failed: {err}");
-            }
+            self.compositor.apply_shell_mode(mode)?;
         }
+        Ok(())
+    }
+
+    fn change_mode(
+        &mut self,
+        next: ModeStateMachine,
+        ctx: &mut SceneContext,
+    ) -> Result<(), veilshell_compositor::CompositorError> {
+        let mode = next.effective_mode();
+        if mode != self.mode_sm.effective_mode() {
+            self.apply_mode_layout(mode)?;
+        }
+        self.mode_sm = next;
+        ctx.tablet_mode = mode == ShellMode::Tablet;
+        Ok(())
     }
 
     fn request_power(&self, action: PowerAction, ctx: &mut SceneContext) {
@@ -250,6 +281,15 @@ impl<C: CompositorBackend> LiveActionHandler<C> {
                 ctx.tablet_mode = self.mode_sm.effective_mode() == ShellMode::Tablet;
                 return;
             }
+            "desk_mode" if self.session.owns_compositor() => {
+                let mut next = self.mode_sm;
+                next.handle(ModeEvent::ToggleManual);
+                if let Err(err) = self.change_mode(next, ctx) {
+                    eprintln!("veilshell: could not switch session layout: {err}");
+                    ctx.shade.feedback = Some("Could not switch session layout".into());
+                }
+                return;
+            }
             "profile" => {
                 if let Some(label) = shade::cycle_profile() {
                     ctx.shade.power_profile = Some(label);
@@ -304,6 +344,7 @@ impl<C: CompositorBackend> LiveActionHandler<C> {
 impl<C: CompositorBackend> ShellActionHandler for LiveActionHandler<C> {
     fn on_action(&mut self, action: ShellAction, ctx: &mut SceneContext) {
         match action {
+            ShellAction::Settings(action) => self.change_setting(action, ctx),
             ShellAction::RequestRefresh(scene) => self.refresh_context(scene, ctx),
             ShellAction::FocusWindow(id) => {
                 if let Err(err) = self.compositor.focus_window(&WindowId(id)) {
@@ -351,11 +392,14 @@ impl<C: CompositorBackend> ShellActionHandler for LiveActionHandler<C> {
     ) -> Option<bool> {
         let mut vis_override = None;
         if let Some(attached) = keyboard_attached {
-            if let Some(next_mode) = self.mode_sm.handle(ModeEvent::KeyboardAttached(attached)) {
-                self.apply_mode_layout(next_mode);
-                let tablet = next_mode == ShellMode::Tablet;
-                ctx.tablet_mode = tablet;
-                vis_override = Some(tablet);
+            let mut next = self.mode_sm;
+            let changed = next.handle(ModeEvent::KeyboardAttached(attached)).is_some();
+            match self.change_mode(next, ctx) {
+                Ok(()) if changed => {
+                    vis_override = Some(self.session.owns_compositor() || ctx.tablet_mode);
+                }
+                Err(err) => eprintln!("veilshell: could not switch session layout: {err}"),
+                _ => {}
             }
         }
 
@@ -378,34 +422,40 @@ impl<C: CompositorBackend> ShellActionHandler for LiveActionHandler<C> {
         if parts.next() != Some("mode") {
             return (format!("err unknown command '{cmd}'"), None);
         }
-        let previous_mode = self.mode_sm.effective_mode();
+        let mut next = self.mode_sm;
         let event = match parts.next() {
             Some("auto") => {
                 let kbd = self.hw.detect_keyboard_attached();
-                let _ = self.mode_sm.handle(ModeEvent::KeyboardAttached(kbd));
+                let _ = next.handle(ModeEvent::KeyboardAttached(kbd));
                 ModeEvent::SetPolicy(ModePolicy::Auto)
             }
             Some("laptop") => ModeEvent::SetPolicy(ModePolicy::ForceLaptop),
+            Some("desk") if self.session.owns_compositor() => {
+                ModeEvent::SetPolicy(ModePolicy::ForceLaptop)
+            }
+            Some("desk") => return ("err Desk Mode requires a standalone session".into(), None),
             Some("tablet") => ModeEvent::SetPolicy(ModePolicy::ForceTablet),
             Some("toggle") => ModeEvent::ToggleManual,
             _ => {
                 return (
-                    "err usage: mode <auto|laptop|tablet|toggle>".to_owned(),
+                    "err usage: mode <auto|laptop|tablet|desk|toggle>".to_owned(),
                     None,
                 )
             }
         };
-        self.mode_sm.handle(event);
-        let mode = self.mode_sm.effective_mode();
-        if mode != previous_mode {
-            self.apply_mode_layout(mode);
+        next.handle(event);
+        if let Err(err) = self.change_mode(next, ctx) {
+            return (format!("err could not switch session layout: {err}"), None);
         }
         let policy = self.mode_sm.policy();
-        let tablet = mode == ShellMode::Tablet;
-        ctx.tablet_mode = tablet;
+        let name = match (self.mode_sm.effective_mode(), self.session) {
+            (ShellMode::Tablet, _) => "Tablet",
+            (ShellMode::Laptop, ShellSession::Overlay) => "Laptop",
+            (ShellMode::Laptop, ShellSession::Standalone) => "Desk",
+        };
         (
-            format!("Mode set to {mode:?} (policy: {policy:?})"),
-            Some(tablet),
+            format!("Mode set to {name} (policy: {policy:?})"),
+            Some(self.session.owns_compositor() || ctx.tablet_mode),
         )
     }
 }
@@ -463,6 +513,7 @@ fn spawn_hardware_watchers(
             let theme_path = session.desktop_theme_path();
             let mut last_theme_mtime = read_mtime(theme_path.as_ref());
             let mut last_bat = read_sysfs_battery().map(|(pct, _)| pct);
+            let mut last_minute = unix_minute();
 
             let mut ticks = 0;
             while !stop.load(Ordering::Relaxed) {
@@ -474,10 +525,16 @@ fn spawn_hardware_watchers(
                 } else {
                     last_bat
                 };
-                if cur_kbd != last_kbd || cur_bat != last_bat {
+                let minute = if periodic && session.owns_compositor() {
+                    unix_minute()
+                } else {
+                    last_minute
+                };
+                if cur_kbd != last_kbd || cur_bat != last_bat || minute != last_minute {
                     let keyboard_attached = (cur_kbd != last_kbd).then_some(cur_kbd);
                     last_kbd = cur_kbd;
                     last_bat = cur_bat;
+                    last_minute = minute;
                     let _ = poll_tx.send(DaemonCommand::HardwareUpdate {
                         keyboard_attached,
                         orientation: None,
@@ -500,6 +557,12 @@ fn spawn_hardware_watchers(
         .ok();
 
     (sensor_guard, handle)
+}
+
+fn unix_minute() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() / 60)
 }
 
 fn read_mtime(path: Option<&PathBuf>) -> Option<SystemTime> {
@@ -549,7 +612,7 @@ fn parse_cli(args: &[String]) -> CliOutcome {
     let scene = match parse_flag(args, "--scene") {
         Some(raw) => {
             let Some(parsed) = SceneKind::parse_name(&raw) else {
-                eprintln!("invalid --scene '{raw}' (expected: pill, home, recents, shade, osk)");
+                eprintln!("invalid --scene '{raw}'");
                 return CliOutcome::Exit(ExitCode::FAILURE);
             };
             parsed
@@ -669,6 +732,12 @@ fn initial_scene(
     visible: bool,
 ) -> SceneContext {
     let mut ctx = SceneContext {
+        settings: session
+            .owns_compositor()
+            .then(settings::directory)
+            .flatten()
+            .as_deref()
+            .map(settings::load),
         clock_text: current_clock_hhmm(),
         tablet_mode: visible,
         home_apps: apps_to_tiles(apps),
@@ -707,8 +776,9 @@ fn main() -> ExitCode {
     let watch_rotation = hw.profile().is_none_or(|p| p.auto_rotate_in_tablet_mode);
     let initial_keyboard_attached = hw.detect_keyboard_attached();
     let mode_sm = ModeStateMachine::new(opts.policy, initial_keyboard_attached);
-    let initial_visible =
-        mode_sm.effective_mode() == ShellMode::Tablet || opts.scene != SceneKind::Pill;
+    let initial_visible = session.owns_compositor()
+        || mode_sm.effective_mode() == ShellMode::Tablet
+        || opts.scene != SceneKind::Pill;
 
     let mut scene_ctx = initial_scene(session, &discovered, initial_visible);
 
@@ -735,6 +805,9 @@ fn main() -> ExitCode {
         shade_tx: Some(cmd_tx.clone()),
     };
     handler.sync_hardware_snapshot(&mut scene_ctx);
+    if let Err(err) = handler.apply_mode_layout(mode_sm.effective_mode()) {
+        eprintln!("veilshell: could not apply initial session layout: {err}");
+    }
 
     if let Err(err) = spawn_ipc_listener(&opts.socket_path, cmd_tx.clone(), session) {
         eprintln!(
@@ -830,7 +903,7 @@ fn print_help() {
          OPTIONS:\n\
          \t--policy <auto|laptop|tablet>          Initial Laptop/Tablet mode policy (default: auto)\n\
          \t--osk <auto|manual>                    Manual never claims the input method (default: auto)\n\
-         \t--scene <pill|home|launcher|recents|shade|osk>  Initial surface scene (default: pill)\n\
+         \t--scene <pill|home|launcher|settings|recents|shade|osk>  Initial surface scene (default: pill)\n\
          \t--renderer <auto|wgpu|software>        Rendering backend (default: auto)\n\
          \t--wallpaper <PNG_PATH>                 Static PNG wallpaper for pre-blurred GPU glass\n\
          \t--output <NAME>                        Bind surfaces to a specific Wayland output\n\
@@ -1013,5 +1086,30 @@ mod tests {
             mock.list_outputs().unwrap()[0].orientation,
             Orientation::Rotate90
         );
+    }
+
+    #[test]
+    fn desk_mode_is_standalone_only_and_keeps_the_shell_visible() {
+        let mut overlay = handler(ShellSession::Overlay);
+        let mut ctx = SceneContext::default();
+        let (reply, visible) = overlay.on_custom_command("mode desk", &mut ctx);
+        assert!(reply.starts_with("err "));
+        assert_eq!(visible, None);
+
+        let mut shell = handler(ShellSession::Standalone);
+        assert_eq!(
+            shell.on_custom_command("mode tablet", &mut ctx).1,
+            Some(true)
+        );
+        assert_eq!(shell.compositor.applied_mode(), ShellMode::Tablet);
+        let (reply, visible) = shell.on_custom_command("mode desk", &mut ctx);
+        assert!(reply.starts_with("Mode set to Desk"));
+        assert_eq!(visible, Some(true));
+        assert_eq!(shell.compositor.applied_mode(), ShellMode::Laptop);
+        assert!(!ctx.tablet_mode);
+
+        shell.on_action(ShellAction::ToggleSetting("desk_mode"), &mut ctx);
+        assert!(ctx.tablet_mode);
+        assert_eq!(shell.compositor.applied_mode(), ShellMode::Tablet);
     }
 }

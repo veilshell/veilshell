@@ -187,10 +187,22 @@ until [[ -S $display_path && -S $XDG_RUNTIME_DIR/hypr/${endpoints[1]}/.socket.so
 done
 export WAYLAND_DISPLAY="${endpoints[0]}" HYPRLAND_INSTANCE_SIGNATURE="${endpoints[1]}"
 
+startup=tablet
+user_config=${XDG_CONFIG_HOME:-$HOME/.config}
+[[ $user_config == /* ]] || user_config=$HOME/.config
+if [[ -r $user_config/veilshell/startup.mode ]]; then
+    IFS= read -r startup <"$user_config/veilshell/startup.mode" || true
+fi
+case $startup in
+    desk) startup_args=(--policy laptop --scene pill) ;;
+    auto) startup_args=(--policy auto --scene pill) ;;
+    *) startup_args=(--policy tablet --scene home) ;;
+esac
+
 hypridle --config "$config_dir/hypridle.conf" &
 idle_pid=$!
 pids+=("$idle_pid")
-veilshell --policy tablet --scene home &
+veilshell "${startup_args[@]}" &
 shell_pid=$!
 pids+=("$shell_pid")
 

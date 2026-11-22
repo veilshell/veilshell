@@ -58,7 +58,7 @@ elif name in ("veilshell", "hypridle", "veilshell-autostart"):
     assert Path(os.environ["VEILSHELL_SOCKET"]).parent == Path(os.environ["VEILSHELL_SESSION_DIR"])
     log(name + " started")
     if name == "veilshell":
-        assert sys.argv[1:] == ["--policy", "tablet", "--scene", "home"]
+        assert " ".join(sys.argv[1:]) == os.getenv("TEST_STARTUP_ARGS", "--policy tablet --scene home")
         if "TEST_SHELL_STATUS" in os.environ:
             time.sleep(0.2)
             sys.exit(int(os.environ["TEST_SHELL_STATUS"]))
@@ -120,6 +120,7 @@ class SessionTests(unittest.TestCase):
             os.environ,
             PATH=f"{bindir}:{os.environ['PATH']}",
             XDG_RUNTIME_DIR=str(self.runtime),
+            XDG_CONFIG_HOME=str(self.root / "config"),
             VEILSHELL_SESSION_CONFIG_DIR=str(ADAPTER),
             TEST_LOG=str(self.log),
             DISPLAY="stale",
@@ -149,6 +150,24 @@ class SessionTests(unittest.TestCase):
         self.assertIn("hypridle stopped", self.log.read_text())
         self.assertIn("Hyprland stopped", self.log.read_text())
         self.assertEqual(list(self.runtime.glob("veilshell.*")), [])
+
+    def test_saved_startup_mode_is_applied_without_sourcing_config(self):
+        prefs = Path(self.env["XDG_CONFIG_HOME"]) / "veilshell"
+        prefs.mkdir(parents=True)
+        self.env["TEST_SHELL_STATUS"] = "0"
+        for index, (value, args) in enumerate((
+            ("desk", "--policy laptop --scene pill"),
+            ("auto", "--policy auto --scene pill"),
+            ("invalid; exit 99", "--policy tablet --scene home"),
+        )):
+            with self.subTest(value=value):
+                runtime = self.root / f"runtime-{index}"
+                runtime.mkdir(mode=0o700)
+                self.env["XDG_RUNTIME_DIR"] = str(runtime)
+                (prefs / "startup.mode").write_text(value + "\n")
+                self.env["TEST_STARTUP_ARGS"] = args
+                result = self.run_launcher()
+                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_failed_start_and_shell_map_status_one(self):
         self.env["TEST_HYPR_FAIL"] = "yes"

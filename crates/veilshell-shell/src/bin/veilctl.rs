@@ -82,11 +82,11 @@ fn cmd_daemon_simple(verb: &str) -> ExitCode {
 
 fn cmd_show(arg: Option<&str>) -> ExitCode {
     let Some(raw) = arg else {
-        eprintln!("usage: veilctl show <pill|home|launcher|recents|shade|osk>");
+        eprintln!("usage: veilctl show <pill|home|launcher|settings|recents|shade|osk>");
         return ExitCode::FAILURE;
     };
     let Some(scene) = SceneKind::parse_name(raw) else {
-        eprintln!("invalid scene '{raw}' (expected: pill, home, recents, shade, osk)");
+        eprintln!("invalid scene '{raw}'");
         return ExitCode::FAILURE;
     };
     let sock = default_socket_path();
@@ -279,8 +279,8 @@ fn cmd_theme() {
 }
 
 fn cmd_mode(arg: Option<&str>) -> ExitCode {
-    let Some(mode_arg @ ("auto" | "laptop" | "tablet" | "toggle")) = arg else {
-        eprintln!("usage: veilctl mode <auto|laptop|tablet|toggle>");
+    let Some(mode_arg @ ("auto" | "laptop" | "tablet" | "desk" | "toggle")) = arg else {
+        eprintln!("usage: veilctl mode <auto|laptop|tablet|desk|toggle>");
         return ExitCode::FAILURE;
     };
 
@@ -501,8 +501,8 @@ fn print_help() {
          COMMANDS:\n\
          \tstatus                            Show shell mode, theme, hardware, compositor, and daemon state\n\
          \thw                                Show live Linux hardware telemetry & matched device profile\n\
-         \tshow <pill|home|launcher|recents|shade|osk> Switch the running daemon's active surface\n\
-         \tmode <auto|laptop|tablet|toggle>  Change the running daemon's visibility policy\n\
+         \tshow <pill|home|launcher|settings|recents|shade|osk> Switch the running daemon's active surface\n\
+         \tmode <auto|laptop|tablet|desk|toggle>  Change shell mode (Desk is standalone only)\n\
          \twallpaper <PNG_PATH|clear>        Update or clear the GPU pre-blurred glass wallpaper\n\
          \treload-theme                      Reload colors.toml in the running daemon\n\
          \tquit                              Stop the running daemon cleanly\n\

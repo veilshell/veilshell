@@ -123,7 +123,9 @@ impl Dispatch2<ZwpInputMethodV2, LayerApp> for InputMethodData {
                     // never reopen a keyboard the user just dismissed. A deactivate
                     // and activate in the same batch still means a new editor.
                     Some(EditorChange::Activated)
-                        if state.visible && state.active_scene == SceneKind::Pill =>
+                        if state.visible
+                            && state.active_scene == SceneKind::Pill
+                            && !state.in_desk_mode() =>
                     {
                         state.osk.auto_opened = true;
                         state.show_scene(SceneKind::Osk, false);

@@ -10,6 +10,7 @@ hl.config({
 })
 
 hl.layer_rule({ match = { namespace = "veilshell" }, no_anim = true })
+hl.bind("SUPER + CTRL + ALT + I", hl.dsp.exec_cmd("veilctl show settings"), { description = "VeilShell Settings" })
 
 hl.on("hyprland.start", function()
     -- This command inherits the new compositor's Wayland and IPC endpoints.
@@ -17,7 +18,8 @@ hl.on("hyprland.start", function()
 end)
 
 local session_config = os.getenv("VEILSHELL_SESSION_CONFIG_DIR") or "/usr/share/veilshell/session"
-local user_config = (os.getenv("XDG_CONFIG_HOME") or (os.getenv("HOME") .. "/.config")) .. "/veilshell"
+local xdg_config = os.getenv("XDG_CONFIG_HOME")
+local user_config = ((xdg_config and xdg_config:sub(1, 1) == "/" and xdg_config) or (os.getenv("HOME") .. "/.config")) .. "/veilshell"
 local profile = "preview"
 local selection = io.open(user_config .. "/bindings.profile", "r")
 if selection then

@@ -127,6 +127,7 @@ pub struct RuntimeStatus {
     pub width: u32,
     pub height: u32,
     pub renderer: String,
+    pub standalone_layout: Option<&'static str>,
 }
 
 /// Partial state changes from a Quick Settings service operation.
@@ -144,6 +145,7 @@ pub enum ShadeReply {
 /// Interactive UI events emitted by the `Wayland` shell surfaces.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ShellAction {
+    Settings(veilshell_render::SettingsAction),
     /// Sent immediately before opening a scene so state (e.g. Hyprland windows) can refresh.
     RequestRefresh(SceneKind),
     /// Focus and raise a compositor window.
@@ -151,7 +153,10 @@ pub enum ShellAction {
     /// Request closing a compositor window.
     CloseWindow(String),
     /// Activate a Home entry, retaining its desktop-file ID for session policy.
-    LaunchApp { id: String, exec: String },
+    LaunchApp {
+        id: String,
+        exec: String,
+    },
     /// Switch to the adjacent workspace (`+1` next, `-1` prev).
     SwitchWorkspace(i32),
     /// Toggle a Quick Settings tile (`wifi`, `bluetooth`, `lte`, `autorotate`, `tablet_mode`, `night_light`).
@@ -159,7 +164,10 @@ pub enum ShellAction {
     /// Navigate to or activate a Quick Settings detail or desktop tool.
     Shade(ShadeAction),
     /// Update a Quick Settings slider (`brightness`, `volume`) to `0..=100`.
-    SetSlider { id: &'static str, pct: u8 },
+    SetSlider {
+        id: &'static str,
+        pct: u8,
+    },
     /// Notify that the active Home grid page changed.
     HomePageChanged(usize),
     /// Request an operation from the standalone session adapter.
@@ -198,6 +206,7 @@ impl ShellActionHandler for NoopActionHandler {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SurfaceKind {
+    Wallpaper,
     Pill,
     TopStrip,
     Overlay,
@@ -239,23 +248,30 @@ impl RegionRect {
 enum EdgeHandle {
     Bottom,
     Top,
+    Desk,
 }
 
 impl EdgeHandle {
-    fn input_rects(self, size: (u32, u32), show_keyboard: bool) -> [Option<RegionRect>; 2] {
+    fn input_rects(self, size: (u32, u32), show_keyboard: bool) -> [Option<RegionRect>; 3] {
+        if matches!(self, Self::Desk) {
+            return veilshell_render::desk_panel_actions(size.0 as f32).map(|action| {
+                let b = action.bounds;
+                (b.w > 0.0).then_some(RegionRect(b.x as i32, 0, b.w as i32, b.h as i32))
+            });
+        }
         let keyboard = if show_keyboard && matches!(self, Self::Bottom) {
             keyboard_button_bounds(size.0 as f32, size.1 as f32)
                 .map(|b| RegionRect(b.x as i32, b.y as i32, b.w as i32, b.h as i32))
         } else {
             None
         };
-        [self.input_rect(size), keyboard]
+        [self.input_rect(size), keyboard, None]
     }
 
     fn bounds(self, width: f32, height: f32) -> HitRect {
         match self {
             Self::Bottom => bottom_pill_bounds(width, height),
-            Self::Top => top_handle_bounds(width, height),
+            Self::Top | Self::Desk => top_handle_bounds(width, height),
         }
     }
 
@@ -285,7 +301,7 @@ fn handle_tap(allowed: bool, max_travel: f32) -> bool {
 struct HandleInputRegion {
     handle: EdgeHandle,
     region: Region,
-    rects: [Option<RegionRect>; 2],
+    rects: [Option<RegionRect>; 3],
 }
 
 impl HandleInputRegion {
@@ -300,7 +316,7 @@ impl HandleInputRegion {
         Self {
             handle,
             region,
-            rects: [None; 2],
+            rects: [None; 3],
         }
     }
 
@@ -351,6 +367,14 @@ struct ManagedSurface {
     redraw_pending: bool,
 }
 
+fn surface_layer(role: LayerRole) -> Layer {
+    match role {
+        LayerRole::DeskPanel => Layer::Top,
+        LayerRole::Wallpaper => Layer::Background,
+        _ => Layer::Overlay,
+    }
+}
+
 impl ManagedSurface {
     fn create(app: &LayerApp, role: LayerRole) -> Self {
         let spec = LayerSurfaceSpec::for_role(role, app.viewport_w, app.viewport_h);
@@ -371,7 +395,7 @@ impl ManagedSurface {
         let layer = app.layer_shell.create_layer_surface(
             &app.qh,
             wl_surface,
-            Layer::Overlay,
+            surface_layer(role),
             Some("veilshell"),
             app.target_output.as_ref(),
         );
@@ -427,10 +451,11 @@ impl ManagedSurface {
         let handle_input = match role {
             LayerRole::BottomPill => Some(EdgeHandle::Bottom),
             LayerRole::TopStrip => Some(EdgeHandle::Top),
+            LayerRole::DeskPanel => Some(EdgeHandle::Desk),
             _ => None,
         }
         .map(|handle| HandleInputRegion::new(handle, &app.compositor, layer.wl_surface()));
-        if edge_preview {
+        if edge_preview || role == LayerRole::Wallpaper {
             let empty = Region::new(&app.compositor).expect("compositor is already bound");
             layer.wl_surface().set_input_region(Some(empty.wl_region()));
         }
@@ -668,6 +693,7 @@ pub(crate) struct LayerApp {
     pill: Option<ManagedSurface>,
     top_strip: Option<ManagedSurface>,
     overlay: Option<ManagedSurface>,
+    wallpaper: Option<ManagedSurface>,
     overlay_layout: Option<SceneOutput>,
     overlay_spring: Spring,
     home_spring: Option<Spring>,
@@ -693,8 +719,44 @@ pub(crate) struct LayerApp {
 }
 
 impl LayerApp {
+    fn sync_top_strip(&mut self) {
+        let desk = self.uses_desk_panel();
+        let keep_pull_origin = self
+            .drag
+            .as_ref()
+            .is_some_and(|drag| drag.surface == SurfaceKind::TopStrip);
+        if desk || self.active_scene == SceneKind::Pill {
+            let right_role = self
+                .top_strip
+                .as_ref()
+                .and_then(|s| s.handle_input.as_ref())
+                .is_some_and(|input| matches!(input.handle, EdgeHandle::Desk) == desk);
+            if !right_role {
+                let role = if desk {
+                    LayerRole::DeskPanel
+                } else {
+                    LayerRole::TopStrip
+                };
+                self.top_strip = Some(ManagedSurface::create(self, role));
+            }
+        } else if !keep_pull_origin {
+            self.top_strip = None;
+        }
+    }
+
+    fn uses_desk_panel(&self) -> bool {
+        self.in_desk_mode()
+            && self
+                .renderer
+                .context()
+                .settings
+                .as_ref()
+                .is_none_or(|s| s.panel)
+    }
+
     fn sync_surfaces(&mut self) {
         if !self.visible {
+            self.wallpaper = None;
             self.overlay = None;
             self.overlay_layout = None;
             self.top_strip = None;
@@ -702,6 +764,9 @@ impl LayerApp {
             return;
         }
 
+        if self.wallpaper.is_none() && self.renderer.context().settings.is_some() {
+            self.wallpaper = Some(ManagedSurface::create(self, LayerRole::Wallpaper));
+        }
         if self.active_scene == SceneKind::Osk {
             // A keyboardless seat may not be advertising wl_keyboard yet.
             // Give the focused client time to subscribe before the first tap,
@@ -721,25 +786,13 @@ impl LayerApp {
             self.pill = Some(ManagedSurface::create(self, LayerRole::BottomPill));
         }
 
+        self.sync_top_strip();
         if self.active_scene == SceneKind::Pill {
             self.overlay = None;
             self.overlay_layout = None;
-            if self.top_strip.is_none() {
-                self.top_strip = Some(ManagedSurface::create(self, LayerRole::TopStrip));
-            }
-        } else {
-            // Destroying the origin of the pull would cancel the Wayland grab.
-            if !self
-                .drag
-                .as_ref()
-                .is_some_and(|drag| drag.surface == SurfaceKind::TopStrip)
-            {
-                self.top_strip = None;
-            }
-            if self.overlay.is_none() {
-                let role = LayerRole::from_scene(self.active_scene);
-                self.overlay = Some(ManagedSurface::create(self, role));
-            }
+        } else if self.overlay.is_none() {
+            let role = LayerRole::from_scene(self.active_scene);
+            self.overlay = Some(ManagedSurface::create(self, role));
         }
     }
 
@@ -758,6 +811,9 @@ impl LayerApp {
     }
 
     pub(crate) fn show_scene(&mut self, scene: SceneKind, animate: bool) {
+        if scene == SceneKind::Settings && self.renderer.context().settings.is_none() {
+            return;
+        }
         if scene == SceneKind::Pill
             && self.active_scene == SceneKind::Launcher
             && self.launcher_input.opened_from_hidden
@@ -883,9 +939,19 @@ impl LayerApp {
         }
         self.sync_surfaces();
         if visible {
+            if self.in_desk_mode() && self.active_scene == SceneKind::Osk && self.osk.auto_opened {
+                self.show_scene(SceneKind::Pill, false);
+                return;
+            }
             self.draw_pill();
             self.draw_top_strip();
+            self.draw_overlay();
         }
+    }
+
+    pub(crate) fn in_desk_mode(&self) -> bool {
+        let ctx = self.renderer.context();
+        ctx.power_menu.is_some() && !ctx.tablet_mode
     }
 
     fn sync_osk_visibility(&mut self) {
@@ -934,10 +1000,20 @@ impl LayerApp {
     }
 
     fn draw_top_strip(&mut self) {
+        let desk = self.uses_desk_panel();
         let Some(surf) = &mut self.top_strip else {
             return;
         };
         if !surf.configured || surf.width == 0 || surf.height == 0 {
+            return;
+        }
+        if desk {
+            let list = veilshell_render::build_desk_panel(
+                surf.width as f32,
+                &self.palette,
+                self.renderer.context(),
+            );
+            self.present_surface(SurfaceKind::TopStrip, &list, false);
             return;
         }
         self.renderer.context_mut().top_pressed = self
@@ -952,6 +1028,29 @@ impl LayerApp {
             self.renderer.context().top_pressed,
         );
         self.present_surface(SurfaceKind::TopStrip, &list, false);
+    }
+
+    fn draw_wallpaper(&mut self) {
+        if !self
+            .wallpaper
+            .as_ref()
+            .is_some_and(|surface| surface.configured)
+        {
+            return;
+        }
+        if let Some(preset) = self
+            .renderer
+            .context()
+            .settings
+            .as_ref()
+            .map(|s| s.wallpaper)
+        {
+            self.present_surface(
+                SurfaceKind::Wallpaper,
+                &veilshell_render::build_wallpaper(preset),
+                false,
+            );
+        }
     }
 
     pub(crate) fn draw_overlay(&mut self) {
@@ -1039,9 +1138,14 @@ impl LayerApp {
                 eprintln!("veilshell: Wayland GPU failed for {kind:?} ({err}); using sdf-software");
                 // Tear down swapchains before dropping the device. Already committed buffers
                 // may remain visible; future draws on all surfaces use wl_shm.
-                for surface in [&mut self.pill, &mut self.top_strip, &mut self.overlay]
-                    .into_iter()
-                    .flatten()
+                for surface in [
+                    &mut self.pill,
+                    &mut self.top_strip,
+                    &mut self.overlay,
+                    &mut self.wallpaper,
+                ]
+                .into_iter()
+                .flatten()
                 {
                     surface.gpu_surface = None;
                 }
@@ -1068,6 +1172,7 @@ impl LayerApp {
         animate: bool,
     ) -> Result<bool, String> {
         let surface = match kind {
+            SurfaceKind::Wallpaper => self.wallpaper.as_mut(),
             SurfaceKind::Pill => self.pill.as_mut(),
             SurfaceKind::TopStrip => self.top_strip.as_mut(),
             SurfaceKind::Overlay => self.overlay.as_mut(),
@@ -1105,12 +1210,16 @@ impl LayerApp {
         {
             Some(SurfaceKind::Overlay)
         } else {
-            None
+            self.wallpaper
+                .as_ref()
+                .filter(|s| s.layer.wl_surface() == surface)
+                .map(|_| SurfaceKind::Wallpaper)
         }
     }
 
     fn managed_surface_mut(&mut self, kind: SurfaceKind) -> Option<&mut ManagedSurface> {
         match kind {
+            SurfaceKind::Wallpaper => self.wallpaper.as_mut(),
             SurfaceKind::Pill => self.pill.as_mut(),
             SurfaceKind::TopStrip => self.top_strip.as_mut(),
             SurfaceKind::Overlay => self.overlay.as_mut(),
@@ -1119,6 +1228,7 @@ impl LayerApp {
 
     fn draw_surface(&mut self, kind: SurfaceKind) {
         match kind {
+            SurfaceKind::Wallpaper => self.draw_wallpaper(),
             SurfaceKind::Pill => self.draw_pill(),
             SurfaceKind::TopStrip => self.draw_top_strip(),
             SurfaceKind::Overlay => self.draw_overlay(),
@@ -1139,6 +1249,7 @@ impl LayerApp {
     #[cfg(feature = "wgpu")]
     fn swapchain_retries(&self) -> impl Iterator<Item = (SurfaceKind, Instant)> + '_ {
         [
+            (SurfaceKind::Wallpaper, &self.wallpaper),
             (SurfaceKind::Pill, &self.pill),
             (SurfaceKind::TopStrip, &self.top_strip),
             (SurfaceKind::Overlay, &self.overlay),
@@ -1244,6 +1355,13 @@ impl LayerApp {
                     width: self.viewport_w,
                     height: self.viewport_h,
                     renderer: self.renderer.backend_label(),
+                    standalone_layout: self.renderer.context().power_menu.as_ref().map(|_| {
+                        if self.in_desk_mode() {
+                            "Desk"
+                        } else {
+                            "Tablet"
+                        }
+                    }),
                 });
             }
             DaemonCommand::Custom { cmd, reply } => {
@@ -1285,6 +1403,7 @@ impl LayerApp {
         let handle = match kind {
             SurfaceKind::Pill => self.pill.as_ref().map(|s| (EdgeHandle::Bottom, s)),
             SurfaceKind::TopStrip => self.top_strip.as_ref().map(|s| (EdgeHandle::Top, s)),
+            SurfaceKind::Wallpaper => return,
             SurfaceKind::Overlay => None,
         };
         let handle_tap_allowed =
@@ -1412,7 +1531,7 @@ impl LayerApp {
                         Some(SceneKind::Home),
                     ))
                 }
-                (SurfaceKind::TopStrip, SceneKind::Pill) if dy > 0.0 => {
+                (SurfaceKind::TopStrip, SceneKind::Pill) if dy > 0.0 && !self.uses_desk_panel() => {
                     return Some((
                         DragMotion::edge_reveal(shade_reveal_travel(h), 1.0),
                         Some(SceneKind::Shade),
@@ -1647,6 +1766,7 @@ impl LayerApp {
         }
 
         match surface {
+            SurfaceKind::Wallpaper => {}
             SurfaceKind::Pill => {
                 self.renderer.context_mut().pill_drag_x = x - start_x;
                 self.renderer.context_mut().pill_drag_y = y - start_y;
@@ -1712,6 +1832,7 @@ impl LayerApp {
         let dist = dx.hypot(dy);
 
         match drag.surface {
+            SurfaceKind::Wallpaper => {}
             SurfaceKind::Pill => {
                 if handle_tap(drag.handle_tap_allowed, drag.max_travel) {
                     let scene = if self.active_scene == SceneKind::Pill {
@@ -1757,7 +1878,9 @@ impl LayerApp {
                 }
             }
             SurfaceKind::TopStrip => {
-                if handle_tap(drag.handle_tap_allowed, drag.max_travel) {
+                if self.uses_desk_panel() {
+                    self.finish_desk_panel_tap(&drag);
+                } else if handle_tap(drag.handle_tap_allowed, drag.max_travel) {
                     self.show_scene(SceneKind::Shade, true);
                 } else {
                     self.draw_top_strip();
@@ -1844,6 +1967,26 @@ impl LayerApp {
         }
     }
 
+    fn finish_desk_panel_tap(&mut self, drag: &ActiveDrag) {
+        if !handle_tap(true, drag.max_travel) {
+            return;
+        }
+        let Some(panel) = &self.top_strip else { return };
+        for action in veilshell_render::desk_panel_actions(panel.width as f32) {
+            if action.bounds.contains(drag.start_x, drag.start_y)
+                && action.bounds.contains(drag.last_x, drag.last_y)
+            {
+                let scene = if self.active_scene == action.scene {
+                    SceneKind::Pill
+                } else {
+                    action.scene
+                };
+                self.show_scene(scene, false);
+                break;
+            }
+        }
+    }
+
     fn handle_overlay_tap(&mut self, x: f32, y: f32) {
         if !self.overlay_input_ready() {
             return;
@@ -1882,13 +2025,33 @@ impl LayerApp {
             HitTarget::ShadeToggle { id } => {
                 self.handler
                     .on_action(ShellAction::ToggleSetting(id), self.renderer.context_mut());
+                if id == "desk_mode" {
+                    self.sync_surfaces();
+                    self.draw_top_strip();
+                }
                 if id == "tablet_mode" && !self.renderer.context().tablet_mode {
                     self.set_visible(false);
                 } else {
                     self.draw_overlay();
                 }
             }
+            HitTarget::ShadeAction(ShadeAction::Settings) => {
+                self.show_scene(SceneKind::Settings, false);
+            }
             HitTarget::ShadeAction(action) => self.apply_shade_action(action),
+            HitTarget::Settings(veilshell_render::SettingsAction::Back) => {
+                self.show_scene(SceneKind::Shade, false);
+            }
+            HitTarget::Settings(action) => {
+                self.handler
+                    .on_action(ShellAction::Settings(action), self.renderer.context_mut());
+                self.sync_surfaces();
+                if action == veilshell_render::SettingsAction::Wallpaper {
+                    self.draw_wallpaper();
+                }
+                self.draw_top_strip();
+                self.draw_overlay();
+            }
             HitTarget::ShadeSlider { id, rect } => {
                 let pct = slider_pct_for_y(y, rect);
                 self.handler.on_action(
@@ -2164,6 +2327,7 @@ pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
         pill: None,
         top_strip: None,
         overlay: None,
+        wallpaper: None,
         overlay_layout: None,
         overlay_spring: settled_spring,
         home_spring: None,
@@ -2420,6 +2584,7 @@ impl LayerShellHandler for LayerApp {
         match self.surface_kind(layer.wl_surface()) {
             Some(SurfaceKind::Overlay) => self.show_scene(SceneKind::Pill, false),
             Some(SurfaceKind::Pill) => self.exit = true,
+            Some(SurfaceKind::Wallpaper) => self.wallpaper = None,
             Some(SurfaceKind::TopStrip) | None => {}
         }
     }
@@ -2464,6 +2629,7 @@ impl LayerShellHandler for LayerApp {
         }
 
         match kind {
+            SurfaceKind::Wallpaper => self.draw_wallpaper(),
             SurfaceKind::Pill => {
                 if resized
                     && self
@@ -2755,14 +2921,17 @@ mod tests {
     #[test]
     fn keyboard_button_only_adds_a_disjoint_region_to_the_resting_bottom_pill() {
         for w in [640, 960] {
-            let [pill, keyboard] = EdgeHandle::Bottom.input_rects((w, 48), true);
+            let [pill, keyboard, _] = EdgeHandle::Bottom.input_rects((w, 48), true);
             let keyboard = keyboard.unwrap();
             let RegionRect(x, y, width, _) = keyboard;
             let RegionRect(left, _, pill_width, _) = pill.unwrap();
             assert!(x > left + pill_width);
             assert!(x + width < i32::try_from(w).unwrap());
             assert!(keyboard.contains((x + 22) as f32, (y + 22) as f32));
-            assert_eq!(EdgeHandle::Bottom.input_rects((w, 48), false), [pill, None]);
+            assert_eq!(
+                EdgeHandle::Bottom.input_rects((w, 48), false),
+                [pill, None, None]
+            );
             assert!(EdgeHandle::Top.input_rects((w, 48), true)[1].is_none());
         }
     }

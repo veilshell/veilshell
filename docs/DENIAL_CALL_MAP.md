@@ -67,6 +67,22 @@ binding must not take precedence over a personal resize binding.
 See the [standalone keybinding profile](../adapters/session/README.md#optional-omarchy-style-keybindings)
 for the exact supported chords, overrides, and dependencies.
 
+## Out-of-box gap map
+
+The baseline is what Denial actually ships at the pin, not every item in
+its ecosystem. A control delegated to Omarchy in overlay mode is not
+available out of the box in standalone VeilShell.
+
+| Denial surface or component | Denial default and call boundary | VeilShell standalone gap / next check |
+|---|---|---|
+| Mobile liquid navigation pill | [Mobile controller][controller] handles Home, Back, Recents and input routing; visual pill deforms with drag. | **Partial:** finger-following Home/Shade and Recents, reverse/cancel, manual app OSK. Missing the liquid morph and app Back routing. Check opt-in and cancel without swallowing touches outside the handle. |
+| Desktop top-bar pills | [Top Bar][topbar] provides `ShellSurface.place` and `ShellWorkArea.reserve`; `DesktopSystemBar` gets workspace, telemetry, tray, media and Dashboard actions from injected services. Output/edge selection and fullscreen visibility are separate from reservation. | **First slice:** Apps, Recents, Controls and a wide-layout clock; standalone only. Missing interactive workspace pill, media/battery/CPU/GPU pills, tray, pill transitions and configurable edge/outputs. Test app fullscreen and multi-output reservation before claiming parity. |
+| Dashboard and taskbar | Desktop shell composes its window and panel surfaces; top-bar clock opens Dashboard, with system actions and state supplied by the service interfaces. | **Missing:** the Recents button and Quick Settings are not a running-app taskbar or desktop Dashboard. Next: running-app/workspace pills with focus, then a desktop controls surface with notifications and media. |
+| Built-in plugins | [Default manifest][builtins] enables Desktop, Top Bar, Launcher, Clock and Pets. Clock can provide a widget; Pets adds a separate surface/behavior. | **Partial:** Rust shell and built-in panel/launcher, no replaceable composition, mobile Home clock widget/pet slots or third-party capabilities. Implement first-party modules independently; do not equate built-in pills with plugin support. Pets is lower priority than Settings and session services. |
+| Plugin selection and manager | [Plugin contract][plugins]: discover packages, resolve providers/dependencies, generate a composition, build and activate one AOT shell. Not a runtime loader. | **Missing by design so far:** no plugin manager or public SDK. Keep typed internal capabilities first; only consider public extension contracts after a second live compositor validates the boundary. Do not load Denial Dart plugins or arbitrary shared objects. |
+| Shipped Settings and Welcome | [Settings package][settings] includes a separate GPUI app (from pinned `denial-apps`), Settings and Welcome `.desktop` entries, and selected polkit integration. Settings reads/writes native state; Welcome is the same executable with `--welcome`. | **Partial:** built-in standalone Settings opens from Quick Settings or a shortcut. Startup mode and shortcut profile apply at next login; panel visibility and built-in wallpaper apply live. No Welcome, photo picker, independent Settings app or full display/input, connectivity and power pages. |
+| Everyday services | Denial includes desktop notification routes, backend discovery and portal integration; system privileges still belong to OS services. | **Partial/missing:** stand-alone network reconnect, paired-device connect, audio and power work where supported. New Wi-Fi/Bluetooth setup, actionable notifications and history, portal/file-picker/screencast and polkit prompts still need fresh-session checks. |
+
 [denial]: https://github.com/denialwm/denial/tree/01b588e
 [startup]: https://github.com/denialwm/denial/blob/01b588e/docs/SESSION_STARTUP.md
 [home]: https://github.com/denialwm/denial/blob/01b588e/plugins/denial_desktop/lib/src/launcher/home_launch.dart
@@ -82,3 +98,7 @@ for the exact supported chords, overrides, and dependencies.
 [native]: https://github.com/denialwm/denial/blob/01b588e/compositor/src/bin/deniald/native_shortcut.rs
 [launcher-ui]: https://github.com/denialwm/denial/blob/01b588e/plugins/denial_launcher/lib/src/desktop_application_launcher.dart
 [shortcut-actions]: https://github.com/denialwm/denial/blob/01b588e/packages/denial_flutter_sdk/lib/src/models/shortcut_configuration.dart
+[topbar]: https://github.com/denialwm/denial/blob/01b588e/plugins/denial_top_bar/lib/denial_top_bar.dart
+[builtins]: https://github.com/denialwm/denial/blob/01b588e/plugins/builtins.yaml
+[plugins]: https://github.com/denialwm/denial/blob/01b588e/docs/PLUGIN_SYSTEM.md
+[settings]: https://github.com/denialwm/denial/blob/01b588e/settings/README.md
