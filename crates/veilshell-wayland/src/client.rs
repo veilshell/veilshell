@@ -12,7 +12,7 @@ use smithay_client_toolkit::reexports::calloop::{EventLoop, LoopHandle};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::{
-    wl_output, wl_pointer, wl_seat, wl_shm, wl_surface, wl_touch,
+    wl_callback, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface, wl_touch,
 };
 use smithay_client_toolkit::reexports::client::{Connection, Proxy, QueueHandle};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
@@ -33,8 +33,6 @@ use veilshell_core::{
     OskState, Spring, SpringParams, ThemePalette,
 };
 use veilshell_render::power::{PowerAction, PowerInput, PowerMenu};
-#[cfg(feature = "wgpu")]
-use veilshell_render::SdfSoftwareRenderer;
 use veilshell_render::{
     build_scene, build_scene_layout, build_top_strip_scene, home_page_count, home_reveal_travel,
     recents_stride, shade_reveal_travel, ActiveRenderer, DrawList, HitTarget, SceneContext,
@@ -43,7 +41,7 @@ use veilshell_render::{
 
 use crate::capture::ToplevelCaptureState;
 #[cfg(feature = "wgpu")]
-use crate::gpu::WgpuWaylandSurface;
+use crate::gpu::{gpu_attempt, init_renderer, WgpuWaylandSurface};
 use crate::motion::{horizontal, slider_pct_for_y, vertical, DragMotion, DragVelocity, SliderDrag};
 use crate::osk::{OskRepeat, OskWaylandState};
 use crate::scale::{FractionalScaleGlobals, SurfaceFrame, SurfaceScaling};
@@ -200,13 +198,14 @@ struct ManagedSurface {
     layer: LayerSurface,
     pool: Option<SlotPool>,
     #[cfg(feature = "wgpu")]
-    shm_fallback: Option<Box<SdfSoftwareRenderer>>,
-    #[cfg(feature = "wgpu")]
     retry_at: Option<Instant>,
+    #[cfg(feature = "wgpu")]
+    initial_acquire_timeouts: Option<u8>,
     // Layer configure sizes and all layout/input coordinates are logical.
     width: u32,
     height: u32,
     configured: bool,
+    callback_queued: Option<wl_callback::WlCallback>,
     frame_pending: bool,
     redraw_pending: bool,
 }
@@ -277,32 +276,20 @@ impl ManagedSurface {
         );
         layer.commit();
 
-        #[cfg(feature = "wgpu")]
-        let gpu_surface = app.renderer.as_wgpu().and_then(|gpu| {
-            match WgpuWaylandSurface::create(gpu.instance(), &app.conn, layer.wl_surface()) {
-                Ok(surf) => Some(surf),
-                Err(err) => {
-                    eprintln!(
-                        "veilshell: wgpu surface creation failed ({err}); using wl_shm for {role:?}"
-                    );
-                    None
-                }
-            }
-        });
-
         Self {
             #[cfg(feature = "wgpu")]
-            gpu_surface,
+            gpu_surface: None,
             scaling,
             layer,
             pool: None,
             #[cfg(feature = "wgpu")]
-            shm_fallback: None,
-            #[cfg(feature = "wgpu")]
             retry_at: None,
+            #[cfg(feature = "wgpu")]
+            initial_acquire_timeouts: Some(0),
             width: spec.width,
             height: spec.height,
             configured: false,
+            callback_queued: None,
             frame_pending: false,
             redraw_pending: false,
         }
@@ -315,9 +302,10 @@ impl ManagedSurface {
         renderer: &mut ActiveRenderer,
         list: &DrawList,
         request_frame_callback: bool,
-    ) -> bool {
+        #[cfg(feature = "wgpu")] conn: &Connection,
+    ) -> Result<bool, String> {
         if !self.configured {
-            return false;
+            return Ok(false);
         }
         #[cfg(feature = "wgpu")]
         {
@@ -328,37 +316,47 @@ impl ManagedSurface {
                 "veilshell: invalid buffer size for {}x{} surface",
                 self.width, self.height
             );
-            return false;
+            return Ok(false);
         };
 
         #[cfg(feature = "wgpu")]
-        if let (Some(gpu_surf), Some(gpu_renderer)) =
-            (self.gpu_surface.as_mut(), renderer.as_wgpu_mut())
-        {
+        if let Some(gpu_renderer) = renderer.as_wgpu_mut() {
             let surface = self.layer.wl_surface();
+            let gpu_surface = match &mut self.gpu_surface {
+                Some(surface) => surface,
+                slot @ None => slot.insert(gpu_attempt(
+                    "Wayland GPU surface creation panicked",
+                    || WgpuWaylandSurface::create(gpu_renderer.instance(), conn, surface),
+                )?),
+            };
             let scaling = &mut self.scaling;
-            match gpu_surf.present_draw_list(gpu_renderer, frame.target, list, || {
-                scaling.apply(surface, frame);
-                if request_frame_callback {
-                    surface.frame(qh, FrameCallbackData(surface.clone()));
+            let callback_queued = &mut self.callback_queued;
+            let presented = gpu_attempt("Wayland GPU presentation panicked", || {
+                gpu_surface.present_draw_list(gpu_renderer, frame.target, list, || {
+                    scaling.apply(surface, frame);
+                    if request_frame_callback {
+                        *callback_queued =
+                            Some(surface.frame(qh, FrameCallbackData(surface.clone())));
+                    }
+                })
+            })?;
+            if presented {
+                self.callback_queued = None;
+                self.initial_acquire_timeouts = None;
+            } else {
+                if let Some(timeouts) = &mut self.initial_acquire_timeouts {
+                    *timeouts += 1;
+                    if *timeouts >= 3 {
+                        return Err("wgpu timed out acquiring the first Wayland buffer".to_owned());
+                    }
                 }
-            }) {
-                Ok(true) => return true,
-                Ok(false) => {
-                    // A timeout committed nothing and cannot produce a callback.
-                    self.retry_at = Some(Instant::now() + Duration::from_millis(16));
-                    return false;
-                }
-                Err(err) => {
-                    eprintln!(
-                        "veilshell: wgpu present failed ({err}); falling back to wl_shm for this surface"
-                    );
-                    self.gpu_surface = None;
-                }
+                // A timeout committed nothing and cannot produce a callback.
+                self.retry_at = Some(Instant::now() + Duration::from_millis(16));
             }
+            return Ok(presented);
         }
 
-        self.present_shm_draw_list(qh, shm, renderer, list, frame, request_frame_callback)
+        Ok(self.present_shm_draw_list(qh, shm, renderer, list, frame, request_frame_callback))
     }
 
     fn present_shm_draw_list(
@@ -388,19 +386,7 @@ impl ManagedSurface {
             return false;
         };
 
-        // If this surface cannot use a swapchain, avoid GPU readback and
-        // any dependency on the GPU's maximum renderable dimensions.
-        #[cfg(feature = "wgpu")]
-        let rasterized = if renderer.as_wgpu().is_some() {
-            self.shm_fallback
-                .get_or_insert_with(Box::default)
-                .rasterize_scaled(frame.target, list)
-        } else {
-            renderer.rasterize_scaled(frame.target, list)
-        };
-        #[cfg(not(feature = "wgpu"))]
-        let rasterized = renderer.rasterize_scaled(frame.target, list);
-        let pixels = match rasterized {
+        let pixels = match renderer.rasterize_scaled(frame.target, list) {
             Ok(pixels) => pixels,
             Err(err) => {
                 eprintln!("veilshell: rasterize failed: {err}");
@@ -433,7 +419,9 @@ impl ManagedSurface {
                 i32::try_from(self.height).unwrap_or(i32::MAX),
             );
         }
-        if request_frame_callback {
+        // A failed WSI present may already have queued this for the next commit.
+        let callback_queued = std::mem::take(&mut self.callback_queued);
+        if request_frame_callback && callback_queued.is_none() {
             surface.frame(qh, FrameCallbackData(surface.clone()));
         }
         surface.commit();
@@ -480,6 +468,9 @@ pub(crate) struct LayerApp {
     last_anim_tick: Instant,
     palette: ThemePalette,
     pub(crate) renderer: ActiveRenderer,
+    #[cfg(feature = "wgpu")]
+    renderer_preference: veilshell_render::RendererPreference,
+    render_failure: Option<String>,
     pointer: Option<wl_pointer::WlPointer>,
     touch: Option<wl_touch::WlTouch>,
     drag: Option<ActiveDrag>,
@@ -630,7 +621,7 @@ impl LayerApp {
             &self.palette,
             self.renderer.context(),
         );
-        surf.present_draw_list(&self.qh, &self.shm, &mut self.renderer, &list, false);
+        self.present_surface(SurfaceKind::Pill, &list, false);
     }
 
     fn draw_top_strip(&mut self) {
@@ -646,7 +637,7 @@ impl LayerApp {
             &self.palette,
             self.renderer.context().top_drag_y,
         );
-        surf.present_draw_list(&self.qh, &self.shm, &mut self.renderer, &list, false);
+        self.present_surface(SurfaceKind::TopStrip, &list, false);
     }
 
     pub(crate) fn draw_overlay(&mut self) {
@@ -687,16 +678,69 @@ impl LayerApp {
         let animating = !self.overlay_spring.is_settled()
             || self.home_spring.is_some()
             || self.drag.as_ref().is_some_and(|drag| drag.motion.is_some());
-        if surf.present_draw_list(
-            &self.qh,
-            &self.shm,
-            &mut self.renderer,
-            &layout.draw_list,
-            animating,
-        ) {
-            surf.frame_pending = animating;
+        if self.present_surface(SurfaceKind::Overlay, &layout.draw_list, animating) {
+            if let Some(surf) = &mut self.overlay {
+                surf.frame_pending = animating;
+            }
             self.overlay_layout = Some(layout);
         }
+    }
+
+    fn present_surface(&mut self, kind: SurfaceKind, list: &DrawList, animate: bool) -> bool {
+        if self.render_failure.is_some() {
+            return false;
+        }
+        match self.try_present_surface(kind, list, animate) {
+            Ok(presented) => presented,
+            #[cfg(feature = "wgpu")]
+            Err(err) if self.renderer_preference == veilshell_render::RendererPreference::Auto => {
+                eprintln!("veilshell: Wayland GPU failed for {kind:?} ({err}); using sdf-software");
+                // Tear down swapchains before dropping the device. Already committed buffers
+                // may remain visible; future draws on all surfaces use wl_shm.
+                for surface in [&mut self.pill, &mut self.top_strip, &mut self.overlay]
+                    .into_iter()
+                    .flatten()
+                {
+                    surface.gpu_surface = None;
+                }
+                self.renderer = ActiveRenderer::Software(Box::new(
+                    veilshell_render::SdfSoftwareRenderer::with_context(std::mem::take(
+                        self.renderer.context_mut(),
+                    )),
+                ));
+                self.try_present_surface(kind, list, animate)
+                    .unwrap_or(false)
+            }
+            Err(err) => {
+                self.render_failure = Some(format!("Wayland GPU failed for {kind:?}: {err}"));
+                self.exit = true;
+                false
+            }
+        }
+    }
+
+    fn try_present_surface(
+        &mut self,
+        kind: SurfaceKind,
+        list: &DrawList,
+        animate: bool,
+    ) -> Result<bool, String> {
+        let surface = match kind {
+            SurfaceKind::Pill => self.pill.as_mut(),
+            SurfaceKind::TopStrip => self.top_strip.as_mut(),
+            SurfaceKind::Overlay => self.overlay.as_mut(),
+        };
+        surface.map_or(Ok(false), |surf| {
+            surf.present_draw_list(
+                &self.qh,
+                &self.shm,
+                &mut self.renderer,
+                list,
+                animate,
+                #[cfg(feature = "wgpu")]
+                &self.conn,
+            )
+        })
     }
 
     fn surface_kind(&self, surface: &wl_surface::WlSurface) -> Option<SurfaceKind> {
@@ -1567,7 +1611,7 @@ pub fn run_layer_surface(
 ///
 /// # Errors
 /// Returns [`WaylandError`] if connecting to `Wayland`, binding required globals, or selecting the
-/// requested output fails.
+/// requested output fails, or if the explicitly requested GPU renderer cannot present.
 #[allow(clippy::too_many_lines)]
 pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
     config: &WaylandRuntimeConfig,
@@ -1593,8 +1637,14 @@ pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
         .map_err(|e| WaylandError::MissingGlobal(format!("wl_shm: {e}")))?;
 
     initial_ctx.overlay_progress = 1.0;
-    let mut renderer = ActiveRenderer::new(config.renderer, initial_ctx)
-        .map_err(|e| WaylandError::Runtime(format!("renderer init: {e}")))?;
+    #[cfg(feature = "wgpu")]
+    let renderer = init_renderer(config.renderer, initial_ctx, &conn, || {
+        compositor.create_surface(&qh).into()
+    });
+    #[cfg(not(feature = "wgpu"))]
+    let renderer = ActiveRenderer::new(config.renderer, initial_ctx);
+    let mut renderer =
+        renderer.map_err(|e| WaylandError::Runtime(format!("renderer init: {e}")))?;
     if let Some(wp) = &config.wallpaper {
         if let Err(err) = renderer.set_wallpaper(Some(wp)) {
             eprintln!("veilshell: failed to pre-blur wallpaper: {err}");
@@ -1629,6 +1679,9 @@ pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
         last_anim_tick: Instant::now(),
         palette,
         renderer,
+        #[cfg(feature = "wgpu")]
+        renderer_preference: config.renderer,
+        render_failure: None,
         pointer: None,
         touch: None,
         drag: None,
@@ -1732,7 +1785,8 @@ pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
     app.top_strip = None;
     app.pill = None;
 
-    Ok(())
+    app.render_failure
+        .map_or(Ok(()), |err| Err(WaylandError::Runtime(err)))
 }
 
 impl CompositorHandler for LayerApp {

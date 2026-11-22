@@ -379,9 +379,34 @@ impl WgpuRenderer {
     ///
     /// # Errors
     /// Returns [`RenderError::Gpu`] if no compatible GPU adapter or device can be created.
-    #[allow(clippy::too_many_lines)]
     pub fn with_context(context: SceneContext) -> Result<Self, RenderError> {
         let (instance, adapter) = create_instance_and_adapter()?;
+        Self::with_adapter(instance, adapter, context)
+    }
+
+    /// Initialize a renderer using an adapter compatible with an existing presentation surface.
+    ///
+    /// Create the surface before selecting an adapter: GLES can replace its EGL context when
+    /// first given the native display, invalidating adapters obtained before then.
+    ///
+    /// # Errors
+    /// Returns [`RenderError::Gpu`] if no eligible adapter or device can be created.
+    pub fn with_surface(
+        instance: wgpu::Instance,
+        surface: &wgpu::Surface<'_>,
+        context: SceneContext,
+        hardware_only: bool,
+    ) -> Result<Self, RenderError> {
+        let adapter = request_best_adapter(&instance, Some(surface), hardware_only)?;
+        Self::with_adapter(instance, adapter, context)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn with_adapter(
+        instance: wgpu::Instance,
+        adapter: wgpu::Adapter,
+        context: SceneContext,
+    ) -> Result<Self, RenderError> {
         let info = adapter.get_info();
         let adapter_summary = format!("{} ({:?}, {:?})", info.name, info.backend, info.device_type);
 
@@ -1219,7 +1244,7 @@ fn create_instance_and_adapter() -> Result<(wgpu::Instance, wgpu::Adapter), Rend
             backends: env_backends,
             ..Default::default()
         });
-        let adapter = request_best_adapter(&instance)?;
+        let adapter = request_best_adapter(&instance, None, false)?;
         return Ok((instance, adapter));
     }
 
@@ -1230,7 +1255,7 @@ fn create_instance_and_adapter() -> Result<(wgpu::Instance, wgpu::Adapter), Rend
         backends: wgpu::Backends::VULKAN,
         ..Default::default()
     });
-    match request_best_adapter(&vk_instance) {
+    match request_best_adapter(&vk_instance, None, false) {
         Ok(adapter) => Ok((vk_instance, adapter)),
         Err(vk_err) => {
             if std::env::var_os("WAYLAND_DISPLAY").is_some()
@@ -1242,7 +1267,7 @@ fn create_instance_and_adapter() -> Result<(wgpu::Instance, wgpu::Adapter), Rend
                 backends: wgpu::Backends::GL,
                 ..Default::default()
             });
-            match request_best_adapter(&gl_instance) {
+            match request_best_adapter(&gl_instance, None, false) {
                 Ok(adapter) => Ok((gl_instance, adapter)),
                 Err(gl_err) => Err(RenderError::Gpu(format!(
                     "{vk_err}; GLES fallback also failed: {gl_err}"
@@ -1252,36 +1277,49 @@ fn create_instance_and_adapter() -> Result<(wgpu::Instance, wgpu::Adapter), Rend
     }
 }
 
-fn request_best_adapter(instance: &wgpu::Instance) -> Result<wgpu::Adapter, RenderError> {
+fn request_best_adapter(
+    instance: &wgpu::Instance,
+    compatible_surface: Option<&wgpu::Surface<'_>>,
+    hardware_only: bool,
+) -> Result<wgpu::Adapter, RenderError> {
     let attempts = [
         wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::LowPower,
-            compatible_surface: None,
+            compatible_surface,
             force_fallback_adapter: false,
         },
         wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
+            compatible_surface,
             force_fallback_adapter: false,
         },
         wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::None,
-            compatible_surface: None,
+            compatible_surface,
             force_fallback_adapter: true,
         },
     ];
 
     let mut last_err = None;
-    for opts in &attempts {
+    for opts in attempts
+        .iter()
+        .filter(|opts| !hardware_only || !opts.force_fallback_adapter)
+    {
         match pollster::block_on(instance.request_adapter(opts)) {
+            Ok(adapter)
+                if hardware_only && adapter.get_info().device_type == wgpu::DeviceType::Cpu =>
+            {
+                last_err = Some("only a CPU adapter was selected".to_owned());
+            }
             Ok(adapter) => return Ok(adapter),
-            Err(err) => last_err = Some(err),
+            Err(err) if last_err.is_none() => last_err = Some(err.to_string()),
+            Err(_) => {}
         }
     }
 
     Err(RenderError::Gpu(format!(
         "no compatible Vulkan/GLES adapter found: {}",
-        last_err.map_or_else(|| "unknown error".to_owned(), |e| e.to_string())
+        last_err.as_deref().unwrap_or("unknown error")
     )))
 }
 

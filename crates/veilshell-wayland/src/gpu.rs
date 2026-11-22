@@ -6,6 +6,7 @@
 //! drops `gpu_surface` before `layer`) and `LayerApp` (which keeps `conn` alive until after all
 //! surfaces are dropped).
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::NonNull;
 
 use raw_window_handle::{
@@ -13,7 +14,182 @@ use raw_window_handle::{
 };
 use smithay_client_toolkit::reexports::client::protocol::wl_surface;
 use smithay_client_toolkit::reexports::client::{Connection, Proxy};
-use veilshell_render::{DrawList, RenderTarget, WgpuRenderer};
+use veilshell_render::{
+    ActiveRenderer, DrawList, RenderTarget, RendererPreference, SceneContext, WgpuRenderer,
+};
+
+/// Turn a panicking GPU driver/HAL call into the same failure path as a returned WSI error.
+/// After such a panic, the caller must stop using the backend rather than try it again.
+pub(crate) fn gpu_attempt<T>(
+    stage: &str,
+    attempt: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    catch_unwind(AssertUnwindSafe(attempt)).map_err(|panic| {
+        let reason = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("unknown panic payload");
+        format!("{stage}: {reason}")
+    })?
+}
+
+/// Select a backend against this Wayland connection, not a headless adapter.
+pub(crate) fn init_renderer(
+    preference: RendererPreference,
+    context: SceneContext,
+    conn: &Connection,
+    probe: impl FnOnce() -> smithay_client_toolkit::compositor::Surface,
+) -> Result<ActiveRenderer, String> {
+    select_renderer(preference, context, |context| {
+        let probe = probe();
+        let enabled = wgpu::Backends::from_env()
+            .filter(|b| !b.is_empty())
+            .unwrap_or_else(|| {
+                // wgpu-hal 26 probes X11 even when targeting Wayland. XOpenDisplay can
+                // block on lazy XWayland during session startup; keep GLES opt-in there.
+                if std::env::var_os("DISPLAY").is_some() {
+                    wgpu::Backends::VULKAN
+                } else {
+                    wgpu::Backends::VULKAN | wgpu::Backends::GL
+                }
+            });
+        try_backends(enabled, |backend| {
+            gpu_attempt("Wayland GPU initialization panicked", || {
+                let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                    backends: backend,
+                    ..Default::default()
+                });
+                let surface = WgpuWaylandSurface::create(&instance, conn, probe.wl_surface())?;
+                WgpuRenderer::with_surface(
+                    instance,
+                    &surface.surface,
+                    context.clone(),
+                    preference == RendererPreference::Auto,
+                )
+                .map_err(|err| err.to_string())
+            })
+        })
+    })
+}
+
+fn select_renderer(
+    preference: RendererPreference,
+    context: SceneContext,
+    try_gpu: impl FnOnce(&SceneContext) -> Result<WgpuRenderer, String>,
+) -> Result<ActiveRenderer, String> {
+    if preference != RendererPreference::Software {
+        match try_gpu(&context) {
+            Ok(renderer) => return Ok(ActiveRenderer::Wgpu(Box::new(renderer))),
+            Err(err) if preference == RendererPreference::Wgpu => return Err(err),
+            Err(err) => eprintln!("veilshell: Wayland GPU unavailable ({err}); using sdf-software"),
+        }
+    }
+    ActiveRenderer::new(RendererPreference::Software, context).map_err(|err| err.to_string())
+}
+
+fn try_backends<T>(
+    enabled: wgpu::Backends,
+    mut attempt: impl FnMut(wgpu::Backends) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut errors = Vec::new();
+    // Do not initialize GLES at all when Vulkan works. Separate instances also prevent GLES
+    // surface creation from running when an explicit override enables both backends.
+    for (backend, name) in [
+        (wgpu::Backends::VULKAN, "Vulkan"),
+        (wgpu::Backends::GL, "GLES"),
+    ] {
+        if enabled.contains(backend) {
+            match attempt(backend) {
+                Ok(renderer) => return Ok(renderer),
+                Err(err) => errors.push(format!("{name}: {err}")),
+            }
+        }
+    }
+    if errors.is_empty() {
+        return Err(format!("no supported Wayland GPU backend in {enabled:?}"));
+    }
+    Err(errors.join("; "))
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::{gpu_attempt, select_renderer, try_backends};
+    use veilshell_render::{RendererPreference, SceneContext};
+    use wgpu::Backends;
+
+    #[test]
+    fn tries_vulkan_first_then_gles_and_honors_override() {
+        let mut tried = Vec::new();
+        let result = try_backends(Backends::VULKAN | Backends::GL, |backend| {
+            tried.push(backend);
+            Err::<(), _>("unavailable".to_owned())
+        });
+        assert_eq!(tried, [Backends::VULKAN, Backends::GL]);
+        assert_eq!(
+            result.unwrap_err(),
+            "Vulkan: unavailable; GLES: unavailable"
+        );
+
+        let result = try_backends(Backends::GL, Ok);
+        assert_eq!(result.unwrap(), Backends::GL);
+
+        let result = try_backends(Backends::VULKAN | Backends::GL, |backend| {
+            assert_eq!(backend, Backends::VULKAN);
+            Ok(backend)
+        });
+        assert_eq!(result.unwrap(), Backends::VULKAN);
+    }
+
+    #[test]
+    fn recovers_from_hal_panics_as_well_as_returned_errors() {
+        assert_eq!(
+            gpu_attempt::<()>("surface creation", || panic!("BadDisplay")),
+            Err("surface creation: BadDisplay".to_owned())
+        );
+        assert_eq!(
+            gpu_attempt::<()>("presentation", || Err("surface lost".to_owned())),
+            Err("surface lost".to_owned())
+        );
+    }
+
+    #[test]
+    fn bad_display_falls_back_only_in_auto_mode() {
+        let bad_display =
+            |_: &SceneContext| gpu_attempt("surface creation", || panic!("BadDisplay"));
+        let software = select_renderer(
+            RendererPreference::Auto,
+            SceneContext {
+                home_page: 3,
+                ..SceneContext::default()
+            },
+            bad_display,
+        )
+        .unwrap();
+        assert_eq!(software.backend_label(), "sdf-software");
+        assert_eq!(software.context().home_page, 3);
+        assert_eq!(
+            select_renderer(
+                RendererPreference::Wgpu,
+                SceneContext::default(),
+                bad_display
+            )
+            .unwrap_err(),
+            "surface creation: BadDisplay"
+        );
+        assert_eq!(
+            select_renderer(
+                RendererPreference::Software,
+                SceneContext::default(),
+                |_| { panic!("software must not probe wgpu") }
+            )
+            .unwrap()
+            .backend_label(),
+            "sdf-software"
+        );
+    }
+}
 
 /// Zero-copy Vulkan/GLES `Wayland` swapchain bound to a single `wlr-layer-shell` `wl_surface`.
 pub(crate) struct WgpuWaylandSurface {
