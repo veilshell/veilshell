@@ -339,6 +339,13 @@ impl HyprlandBackend {
         Ok(response)
     }
 
+    fn dispatch_lua_or_legacy(&self, lua: &str, legacy: &str) -> Result<(), CompositorError> {
+        if self.eval_lua(lua).is_ok() {
+            return Ok(());
+        }
+        self.dispatch(legacy)
+    }
+
     fn dispatch(&self, cmd: &str) -> Result<(), CompositorError> {
         let reply = self.send_request(&format!("dispatch {cmd}"))?;
         if reply.trim() == "ok" {
@@ -477,11 +484,19 @@ impl CompositorBackend for HyprlandBackend {
     }
 
     fn focus_window(&mut self, id: &WindowId) -> Result<(), CompositorError> {
-        self.dispatch(&format!("focuswindow address:{}", id.0))
+        let escaped = lua_escape(&id.0);
+        self.dispatch_lua_or_legacy(
+            &format!("hl.dispatch(hl.dsp.focus({{ window = \"address:{escaped}\" }}))"),
+            &format!("focuswindow address:{}", id.0),
+        )
     }
 
     fn close_window(&mut self, id: &WindowId) -> Result<(), CompositorError> {
-        self.dispatch(&format!("closewindow address:{}", id.0))
+        let escaped = lua_escape(&id.0);
+        self.dispatch_lua_or_legacy(
+            &format!("hl.dispatch(hl.dsp.window.close({{ window = \"address:{escaped}\" }}))"),
+            &format!("closewindow address:{}", id.0),
+        )
     }
 
     fn list_outputs(&self) -> Result<Vec<OutputInfo>, CompositorError> {
@@ -546,15 +561,39 @@ impl CompositorBackend for HyprlandBackend {
 
     fn switch_workspace_relative(&mut self, delta: i32) -> Result<(), CompositorError> {
         match delta.cmp(&0) {
-            std::cmp::Ordering::Greater => self.dispatch("workspace e+1"),
-            std::cmp::Ordering::Less => self.dispatch("workspace e-1"),
+            std::cmp::Ordering::Greater => self.dispatch_lua_or_legacy(
+                "hl.dispatch(hl.dsp.focus({ workspace = \"e+1\" }))",
+                "workspace e+1",
+            ),
+            std::cmp::Ordering::Less => self.dispatch_lua_or_legacy(
+                "hl.dispatch(hl.dsp.focus({ workspace = \"e-1\" }))",
+                "workspace e-1",
+            ),
             std::cmp::Ordering::Equal => Ok(()),
         }
     }
 
     fn launch_command(&self, command: &str) -> Result<(), CompositorError> {
-        self.dispatch(&format!("exec {command}"))
+        let escaped = lua_escape(command);
+        self.dispatch_lua_or_legacy(
+            &format!("hl.dispatch(hl.dsp.exec_cmd(\"{escaped}\"))"),
+            &format!("exec {command}"),
+        )
     }
+}
+
+fn lua_escape(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -666,5 +705,13 @@ mod tests {
         assert_eq!(outputs[0].name, "HEADLESS-2");
         assert_eq!(outputs[0].orientation, Orientation::Rotate90);
         assert!((outputs[0].scale - 1.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn lua_escape_handles_quotes_and_backslashes() {
+        assert_eq!(
+            lua_escape("chromium --app=\"https://example.com\\path\""),
+            "chromium --app=\\\"https://example.com\\\\path\\\""
+        );
     }
 }
