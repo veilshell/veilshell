@@ -4,6 +4,8 @@
 pub mod font;
 #[cfg(feature = "wgpu")]
 pub mod gpu;
+mod launcher;
+pub use launcher::LauncherState;
 pub mod power;
 pub mod primitives;
 mod recents;
@@ -41,6 +43,7 @@ pub use software::SdfSoftwareRenderer;
 pub enum SceneKind {
     Pill,
     Home,
+    Launcher,
     Recents,
     Shade,
     Osk,
@@ -53,6 +56,7 @@ impl SceneKind {
         match raw.trim().to_ascii_lowercase().as_str() {
             "pill" => Some(Self::Pill),
             "home" => Some(Self::Home),
+            "launcher" => Some(Self::Launcher),
             "recents" => Some(Self::Recents),
             "shade" => Some(Self::Shade),
             "osk" => Some(Self::Osk),
@@ -66,6 +70,7 @@ impl SceneKind {
         match self {
             Self::Pill => "pill",
             Self::Home => "home",
+            Self::Launcher => "launcher",
             Self::Recents => "recents",
             Self::Shade => "shade",
             Self::Osk => "osk",

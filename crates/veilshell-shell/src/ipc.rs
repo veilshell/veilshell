@@ -97,7 +97,10 @@ fn handle_client(
     match verb {
         "show" => {
             let Some(scene_str) = parts.next() else {
-                let _ = writeln!(stream, "err usage: show <pill|home|recents|shade|osk>");
+                let _ = writeln!(
+                    stream,
+                    "err usage: show <pill|home|launcher|recents|shade|osk>"
+                );
                 return false;
             };
             let Some(scene) = SceneKind::parse_name(scene_str) else {

@@ -136,7 +136,9 @@ Mode, which simply hides VeilShell.
 - [ ] Touch Wi-Fi network selection and Bluetooth pairing, not just radio toggles.
 - [x] Keyboard hold-to-repeat for Backspace and arrows, and a terminal utility row with Escape, Tab and all four arrows.
 - [ ] Keyboard long-press accents and optional local suggestions that are disabled for sensitive fields.
-- [ ] Editable Home: reorder icons, create folders, persist layout, share a dock across pages, and open a separate alphabetical app drawer. Desktop launcher adds search, recents and physical-keyboard navigation.
+- [ ] Editable Home: reorder icons, create folders, persist layout, share a dock across pages, and open a separate alphabetical app drawer.
+- [x] Desktop launcher with search and physical-keyboard navigation, separate from Tablet Home.
+- [ ] Desktop launcher recent suggestions and pointer scrolling.
 
 ### External displays
 

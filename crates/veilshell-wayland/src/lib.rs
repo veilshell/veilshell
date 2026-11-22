@@ -23,6 +23,8 @@ pub enum LayerRole {
     TopStrip,
     /// Full-screen spring-animated app launcher grid.
     HomeGrid,
+    /// Keyboard-focused desktop application launcher.
+    DesktopLauncher,
     /// Horizontal recents card switcher.
     RecentsDeck,
     /// Top-pull quick settings and status shade.
@@ -38,6 +40,7 @@ impl LayerRole {
         match scene {
             veilshell_render::SceneKind::Pill => Self::BottomPill,
             veilshell_render::SceneKind::Home => Self::HomeGrid,
+            veilshell_render::SceneKind::Launcher => Self::DesktopLauncher,
             veilshell_render::SceneKind::Recents => Self::RecentsDeck,
             veilshell_render::SceneKind::Shade => Self::QuickSettings,
             veilshell_render::SceneKind::Osk => Self::TouchOsk,
@@ -52,6 +55,7 @@ impl LayerRole {
         match self {
             Self::BottomPill | Self::TopStrip => veilshell_render::SceneKind::Pill,
             Self::HomeGrid => veilshell_render::SceneKind::Home,
+            Self::DesktopLauncher => veilshell_render::SceneKind::Launcher,
             Self::RecentsDeck => veilshell_render::SceneKind::Recents,
             Self::QuickSettings => veilshell_render::SceneKind::Shade,
             Self::TouchOsk => veilshell_render::SceneKind::Osk,
@@ -150,7 +154,10 @@ impl LayerSurfaceSpec {
                     keyboard_interactivity: false,
                 }
             }
-            LayerRole::HomeGrid | LayerRole::RecentsDeck | LayerRole::QuickSettings => Self {
+            LayerRole::HomeGrid
+            | LayerRole::DesktopLauncher
+            | LayerRole::RecentsDeck
+            | LayerRole::QuickSettings => Self {
                 role,
                 anchor: Anchor::all(),
                 width: viewport_w,

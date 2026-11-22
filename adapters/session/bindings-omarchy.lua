@@ -5,7 +5,7 @@ local function command(keys, description, cmd, options)
     hl.bind(keys, hl.dsp.exec_cmd(cmd), options)
 end
 
-command("SUPER + SPACE", "VeilShell Home", "veilctl show home")
+command("SUPER + SPACE", "VeilShell app launcher", "veilctl show launcher")
 command("SUPER + CTRL + ALT + R", "VeilShell Recents", "veilctl show recents")
 command("SUPER + CTRL + ALT + S", "VeilShell Quick Settings", "veilctl show shade")
 command("SUPER + CTRL + L", "Lock session", "veilshell-session --lock")

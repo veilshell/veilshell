@@ -39,6 +39,7 @@ pub struct RecentsCard {
 #[derive(Clone, Debug, PartialEq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct SceneContext {
+    pub launcher: crate::LauncherState,
     pub clock_text: String,
     pub battery_pct: u8,
     pub wifi_connected: bool,
@@ -84,6 +85,7 @@ pub struct SceneContext {
 impl Default for SceneContext {
     fn default() -> Self {
         Self {
+            launcher: crate::LauncherState::default(),
             clock_text: "12:00".into(),
             battery_pct: 86,
             wifi_connected: true,
@@ -291,6 +293,9 @@ pub fn build_scene_layout(
     match scene {
         SceneKind::Pill => build_pill(&mut out, width, height, palette, ctx),
         SceneKind::Home => build_home(&mut out, width, height, palette, ctx),
+        SceneKind::Launcher => {
+            crate::launcher::build_launcher(&mut out, width, height, palette, ctx);
+        }
         SceneKind::Recents => build_recents(&mut out, width, height, palette, ctx),
         SceneKind::Shade => build_shade(&mut out, width, height, palette, ctx),
         SceneKind::Osk => build_osk(&mut out, width, height, palette, ctx),

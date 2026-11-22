@@ -56,7 +56,9 @@ and device quirk profiles live under [`hardware-profiles/`](hardware-profiles/mi
 
 ## Quick Start
 
-Requires Rust `1.86+`. From a terminal in your existing Hyprland session:
+Requires Rust `1.86+` and the `libxkbcommon` development files (`libxkbcommon`
+on Arch, `libxkbcommon-dev` on Debian/Ubuntu). From a terminal in your existing
+Hyprland session:
 
 ```bash
 # Show the gesture pill and top handle
@@ -75,6 +77,7 @@ run `veilctl` directly if it's on your `PATH`:
 
 ```bash
 veilctl show home        # Open paged .desktop app launcher
+veilctl show launcher    # Toggle the searchable desktop launcher
 veilctl show recents     # Open the window deck (tap to focus, swipe up on a card to close)
 veilctl show shade       # Open Quick Settings shade
 veilctl show osk         # Open the app keyboard manually

@@ -28,6 +28,9 @@ use smithay_client_toolkit::shell::wlr_layer::{
     LayerSurfaceConfigure,
 };
 use smithay_client_toolkit::shell::WaylandSurface;
+#[path = "launcher_input.rs"]
+mod launcher_input;
+use launcher_input::LauncherInput;
 use smithay_client_toolkit::shm::slot::SlotPool;
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
@@ -396,7 +399,9 @@ impl ManagedSurface {
                 .drag
                 .as_ref()
                 .is_some_and(|drag| drag.surface != SurfaceKind::Overlay && drag.motion.is_some());
-        layer.set_keyboard_interactivity(if spec.keyboard_interactivity && !edge_preview {
+        layer.set_keyboard_interactivity(if role == LayerRole::DesktopLauncher {
+            KeyboardInteractivity::Exclusive
+        } else if spec.keyboard_interactivity && !edge_preview {
             KeyboardInteractivity::OnDemand
         } else {
             KeyboardInteractivity::None
@@ -675,6 +680,7 @@ pub(crate) struct LayerApp {
     render_failure: Option<String>,
     pointer: Option<wl_pointer::WlPointer>,
     touch: Option<wl_touch::WlTouch>,
+    launcher_input: LauncherInput,
     drag: Option<ActiveDrag>,
     pub(crate) osk: OskWaylandState,
     pub(crate) capture: ToplevelCaptureState,
@@ -708,6 +714,8 @@ impl LayerApp {
             {
                 self.osk.ensure_virtual_keyboard(&self.qh);
             }
+            self.pill = None;
+        } else if self.active_scene == SceneKind::Launcher {
             self.pill = None;
         } else if self.pill.is_none() {
             self.pill = Some(ManagedSurface::create(self, LayerRole::BottomPill));
@@ -750,6 +758,13 @@ impl LayerApp {
     }
 
     pub(crate) fn show_scene(&mut self, scene: SceneKind, animate: bool) {
+        if scene == SceneKind::Pill
+            && self.active_scene == SceneKind::Launcher
+            && self.launcher_input.opened_from_hidden
+        {
+            self.set_visible(false);
+            return;
+        }
         self.drag = None;
         self.reset_handle_motion();
         if animate && scene == SceneKind::Pill && self.has_gesture_overlay() {
@@ -770,7 +785,7 @@ impl LayerApp {
 
     fn show_scene_at(&mut self, scene: SceneKind, spring: Spring, refresh: bool) {
         if scene != self.active_scene {
-            self.cancel_osk_drag();
+            self.prepare_scene_change(scene);
             if self.active_scene == SceneKind::Osk {
                 self.osk.auto_opened = false;
                 self.osk.release_virtual_keyboard();
@@ -823,7 +838,10 @@ impl LayerApp {
         // Only recreate the overlay LayerSurface when geometry role changes (TouchOsk vs full-screen).
         if changed && scene != SceneKind::Pill {
             self.overlay_layout = None;
-            if (prev_scene == SceneKind::Osk) != (scene == SceneKind::Osk) {
+            if (prev_scene == SceneKind::Osk) != (scene == SceneKind::Osk)
+                || prev_scene == SceneKind::Launcher
+                || scene == SceneKind::Launcher
+            {
                 self.overlay = None;
             }
         }
@@ -834,10 +852,23 @@ impl LayerApp {
         self.draw_overlay();
     }
 
+    fn prepare_scene_change(&mut self, scene: SceneKind) {
+        self.cancel_osk_drag();
+        if scene == SceneKind::Launcher || self.active_scene == SceneKind::Launcher {
+            self.launcher_input.opened_from_hidden = scene == SceneKind::Launcher && !self.visible;
+            self.launcher_input.clear_focus();
+            self.renderer.context_mut().launcher = veilshell_render::LauncherState::default();
+            self.drag = None;
+        }
+    }
+
     fn set_visible(&mut self, visible: bool) {
         self.visible = visible;
         self.sync_osk_visibility();
         if !visible {
+            self.launcher_input.opened_from_hidden = false;
+            self.launcher_input.clear_focus();
+            self.renderer.context_mut().launcher = veilshell_render::LauncherState::default();
             self.reset_shade_page();
             if self.active_scene == SceneKind::Recents {
                 self.capture.invalidate();
@@ -1144,6 +1175,11 @@ impl LayerApp {
 
     fn handle_daemon_command(&mut self, cmd: DaemonCommand) {
         match cmd {
+            DaemonCommand::ShowScene(SceneKind::Launcher)
+                if self.active_scene == SceneKind::Launcher =>
+            {
+                self.show_scene(SceneKind::Pill, false);
+            }
             DaemonCommand::ShowScene(scene) => self.show_scene(scene, false),
             DaemonCommand::ShowKeyboard(reply) => {
                 let _ = reply.send(self.show_keyboard());
@@ -1828,14 +1864,7 @@ impl LayerApp {
                 self.show_scene(SceneKind::Pill, true);
             }
             HitTarget::LaunchApp { index } => {
-                if let Some(app) = self.renderer.context().home_apps.get(index) {
-                    let action = ShellAction::LaunchApp {
-                        id: app.id.clone(),
-                        exec: app.exec.clone(),
-                    };
-                    self.handler.on_action(action, self.renderer.context_mut());
-                    self.show_scene(SceneKind::Pill, false);
-                }
+                self.launch_app_at(index);
             }
             HitTarget::HomePage { page } => {
                 self.renderer.context_mut().home_page = page;
@@ -1869,7 +1898,21 @@ impl LayerApp {
                 self.draw_overlay();
             }
             HitTarget::Power(input) => self.handle_power_input(input),
-            HitTarget::PowerPanel | HitTarget::OpenKeyboard | HitTarget::OskKey { .. } => {}
+            HitTarget::LauncherPanel
+            | HitTarget::PowerPanel
+            | HitTarget::OpenKeyboard
+            | HitTarget::OskKey { .. } => {}
+        }
+    }
+
+    fn launch_app_at(&mut self, index: usize) {
+        if let Some(app) = self.renderer.context().home_apps.get(index) {
+            let action = ShellAction::LaunchApp {
+                id: app.id.clone(),
+                exec: app.exec.clone(),
+            };
+            self.handler.on_action(action, self.renderer.context_mut());
+            self.show_scene(SceneKind::Pill, false);
         }
     }
 
@@ -2133,6 +2176,7 @@ pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
         render_failure: None,
         pointer: None,
         touch: None,
+        launcher_input: LauncherInput::default(),
         drag: None,
         osk: OskWaylandState::bind_globals(&globals, &qh, config.osk_policy),
         capture: ToplevelCaptureState::bind_globals(&globals, &qh),
@@ -2471,6 +2515,11 @@ impl SeatHandler for LayerApp {
         seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
+        if capability == Capability::Keyboard {
+            if let Ok(keyboard) = self.seat_state.get_keyboard(qh, &seat, None) {
+                self.launcher_input.add(seat.clone(), keyboard);
+            }
+        }
         if capability == Capability::Pointer && self.pointer.is_none() {
             if let Ok(pointer) = self.seat_state.get_pointer(qh, &seat) {
                 self.pointer = Some(pointer);
@@ -2490,6 +2539,9 @@ impl SeatHandler for LayerApp {
         seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
+        if capability == Capability::Keyboard {
+            self.launcher_input.remove(&seat);
+        }
         if capability == Capability::Keyboard
             && self.active_scene == SceneKind::Osk
             && self.osk.seat() == Some(&seat)
@@ -2523,6 +2575,7 @@ impl SeatHandler for LayerApp {
     }
 
     fn remove_seat(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        self.launcher_input.remove(&seat);
         if self.osk.detach_seat(&seat) {
             self.renderer.context_mut().osk_state = OskState::default();
             self.on_osk_editor_lost();

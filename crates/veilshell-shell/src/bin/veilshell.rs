@@ -830,7 +830,7 @@ fn print_help() {
          OPTIONS:\n\
          \t--policy <auto|laptop|tablet>          Initial Laptop/Tablet mode policy (default: auto)\n\
          \t--osk <auto|manual>                    Manual never claims the input method (default: auto)\n\
-         \t--scene <pill|home|recents|shade|osk>  Initial surface scene (default: pill)\n\
+         \t--scene <pill|home|launcher|recents|shade|osk>  Initial surface scene (default: pill)\n\
          \t--renderer <auto|wgpu|software>        Rendering backend (default: auto)\n\
          \t--wallpaper <PNG_PATH>                 Static PNG wallpaper for pre-blurred GPU glass\n\
          \t--output <NAME>                        Bind surfaces to a specific Wayland output\n\

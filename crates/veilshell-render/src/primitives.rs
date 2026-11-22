@@ -359,6 +359,8 @@ pub enum HitTarget {
     DismissOverlay,
     /// Tapping an application icon launches `home_apps[index]`.
     LaunchApp { index: usize },
+    /// Consume clicks inside the desktop launcher without dismissing it.
+    LauncherPanel,
     /// Tapping a pagination dot switches the Home grid page.
     HomePage { page: usize },
     /// Tapping a recents card focuses the window with identifier `id`.

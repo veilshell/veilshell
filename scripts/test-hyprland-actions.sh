@@ -181,6 +181,38 @@ foot --hold --app-id=veil-other --title=VeilOther true >"$ROOT/foot.log" 2>&1 &
 PIDS+=("$!")
 wait_for "underlying fixture focused" json_matches activewindow '.class == "veil-other"'
 
+if [[ ${VEILSHELL_TEST_LAUNCHER:-0} == 1 ]]; then
+    command -v wtype >/dev/null || { echo "Missing tool: wtype" >&2; exit 1; }
+    cat >"$XDG_DATA_HOME/applications/veil-second.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Veil Home Second
+Exec=foot --hold --app-id=veil-second true
+EOF
+    "$BIN/veilshell" --no-watchers --policy laptop --osk manual --output veil-smoke \
+        --renderer software >"$ROOT/launcher.log" 2>&1 &
+    PIDS+=("$!")
+    wait_for "launcher test socket" test -S "$VEILSHELL_SOCKET"
+    show launcher
+    in_scene launcher
+    wtype 'unmatched query'
+    wtype -k Return
+    in_scene launcher
+    json_matches clients 'map(.class) == ["veil-other"]'
+    wtype -k Escape
+    wait_for "Escape restored hidden mode" bash -c \
+        '"$1" status | grep -q "visible: false"' _ "$BIN/veilctl"
+    show launcher
+    in_scene launcher
+    wtype 'veil home'
+    wtype -k Right -k Return
+    wait_for "launcher filtered, selected second result and launched it" json_matches clients \
+        'map(.class) | sort == ["veil-other", "veil-second"]'
+    timeout 5 "$BIN/veilctl" quit >/dev/null
+    echo "Desktop launcher search, empty results, Escape and keyboard launch passed."
+    exit 0
+fi
+
 if [[ ${VEILSHELL_TEST_STANDALONE:-0} == 1 ]]; then
     # Exercise standalone policy without starting SDDM or host services.
     export VEILSHELL_SESSION_DIR="$XDG_RUNTIME_DIR/standalone"

@@ -72,7 +72,7 @@ autostart, shell, or UWSM.
 
 | Keys | Action |
 |---|---|
-| `Super+Space` | VeilShell Home, not the Omarchy menu or a searchable launcher |
+| `Super+Space` | Toggle the searchable VeilShell desktop launcher |
 | `Super+Enter`, `Super+Shift+Enter` / `Super+Shift+B`, `Super+Shift+F` | Terminal, default browser, default file manager |
 | `Super+Q/W`, `Super+F`, `Super+T`, `Alt+Tab` / `Alt+Shift+Tab` | Close, fullscreen, toggle floating, cycle windows |
 | `Super+1–0`, add `Shift` to move, or `Shift+Alt` to send without following | Hyprland workspaces 1–10; not Omarchy's per-monitor numbering |
@@ -88,6 +88,13 @@ launch uses `xdg-terminal-exec` or an installed terminal. Browser launch uses
 Applications that hand off to an existing process or require UWSM or portals
 may need a separate launcher. Installed web apps remain in Home if their
 desktop entries are discoverable; their shortcuts aren't imported.
+
+In the desktop launcher, type to filter by app name or desktop-file ID.
+Use arrows or Tab/Shift+Tab to select, Enter to launch, or Escape to dismiss.
+You can also click a result. `veilctl show launcher` opens or closes the same
+surface without the profile. Tablet Home still opens from the bottom swipe
+and keeps its paged touch grid. Desk Mode layout policy is not required to
+use the launcher and is not part of this change.
 
 For personal bindings, add only the Lua you want to
 `$XDG_CONFIG_HOME/veilshell/bindings.lua` (normally under `~/.config`). It
