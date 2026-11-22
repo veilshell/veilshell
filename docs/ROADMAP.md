@@ -61,7 +61,28 @@
 - [x] Live window thumbnails in the Recents Deck via `ext-foreign-toplevel-list-v1` + `ext-image-copy-capture-v1` (with `wl_shm` format conversion & premultiplied area-box downscaling)
 
 ### Phase 4 — Packaging, Multi-Compositor Ports & `v0.1.0` Release
-- [ ] Arch Linux / AUR `PKGBUILD` (`packaging/arch/PKGBUILD`) + optional standalone SDDM session entry
+
+#### Sprint 4A — Standalone SDDM session, lock and power
+
+- [ ] Standalone SDDM entry, dedicated Hyprland config, session-scoped daemon and reliable return to the greeter. Keep the greeter, autologin, and existing desktop configuration unchanged.
+- [ ] Touch power menu with Lock, Suspend and Logout; confirm destructive actions and add Reboot and Shutdown. Verify lock-before-suspend and resume.
+- [ ] Native Denial-style lock face: wallpaper, clock/date, swipe-up touch authentication, password fallback, PIN and optional fingerprint. Require compositor-enforced locking; use an existing secure locker while the native UI is under development.
+- [ ] Arch Linux / AUR `PKGBUILD` (`packaging/arch/PKGBUILD`) and real SDDM login/logout smoke test.
+
+#### Sprint 4B — Day-to-day tablet parity
+
+- [ ] Fullscreen split shade: edge of pull selects page; horizontal swipe switches Notifications and Quick Settings. Add actionable notification banners, history, dismissal, Do Not Disturb, and lock-screen privacy.
+- [ ] Keyboard hold-to-repeat for Backspace and arrows, terminal keys, long-press accents, and optional local suggestions that are disabled for sensitive fields.
+- [ ] Editable Home: reorder icons, create folders, persist layout, share a dock across pages, and open a separate alphabetical app drawer. Desktop launcher adds search, recents and physical-keyboard navigation.
+
+#### Sprint 4C — External displays
+
+- [ ] Give the built-in touchscreen and external monitor separate mobile and desktop roles. Move windows between outputs from Recents; verify hotplug recovery.
+- [ ] Optional Input Deck: use the built-in touchscreen as a keyboard and relative touchpad while an external display is active.
+
+#### Release follow-up
+
+- See the [Denial parity reference](DENIAL_PARITY_SPEC.md) for upstream behavior, UI metrics and validation gates.
 - [ ] Additional compositor backends (`Niri`, `Sway`) & community `hardware-profiles/*.toml`
 - [ ] Tier 3 frame-time & RSS performance budget assertions in CI
 - [ ] First tagged **`v0.1.0`** release
