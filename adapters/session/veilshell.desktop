@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=VeilShell (Preview)
+Comment=Standalone touch shell on Hyprland
+Exec=/usr/bin/veilshell-session
+TryExec=/usr/bin/veilshell-session
+Type=Application

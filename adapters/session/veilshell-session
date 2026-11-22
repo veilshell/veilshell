@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# Own the standalone compositor and its services without touching the user's
+# service-manager environment or another graphical session.
+set -eu
+umask 077
+
+fail() {
+    printf 'veilshell-session: %s\n' "$*" >&2
+    exit 1
+}
+
+config_dir=${VEILSHELL_SESSION_CONFIG_DIR:-/usr/share/veilshell/session}
+
+case ${1:-} in
+    --publish-display)
+        # Internal Hyprland startup hook. Publish inert data, not shell code.
+        [[ -d ${VEILSHELL_SESSION_DIR:-} && -n ${WAYLAND_DISPLAY:-} &&
+            -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]] || fail "missing compositor session environment"
+        printf '%s\n' "$WAYLAND_DISPLAY" "$HYPRLAND_INSTANCE_SIGNATURE" \
+            >"$VEILSHELL_SESSION_DIR/display.tmp"
+        mv -f -- "$VEILSHELL_SESSION_DIR/display.tmp" "$VEILSHELL_SESSION_DIR/display"
+        exit 0
+        ;;
+    --lock)
+        [[ -d ${VEILSHELL_SESSION_DIR:-} && -n ${WAYLAND_DISPLAY:-} ]] ||
+            fail "not running inside a standalone VeilShell session"
+        # Multiple lock requests must not queue a second locker after unlock.
+        exec flock --exclusive --nonblock --conflict-exit-code 0 --no-fork \
+            "$VEILSHELL_SESSION_DIR/locker.lock" \
+            hyprlock --config "$config_dir/hyprlock.conf" --grace 0 --immediate-render
+        ;;
+esac
+
+check_only=false
+pids=()
+session_dir=
+cleanup() {
+    local status=$? pid running
+    trap - EXIT
+    trap '' HUP INT TERM
+    if (( ${#pids[@]} > 0 )); then
+        for pid in "${pids[@]}"; do
+            kill -TERM "$pid" 2>/dev/null || true
+        done
+        # Bound teardown even if a child fails to handle TERM.
+        local deadline=$((SECONDS + 3))
+        while (( SECONDS < deadline )); do
+            running=false
+            for pid in "${pids[@]}"; do
+                if kill -0 "$pid" 2>/dev/null; then
+                    running=true
+                fi
+            done
+            $running || break
+            sleep 0.05
+        done
+        for pid in "${pids[@]}"; do
+            kill -KILL "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        done
+    fi
+    if [[ -n $session_dir ]]; then
+        rm -f -- "$session_dir"/{display,display.tmp,control.sock,locker.lock}
+        rmdir -- "$session_dir" || true
+    fi
+    # SDDM reserves 1 for authentication failure, even after starting a session.
+    if ! $check_only && (( status == 1 )); then
+        status=2
+    fi
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [[ $# == 1 && $1 == --check ]]; then
+    check_only=true
+elif (( $# != 0 )); then
+    fail "usage: veilshell-session [--check]"
+fi
+
+for binary in Hyprland hyprctl hypridle hyprlock flock veilshell veilctl veilshell-session; do
+    command -v "$binary" >/dev/null || fail "missing command: $binary"
+done
+for config in hyprland.lua hypridle.conf hyprlock.conf; do
+    [[ -f $config_dir/$config && -r $config_dir/$config ]] || fail "missing config: $config_dir/$config"
+done
+if $check_only; then
+    Hyprland --verify-config --config "$config_dir/hyprland.lua"
+    exit 0
+fi
+
+[[ -z ${WAYLAND_DISPLAY:-} && -z ${WAYLAND_SOCKET:-} ]] ||
+    fail "refusing to start inside an existing Wayland session"
+[[ ${XDG_RUNTIME_DIR:-} == /* && -d $XDG_RUNTIME_DIR && -O $XDG_RUNTIME_DIR ]] ||
+    fail "a session-owned XDG_RUNTIME_DIR is required"
+
+session_dir=$(mktemp -d "$XDG_RUNTIME_DIR/veilshell.XXXXXXXX")
+export VEILSHELL_SESSION_DIR="$session_dir"
+export VEILSHELL_SESSION_CONFIG_DIR="$config_dir"
+export VEILSHELL_SOCKET="$session_dir/control.sock"
+export XDG_SESSION_TYPE=wayland XDG_SESSION_DESKTOP=VeilShell XDG_CURRENT_DESKTOP=Hyprland
+export HYPRLAND_NO_SD_VARS=1 HYPRLAND_NO_SD_TARGET=1 HYPRLAND_NO_SD_NOTIFY=1
+unset DISPLAY HYPRLAND_INSTANCE_SIGNATURE SWAYSOCK I3SOCK
+
+Hyprland --config "$config_dir/hyprland.lua" &
+hyprland_pid=$!
+pids+=("$hyprland_pid")
+
+deadline=$((SECONDS + 15))
+until [[ -f $session_dir/display ]]; do
+    kill -0 "$hyprland_pid" 2>/dev/null || fail "Hyprland exited before publishing its display"
+    (( SECONDS < deadline )) || fail "timed out waiting for the Hyprland startup hook"
+    sleep 0.05
+done
+mapfile -t endpoints <"$session_dir/display"
+(( ${#endpoints[@]} == 2 )) || fail "invalid display handshake"
+if [[ ${endpoints[0]} == /* ]]; then
+    display_path=${endpoints[0]}
+else
+    display_path=$XDG_RUNTIME_DIR/${endpoints[0]}
+fi
+until [[ -S $display_path && -S $XDG_RUNTIME_DIR/hypr/${endpoints[1]}/.socket.sock ]]; do
+    kill -0 "$hyprland_pid" 2>/dev/null || fail "Hyprland exited before its sockets were ready"
+    (( SECONDS < deadline )) || fail "Hyprland did not publish live Wayland and IPC sockets"
+    sleep 0.05
+done
+export WAYLAND_DISPLAY="${endpoints[0]}" HYPRLAND_INSTANCE_SIGNATURE="${endpoints[1]}"
+
+hypridle --config "$config_dir/hypridle.conf" &
+idle_pid=$!
+pids+=("$idle_pid")
+veilshell --policy tablet --scene home &
+shell_pid=$!
+pids+=("$shell_pid")
+
+status=0
+if ! kill -0 "$shell_pid" 2>/dev/null; then
+    # wait -n only considers running jobs on older Bash versions.
+    child=$shell_pid
+    wait "$shell_pid" || status=$?
+elif ! kill -0 "$idle_pid" 2>/dev/null; then
+    child=$idle_pid
+else
+    wait -n -p child "${pids[@]}" || status=$?
+fi
+if [[ ${child:-} == "$idle_pid" ]]; then
+    fail "hypridle exited; ending the preview session"
+fi
+exit "$status"

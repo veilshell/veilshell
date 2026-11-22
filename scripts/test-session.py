@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Test the SDDM launcher with isolated fake Hyprland and helper processes."""
+
+import os
+from pathlib import Path
+import signal
+import subprocess
+import tempfile
+import time
+import unittest
+
+
+ADAPTER = Path(__file__).resolve().parents[1] / "adapters" / "session"
+COMMAND = ADAPTER / "veilshell-session"
+MOCK = """#!/usr/bin/env python3
+import os
+from pathlib import Path
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+name = Path(sys.argv[0]).name
+def log(event):
+    with open(os.environ["TEST_LOG"], "a") as file:
+        file.write(event + "\\n")
+def stop(*_):
+    log(name + " stopped")
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+
+if name == "Hyprland":
+    if "--verify-config" in sys.argv:
+        sys.exit(int(os.getenv("TEST_VERIFY_STATUS", "0")))
+    if os.getenv("TEST_HYPR_FAIL"):
+        sys.exit(1)
+    assert "DISPLAY" not in os.environ
+    assert "HYPRLAND_INSTANCE_SIGNATURE" not in os.environ
+    assert os.environ["HYPRLAND_NO_SD_VARS"] == "1"
+    assert os.environ["HYPRLAND_NO_SD_TARGET"] == "1"
+    runtime = Path(os.environ["XDG_RUNTIME_DIR"])
+    os.environ.update(WAYLAND_DISPLAY="isolated", HYPRLAND_INSTANCE_SIGNATURE="fake-hyprland")
+    ipc = runtime / "hypr" / "fake-hyprland"
+    ipc.mkdir(parents=True)
+    wl = socket.socket(socket.AF_UNIX)
+    hypr = socket.socket(socket.AF_UNIX)
+    wl.bind(str(runtime / "isolated"))
+    hypr.bind(str(ipc / ".socket.sock"))
+    log("Hyprland started")
+    subprocess.run(["veilshell-session", "--publish-display"], check=True)
+elif name in ("veilshell", "hypridle"):
+    assert os.environ["WAYLAND_DISPLAY"] == "isolated"
+    assert os.environ["HYPRLAND_INSTANCE_SIGNATURE"] == "fake-hyprland"
+    assert Path(os.environ["VEILSHELL_SOCKET"]).parent == Path(os.environ["VEILSHELL_SESSION_DIR"])
+    log(name + " started")
+    if name == "veilshell":
+        assert sys.argv[1:] == ["--policy", "tablet", "--scene", "home"]
+        if "TEST_SHELL_STATUS" in os.environ:
+            time.sleep(0.2)
+            sys.exit(int(os.environ["TEST_SHELL_STATUS"]))
+    elif os.getenv("TEST_IDLE_FAIL"):
+        sys.exit(1)
+elif name == "hyprlock":
+    assert "--grace" in sys.argv and sys.argv[sys.argv.index("--grace") + 1] == "0"
+    log("hyprlock started")
+else:
+    sys.exit(0)
+
+while True:
+    time.sleep(0.05)
+"""
+
+
+class SessionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="veil-test-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.runtime = self.root / "runtime"
+        self.runtime.mkdir(mode=0o700)
+        bindir = self.root / "bin"
+        bindir.mkdir()
+        mock = bindir / "mock"
+        mock.write_text(MOCK)
+        mock.chmod(0o755)
+        for name in ("Hyprland", "hyprctl", "hypridle", "hyprlock", "veilshell", "veilctl"):
+            (bindir / name).symlink_to(mock)
+        (bindir / COMMAND.name).symlink_to(COMMAND)
+        self.log = self.root / "events"
+        self.env = dict(
+            os.environ,
+            PATH=f"{bindir}:{os.environ['PATH']}",
+            XDG_RUNTIME_DIR=str(self.runtime),
+            VEILSHELL_SESSION_CONFIG_DIR=str(ADAPTER),
+            TEST_LOG=str(self.log),
+            DISPLAY="stale",
+            HYPRLAND_INSTANCE_SIGNATURE="stale",
+        )
+        for key in ("WAYLAND_DISPLAY", "WAYLAND_SOCKET", "VEILSHELL_SESSION_DIR"):
+            self.env.pop(key, None)
+
+    def run_launcher(self, *args):
+        return subprocess.run(
+            [COMMAND, *args], env=self.env, text=True, capture_output=True, timeout=6
+        )
+
+    def wait_for(self, event):
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            if self.log.exists() and event in self.log.read_text():
+                return
+            time.sleep(0.02)
+        self.fail(f"missing event: {event}")
+
+    def test_normal_logout_cleans_up(self):
+        self.env["TEST_SHELL_STATUS"] = "0"
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("hypridle stopped", self.log.read_text())
+        self.assertIn("Hyprland stopped", self.log.read_text())
+        self.assertEqual(list(self.runtime.glob("veilshell.*")), [])
+
+    def test_failed_start_and_shell_map_status_one(self):
+        self.env["TEST_HYPR_FAIL"] = "yes"
+        self.assertEqual(self.run_launcher().returncode, 2)
+        self.env.pop("TEST_HYPR_FAIL")
+        self.env["TEST_SHELL_STATUS"] = "1"
+        self.assertEqual(self.run_launcher().returncode, 2)
+
+    def test_ends_session_if_idle_service_exits(self):
+        self.env["TEST_IDLE_FAIL"] = "yes"
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("hypridle exited", result.stderr)
+        self.assertEqual(list(self.runtime.glob("veilshell.*")), [])
+
+    def test_check_is_read_only_and_does_not_remap_status(self):
+        self.env["WAYLAND_DISPLAY"] = "existing"
+        self.env["TEST_VERIFY_STATUS"] = "1"
+        self.assertEqual(self.run_launcher("--check").returncode, 1)
+        self.assertEqual(self.run_launcher().returncode, 2)
+        self.assertFalse(self.log.exists())
+
+    def test_signal_reaps_children(self):
+        with subprocess.Popen([COMMAND], env=self.env) as process:
+            try:
+                self.wait_for("veilshell started")
+                process.send_signal(signal.SIGTERM)
+                self.assertEqual(process.wait(timeout=6), 143)
+                self.assertIn("veilshell stopped", self.log.read_text())
+            finally:
+                if process.poll() is None:
+                    process.kill()
+
+    def test_lock_requests_do_not_spawn_a_second_locker(self):
+        self.env["WAYLAND_DISPLAY"] = "isolated"
+        self.env["VEILSHELL_SESSION_DIR"] = str(self.runtime)
+        with subprocess.Popen([COMMAND, "--lock"], env=self.env) as locker:
+            try:
+                self.wait_for("hyprlock started")
+                self.assertEqual(self.run_launcher("--lock").returncode, 0)
+                self.assertEqual(self.log.read_text().count("hyprlock started"), 1)
+            finally:
+                locker.terminate()
+
+
+if __name__ == "__main__":
+    unittest.main()

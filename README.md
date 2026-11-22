@@ -80,6 +80,8 @@ veilctl quit             # Stop the daemon cleanly
 
 For Omarchy users, optional instant theme-hook (`adapters/omarchy/hooks/30-veilshell-theme`)
 and `systemd --user` (`adapters/omarchy/systemd/veilshell.service`) integration guides live in [`adapters/omarchy/README.md`](adapters/omarchy/README.md).
+For SDDM, see the [standalone session preview](adapters/session/README.md).
+It currently requires a physical keyboard for password unlock.
 
 ## Documentation
 
