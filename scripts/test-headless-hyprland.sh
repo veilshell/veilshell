@@ -1,218 +1,209 @@
 #!/usr/bin/env bash
-# Tier 3 Automated Hyprland + grim Visual Verification Harness for VeilShell.
-#
-# Inside an active Hyprland session:
-#  1. Creates a temporary isolated headless monitor (`hyprctl output create headless`)
-#  2. Launches ONE persistent `veilshell` daemon pinned strictly to that headless monitor
-#  3. Drives live transitions (`home`, `shade`, `recents`, `pill`) via `veilctl` Unix socket IPC
-#  4. Captures real compositor screenshots of every surface with `grim -o`
-#  5. Tests `veilctl mode laptop` / `tablet` (Lua eval + legacy fallback) and exits cleanly
+# Tier 3: use a fresh nested Hyprland, never the host compositor's IPC.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${1:-/tmp/veilshell-hypr-test}"
-mkdir -p "$OUT_DIR"
+RENDERER="${VEILSHELL_TEST_RENDERER:-auto}"
+case "$RENDERER" in auto|software|wgpu) ;; *) echo "Invalid renderer: $RENDERER" >&2; exit 2;; esac
 
-echo "[1/5] Building veilshell and veilctl..."
-cargo build --manifest-path "$REPO_ROOT/Cargo.toml" --bin veilshell --bin veilctl
+for tool in cargo Hyprland hyprctl grim jq; do
+    command -v "$tool" >/dev/null || { echo "Missing tool: $tool" >&2; exit 1; }
+done
 
-VEILSHELL_BIN="$REPO_ROOT/target/debug/veilshell"
-VEILCTL_BIN="$REPO_ROOT/target/debug/veilctl"
-
-if [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
-    BEFORE_JSON="$(hyprctl -j monitors)"
-    hyprctl output create headless >/dev/null
-    sleep 0.3
-    AFTER_JSON="$(hyprctl -j monitors)"
-    HEADLESS_NAME="$(python3 -c '
-import json, sys
-before = {m["name"] for m in json.loads(sys.argv[1])}
-after = {m["name"] for m in json.loads(sys.argv[2])}
-added = sorted(n for n in (after - before) if n.startswith("HEADLESS-"))
-print(added[-1] if added else "")
-' "$BEFORE_JSON" "$AFTER_JSON")"
-
-    if [[ -z "$HEADLESS_NAME" || "$HEADLESS_NAME" != HEADLESS-* ]]; then
-        echo "ERROR: Failed to detect newly created Hyprland HEADLESS-* output." >&2
-        exit 1
-    fi
-
-    TMP_SOCK="$(mktemp -u /tmp/veilshell-test-XXXXXX.sock)"
-    DAEMON_PID=""
-
-    cleanup() {
-        if [[ -n "$DAEMON_PID" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then
-            VEILSHELL_SOCKET="$TMP_SOCK" "$VEILCTL_BIN" quit >/dev/null 2>&1 || true
-            sleep 0.2
-            kill "$DAEMON_PID" 2>/dev/null || true
-            wait "$DAEMON_PID" 2>/dev/null || true
-        fi
-        rm -f "$TMP_SOCK"
-        if [[ "$HEADLESS_NAME" == HEADLESS-* ]]; then
-            hyprctl output remove "$HEADLESS_NAME" >/dev/null 2>&1 || true
-        fi
-    }
-    trap cleanup EXIT
-
-    echo "[2/5] Configured virtual headless monitor: $HEADLESS_NAME (1280x853@60)"
-    if [[ "$(hyprctl eval "hl.monitor({ output = \"$HEADLESS_NAME\", mode = \"1280x853@60\", position = \"3000x0\", scale = 1 })" 2>/dev/null || true)" != "ok" ]]; then
-        hyprctl keyword monitor "$HEADLESS_NAME,1280x853@60,3000x0,1" >/dev/null
-    fi
-    hyprctl eval 'hl.layer_rule({ match = { namespace = "veilshell" }, no_anim = true, animation = "none" })' >/dev/null 2>&1 \
-        || hyprctl keyword layerrule "noanim, veilshell" >/dev/null 2>&1 || true
-    sleep 0.4
-
-    echo "[3/5] Starting persistent daemon pinned to $HEADLESS_NAME..."
-    "$VEILSHELL_BIN" --output "$HEADLESS_NAME" --socket "$TMP_SOCK" --policy tablet --no-watchers --scene pill >"$OUT_DIR/veilshell.log" 2>&1 &
-    DAEMON_PID=$!
-
-    for _ in $(seq 1 40); do
-        if [[ -S "$TMP_SOCK" ]]; then
-            break
-        fi
-        kill -0 "$DAEMON_PID" 2>/dev/null || {
-            echo "ERROR: veilshell daemon exited prematurely." >&2
-            cat "$OUT_DIR/veilshell.log" >&2 || true
-            exit 1
-        }
-        sleep 0.1
-    done
-
-    if [[ ! -S "$TMP_SOCK" ]]; then
-        echo "ERROR: Timed out waiting for daemon socket $TMP_SOCK" >&2
-        exit 1
-    fi
-
-    export VEILSHELL_SOCKET="$TMP_SOCK"
-    "$VEILCTL_BIN" status
-
-    echo "[4/5] Driving live surface transitions via veilctl & capturing grim screenshots..."
-    PREV_PNG=""
-    for scene in home shade recents osk pill; do
-        "$VEILCTL_BIN" show "$scene"
-        out_png="$OUT_DIR/hyprland-$scene.png"
-        case "$scene" in
-            pill) min_bytes=1500 ;;
-            osk)  min_bytes=12000 ;;
-            *)    min_bytes=25000 ;;
-        esac
-
-        # First capture wakes Hyprland's lazy headless screencopy pipeline so stale frames flush out.
-        sleep 0.25
-        grim -o "$HEADLESS_NAME" "$out_png"
-
-        bytes=0
-        stale=1
-        for _ in $(seq 1 5); do
-            sleep 0.25
-            grim -o "$HEADLESS_NAME" "$out_png"
-            bytes="$(stat -c%s "$out_png")"
-            if (( bytes >= min_bytes )) && { [[ -z "$PREV_PNG" ]] || ! cmp -s "$out_png" "$PREV_PNG"; }; then
-                stale=0
-                break
-            fi
-        done
-
-        if (( stale != 0 )); then
-            echo "ERROR: Screenshot $out_png stayed identical to previous capture $PREV_PNG!" >&2
-            exit 1
-        fi
-        echo "  -> Captured $out_png ($bytes bytes)"
-        if (( bytes < min_bytes )); then
-            echo "ERROR: Screenshot $out_png ($bytes bytes < $min_bytes) looks blank!" >&2
-            hyprctl -j layers >&2 || true
-            cat "$OUT_DIR/veilshell.log" >&2 || true
-            exit 1
-        fi
-        PREV_PNG="$out_png"
-    done
-
-    "$VEILCTL_BIN" mode laptop
-    sleep 0.2
-    "$VEILCTL_BIN" mode tablet
-    sleep 0.2
-    "$VEILCTL_BIN" quit
-    wait "$DAEMON_PID" || true
-    DAEMON_PID=""
-
-    echo "[5/5] Tier 3 live Hyprland + wlr-layer-shell + grim visual test PASSED!"
-    exit 0
-fi
-
-# Nested fallback when running outside Hyprland (requires host wl_compositor >= v6)
-HOST_RT="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-HOST_WL="${WAYLAND_DISPLAY:-}"
-if [[ -z "$HOST_WL" ]]; then
-    HOST_WL="$(find "$HOST_RT" -maxdepth 1 -name 'wayland-*' ! -name '*.lock' -printf '%f\n' 2>/dev/null | head -n 1 || true)"
-fi
-
-if [[ -z "$HOST_WL" ]]; then
-    echo "ERROR: No active Hyprland or host Wayland session found." >&2
-    echo "Tip: Run ./scripts/test-snapshots.sh for offscreen PNG verification." >&2
+# Use the host Wayland socket only as a display for the nested compositor.
+PARENT="${WAYLAND_DISPLAY:-}"
+if [[ -z "$PARENT" ]]; then
+    echo "A parent Wayland display is required to run nested Hyprland." >&2
     exit 1
 fi
+if [[ "$PARENT" != /* ]]; then
+    PARENT="${XDG_RUNTIME_DIR:?Parent XDG_RUNTIME_DIR is required}/$PARENT"
+fi
+[[ -S "$PARENT" ]] || { echo "Parent Wayland socket not found: $PARENT" >&2; exit 1; }
 
-TMP_CFG="$(mktemp /tmp/vs-cfg.XXXX.conf)"
+mkdir -p "$OUT_DIR"
+echo "Building VeilShell..."
+cargo build --manifest-path "$REPO_ROOT/Cargo.toml" --bin veilshell --bin veilctl
+TARGET_DIR="$(cargo metadata --locked --no-deps --format-version 1 --manifest-path "$REPO_ROOT/Cargo.toml" | jq -er .target_directory)"
+BIN="$TARGET_DIR/debug"
+
+# Hyprland embeds a long signature in its Unix socket path (108-byte limit).
+TEST_ROOT="$(mktemp -d /tmp/veil.XXXXXX)"
 HYPR_PID=""
-cleanup_nested() {
-    if [[ -n "$HYPR_PID" ]] && kill -0 "$HYPR_PID" 2>/dev/null; then
-        kill "$HYPR_PID" 2>/dev/null || true
-        wait "$HYPR_PID" 2>/dev/null || true
-    fi
-    rm -f "$TMP_CFG"
+DAEMON_PID=""
+cleanup() {
+    for pid in "$DAEMON_PID" "$HYPR_PID"; do
+        if [[ -n "$pid" ]]; then
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        fi
+    done
+    rm -rf -- "$TEST_ROOT"
 }
-trap cleanup_nested EXIT
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-cat >"$TMP_CFG" <<'EOF'
-monitor=,1280x853@60,0x0,1
-misc {
-    disable_hyprland_logo = true
-    disable_splash_rendering = true
-}
+export XDG_RUNTIME_DIR="$TEST_ROOT/r"
+export XDG_CONFIG_HOME="$TEST_ROOT/config"
+export XDG_CACHE_HOME="$TEST_ROOT/cache"
+export XDG_STATE_HOME="$TEST_ROOT/state"
+mkdir -m 700 "$XDG_RUNTIME_DIR" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME"
+export HYPRLAND_NO_SD_VARS=1 HYPRLAND_NO_SD_TARGET=1 HYPRLAND_NO_SD_NOTIFY=1
+export HYPRLAND_NO_CRASHREPORTER=1
+# No real seat or host notification/activation bus, even inside Omarchy.
+export LIBSEAT_BACKEND=seatd SEATD_SOCK="$TEST_ROOT/no-seat"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$TEST_ROOT/no-user-bus"
+export GSETTINGS_BACKEND=memory
+export XDG_CURRENT_DESKTOP=Hyprland
+unset DISPLAY WAYLAND_SOCKET HYPRLAND_INSTANCE_SIGNATURE NOTIFY_SOCKET VEILSHELL_SESSION_DIR
+export VEILSHELL_SOCKET="$XDG_RUNTIME_DIR/veil.sock"
+
+cat >"$TEST_ROOT/hyprland.lua" <<'EOF'
+hl.config({
+    general = { gaps_in = 19, gaps_out = 23 },
+    decoration = { rounding = 11 },
+    cursor = { sync_gsettings_theme = false },
+    animations = { enabled = false },
+    xwayland = { enabled = false },
+    misc = { disable_hyprland_logo = true, disable_splash_rendering = true, disable_watchdog_warning = true },
+})
 EOF
 
-BEFORE_SOCKS="$(LC_ALL=C find "$HOST_RT" -maxdepth 1 -name 'wayland-*' ! -name '*.lock' -printf '%f\n' 2>/dev/null | LC_ALL=C sort || true)"
-BEFORE_SIGS="$(LC_ALL=C find "$HOST_RT/hypr" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | LC_ALL=C sort || true)"
-
-echo "[2/5] Starting isolated nested Hyprland (host Wayland: $HOST_WL)..."
-env XDG_RUNTIME_DIR="$HOST_RT" WAYLAND_DISPLAY="$HOST_WL" \
-    Hyprland --config "$TMP_CFG" >"$OUT_DIR/hyprland.log" 2>&1 &
+echo "Starting a private Hyprland compositor..."
+(
+    ulimit -c 0
+    export WAYLAND_DISPLAY="$PARENT"
+    exec Hyprland --config "$TEST_ROOT/hyprland.lua"
+) >"$OUT_DIR/hyprland.log" 2>&1 &
 HYPR_PID=$!
-
-CHILD_WL=""
-CHILD_SIG=""
-for _ in $(seq 1 50); do
-    kill -0 "$HYPR_PID" 2>/dev/null || break
-    AFTER_SOCKS="$(LC_ALL=C find "$HOST_RT" -maxdepth 1 -name 'wayland-*' ! -name '*.lock' -printf '%f\n' 2>/dev/null | LC_ALL=C sort || true)"
-    AFTER_SIGS="$(LC_ALL=C find "$HOST_RT/hypr" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | LC_ALL=C sort || true)"
-    CHILD_WL="$(LC_ALL=C comm -13 <(printf '%s\n' "$BEFORE_SOCKS") <(printf '%s\n' "$AFTER_SOCKS") | head -n 1 || true)"
-    CHILD_SIG="$(LC_ALL=C comm -13 <(printf '%s\n' "$BEFORE_SIGS") <(printf '%s\n' "$AFTER_SIGS") | head -n 1 || true)"
-    if [[ -n "$CHILD_WL" && -n "$CHILD_SIG" && -S "$HOST_RT/hypr/$CHILD_SIG/.socket.sock" ]]; then
-        break
+shopt -s nullglob
+for _ in {1..50}; do
+    locks=("$XDG_RUNTIME_DIR"/hypr/*/hyprland.lock)
+    if (( ${#locks[@]} == 1 )); then
+        mapfile -t endpoint <"${locks[0]}" 2>/dev/null || true
+        if [[ ${endpoint[0]:-} == "$HYPR_PID" && ${endpoint[1]:-} == wayland-* &&
+              -S "$XDG_RUNTIME_DIR/${endpoint[1]}" && -S "${locks[0]%/*}/.socket.sock" ]]; then
+            export WAYLAND_DISPLAY="${endpoint[1]}"
+            instance_dir="${locks[0]%/*}"
+            export HYPRLAND_INSTANCE_SIGNATURE="${instance_dir##*/}"
+            break
+        fi
     fi
-    sleep 0.2
+    kill -0 "$HYPR_PID" 2>/dev/null || break
+    sleep 0.1
 done
-
-if [[ -z "$CHILD_WL" || -z "$CHILD_SIG" ]]; then
-    echo "ERROR: Nested Hyprland failed to start (host compositor must support wl_compositor v6)." >&2
-    tail -n 25 "$OUT_DIR/hyprland.log" >&2 || true
+if [[ -z ${HYPRLAND_INSTANCE_SIGNATURE:-} ]]; then
+    echo "Nested Hyprland could not start; check the parent compositor's protocol support and $OUT_DIR/hyprland.log" >&2
     exit 1
 fi
 
-export XDG_RUNTIME_DIR="$HOST_RT"
-export WAYLAND_DISPLAY="$CHILD_WL"
-export HYPRLAND_INSTANCE_SIGNATURE="$CHILD_SIG"
+nested_ctl() { hyprctl -i "$HYPRLAND_INSTANCE_SIGNATURE" "$@"; }
+OUTPUT=veil-test
+[[ $(nested_ctl output create headless "$OUTPUT") == ok ]]
 
-echo "[3/5] Verifying live Hyprland IPC via veilctl..."
-"$VEILCTL_BIN" status
+compositor_state() {
+    nested_ctl -j monitors | jq -c 'map({name, width, height, scale, transform, x, y})'
+    for option in general:gaps_in general:gaps_out decoration:rounding; do
+        nested_ctl -j getoption "$option" | jq -c '{option, value: (.int // .css)}'
+    done
+}
 
-echo "[4/5] Presenting live wlr-layer-shell surfaces & capturing grim screenshots..."
-for scene in home shade recents pill; do
-    "$VEILSHELL_BIN" --scene "$scene" --exit-after-ms 1600 >"$OUT_DIR/veilshell-$scene.log" 2>&1 &
-    SHELL_PID=$!
-    sleep 0.6
-    grim "$OUT_DIR/hyprland-$scene.png"
-    wait "$SHELL_PID"
+configure_output() {
+    local mode="$1" scale="$2" width="${1%x*}" height="${1#*x}"
+    [[ $(nested_ctl eval "hl.monitor({ output = \"$OUTPUT\", mode = \"${mode}@60\", position = \"3000x0\", scale = $scale })") == ok ]]
+    for _ in {1..30}; do
+        if nested_ctl -j monitors | jq -e --arg name "$OUTPUT" --argjson scale "$scale" \
+            --argjson w "$width" --argjson h "$height" \
+            'any(.[]; .name == $name and .scale == $scale and .width == $w and .height == $h)' >/dev/null; then
+            return
+        fi
+        sleep 0.1
+    done
+    echo "Nested output did not reach ${mode} @ ${scale}x" >&2
+    return 1
+}
+
+configure_output 960x640 1
+before="$(compositor_state)"
+if "$BIN/veilctl" mode tablet >"$OUT_DIR/mode-no-daemon.log" 2>&1; then
+    echo "Mode command unexpectedly succeeded without a VeilShell daemon." >&2
+    exit 1
+fi
+[[ $(compositor_state) == "$before" ]]
+
+TRACE="${VEILSHELL_TEST_WAYLAND_DEBUG:-0}"
+if [[ "$RENDERER" == software ]]; then
+    TRACE=client
+fi
+WAYLAND_DEBUG="$TRACE" "$BIN/veilshell" --no-watchers --policy tablet \
+    --output "$OUTPUT" --renderer "$RENDERER" >"$OUT_DIR/veilshell.log" 2>&1 &
+DAEMON_PID=$!
+for _ in {1..50}; do
+    [[ -S "$VEILSHELL_SOCKET" ]] && break
+    kill -0 "$DAEMON_PID" 2>/dev/null || break
+    sleep 0.1
+done
+[[ -S "$VEILSHELL_SOCKET" ]] || { cat "$OUT_DIR/veilshell.log" >&2; exit 1; }
+
+echo "Checking mode transitions don't change compositor settings..."
+before="$(compositor_state)"
+[[ $("$BIN/veilctl" mode laptop) == "Mode set to Laptop "* ]]
+"$BIN/veilctl" status | grep -F 'visible: false'
+[[ $("$BIN/veilctl" mode tablet) == "Mode set to Tablet "* ]]
+"$BIN/veilctl" status | grep -F 'visible: true'
+[[ $(compositor_state) == "$before" ]]
+
+for orientation in landscape portrait; do
+    for factor in 1 1.5 2; do
+        case "$factor" in 1) w=960; h=640;; 1.5) w=1440; h=960;; 2) w=1920; h=1280;; esac
+        if [[ "$orientation" == portrait ]]; then
+            short="$h"
+            h="$w"
+            w="$short"
+        fi
+        configure_output "${w}x${h}" "$factor"
+        echo "Capturing $orientation @ ${factor}x ($RENDERER)..."
+        previous=""
+        for scene in home shade recents osk pill; do
+            "$BIN/veilctl" show "$scene" >/dev/null
+            image="$OUT_DIR/${orientation}-${factor}x-${scene}.png"
+            min_bytes=2000
+            if [[ "$scene" == pill ]]; then
+                min_bytes=500
+            fi
+            for _ in {1..8}; do
+                sleep 0.25
+                grim -o "$OUTPUT" -s "$factor" "$image"
+                if (( $(stat -c%s "$image") >= min_bytes )) &&
+                    { [[ -z "$previous" ]] || ! cmp -s "$image" "$previous"; }; then
+                    break
+                fi
+            done
+            if (( $(stat -c%s "$image") < min_bytes )) ||
+                { [[ -n "$previous" ]] && cmp -s "$image" "$previous"; }; then
+                echo "Blank or stale screenshot: $image" >&2
+                exit 1
+            fi
+            # PNG's IHDR stores frame dimensions as two big-endian 32-bit integers.
+            read -r actual_w actual_h < <(od --endian=big -An -j 16 -N 8 -t u4 "$image")
+            [[ "$actual_w" == "$w" && "$actual_h" == "$h" ]]
+            previous="$image"
+        done
+        if [[ "$RENDERER" == software ]] &&
+            ! grep -Eq "wl_shm_pool.*create_buffer\\(.*,[[:space:]]*$w, $h, $((w * 4)), " "$OUT_DIR/veilshell.log"; then
+            echo "No native ${w}x${h} SHM buffer for $orientation @ ${factor}x" >&2
+            exit 1
+        fi
+    done
 done
 
-echo "[5/5] Tier 3 nested Hyprland visual test PASSED!"
+"$BIN/veilctl" quit >/dev/null
+wait "$DAEMON_PID"
+DAEMON_PID=""
+if [[ "$RENDERER" == wgpu ]] && grep -E 'falling back|cannot present|using wl_shm' "$OUT_DIR/veilshell.log"; then
+    echo "The requested wgpu swapchain fell back during testing." >&2
+    exit 1
+fi
+echo "Nested visual checks passed. Screenshots: $OUT_DIR"

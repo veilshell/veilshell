@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use ab_glyph::{point, Font, FontArc, GlyphId, PxScale, ScaleFont};
 
-use crate::primitives::{TextAlign, TextLabel};
+use crate::primitives::{PixelScale, TextAlign, TextLabel};
 
 /// Bitmap fallback glyph width in base pixels.
 pub const GLYPH_W: u32 = 5;
@@ -40,7 +40,10 @@ pub struct RasterizedGlyph {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PositionedGlyph {
     pub ch: char,
+    /// Physical font width, in tenths of a pixel.
     pub px_tenths: u16,
+    /// Physical font height, in tenths of a pixel.
+    pub px_height_tenths: u16,
     pub x: i32,
     pub y: i32,
     pub glyph: Arc<RasterizedGlyph>,
@@ -55,7 +58,7 @@ pub enum TextLayout {
 
 struct SystemFont {
     font: FontArc,
-    cache: Mutex<HashMap<(char, u16), Arc<RasterizedGlyph>>>,
+    cache: Mutex<HashMap<(char, u16, u16), Arc<RasterizedGlyph>>>,
 }
 
 static SYSTEM_FONT: OnceLock<Option<SystemFont>> = OnceLock::new();
@@ -110,20 +113,20 @@ fn scale_to_px(scale: u32) -> f32 {
     }
 }
 
-fn rasterize_cached(
-    sys: &SystemFont,
-    ch: char,
-    px_size: f32,
-    px_tenths: u16,
-) -> Arc<RasterizedGlyph> {
+fn rasterize_cached(sys: &SystemFont, ch: char, px_tenths: (u16, u16)) -> Arc<RasterizedGlyph> {
+    let key = (ch, px_tenths.0, px_tenths.1);
     if let Ok(guard) = sys.cache.lock() {
-        if let Some(cached) = guard.get(&(ch, px_tenths)) {
+        if let Some(cached) = guard.get(&key) {
             return Arc::clone(cached);
         }
     }
 
     let id = sys.font.glyph_id(ch);
-    let glyph = id.with_scale_and_position(PxScale::from(px_size), point(0.0, 0.0));
+    let scale = PxScale {
+        x: f32::from(px_tenths.0) * 0.1,
+        y: f32::from(px_tenths.1) * 0.1,
+    };
+    let glyph = id.with_scale_and_position(scale, point(0.0, 0.0));
     let built = if let Some(outlined) = sys.font.outline_glyph(glyph) {
         let bb = outlined.px_bounds();
         let w = (bb.width().max(0.0).ceil() as u32).max(1);
@@ -153,7 +156,7 @@ fn rasterize_cached(
     };
 
     if let Ok(mut guard) = sys.cache.lock() {
-        guard.insert((ch, px_tenths), Arc::clone(&built));
+        return Arc::clone(guard.entry(key).or_insert(built));
     }
     built
 }
@@ -161,6 +164,13 @@ fn rasterize_cached(
 /// Lay out a [`TextLabel`] into positioned TrueType glyphs (or report `Bitmap5x7` fallback).
 #[must_use]
 pub fn layout_text_glyphs(label: &TextLabel) -> TextLayout {
+    layout_text_glyphs_scaled(label, PixelScale::ONE)
+}
+
+/// Lay out advances and alignment in logical space, then rasterize at the
+/// destination pixel size. Quantize the outline scale (not glyph positions) so
+/// rounded fractional viewport sizes don't introduce a new cache key per resize.
+pub(crate) fn layout_text_glyphs_scaled(label: &TextLabel, scale: PixelScale) -> TextLayout {
     let Some(sys) = system_font() else {
         return TextLayout::Bitmap5x7;
     };
@@ -168,10 +178,11 @@ pub fn layout_text_glyphs(label: &TextLabel) -> TextLayout {
         return TextLayout::TrueType(Vec::new());
     }
 
-    let scale = label.scale.max(1);
-    let px_size = scale_to_px(scale);
-    let px_scale = PxScale::from(px_size);
-    let px_tenths = (px_size * 10.0).round() as u16;
+    let font_tier = label.scale.max(1);
+    let logical_px = scale_to_px(font_tier);
+    let px_scale = PxScale::from(logical_px);
+    let quantize = |factor: f32| (logical_px * factor * 10.0).round().max(1.0) as u16;
+    let px_tenths = (quantize(scale.x), quantize(scale.y));
     let scaled = sys.font.as_scaled(px_scale);
 
     // Filter out missing glyphs (e.g. emoji in window titles) while preserving spaces.
@@ -216,8 +227,8 @@ pub fn layout_text_glyphs(label: &TextLabel) -> TextLayout {
                 .with_scale_and_position(px_scale, point(0.0, 0.0)),
         )
         .map_or_else(|| scaled.ascent() * 0.72, |g| g.px_bounds().height());
-    let baseline_y = label.y + f32::midpoint(f32::from(GLYPH_H as u8) * (scale as f32), cap_h);
-    let baseline_i32 = baseline_y.round() as i32;
+    let baseline_y = label.y + f32::midpoint(GLYPH_H as f32 * font_tier as f32, cap_h);
+    let baseline_i32 = (baseline_y * scale.y).round() as i32;
 
     let mut positioned = Vec::with_capacity(chars.len());
     let mut pen_x = start_x;
@@ -227,12 +238,13 @@ pub fn layout_text_glyphs(label: &TextLabel) -> TextLayout {
             pen_x += scaled.kern(prev, id);
         }
         if !ch.is_whitespace() {
-            let raster = rasterize_cached(sys, ch, px_size, px_tenths);
+            let raster = rasterize_cached(sys, ch, px_tenths);
             if raster.width > 0 && raster.height > 0 {
                 positioned.push(PositionedGlyph {
                     ch,
-                    px_tenths,
-                    x: (pen_x.round() as i32) + raster.offset_x,
+                    px_tenths: px_tenths.0,
+                    px_height_tenths: px_tenths.1,
+                    x: (pen_x * scale.x).round() as i32 + raster.offset_x,
                     y: baseline_i32 + raster.offset_y,
                     glyph: raster,
                 });
@@ -253,6 +265,37 @@ pub fn measure_text_width(text: &str, scale: u32) -> u32 {
         return 0;
     }
     (count * GLYPH_ADVANCE - 1) * scale.max(1)
+}
+
+/// Physical geometry for the 5x7 fallback, evaluated directly on the pixel
+/// grid rather than magnifying a rendered bitmap.
+pub(crate) struct BitmapLayout {
+    x: f32,
+    pub y: f32,
+    pub cell_x: f32,
+    pub cell_y: f32,
+}
+
+impl BitmapLayout {
+    pub fn new(label: &TextLabel, scale: PixelScale) -> Self {
+        let font_tier = label.scale.max(1);
+        let total_w = measure_text_width(&label.text, font_tier) as f32;
+        let x = match label.align {
+            TextAlign::Left => label.x,
+            TextAlign::Center => label.x - total_w * 0.5,
+            TextAlign::Right => label.x - total_w,
+        };
+        Self {
+            x: (x * scale.x).round(),
+            y: (label.y * scale.y).round(),
+            cell_x: font_tier as f32 * scale.x,
+            cell_y: font_tier as f32 * scale.y,
+        }
+    }
+
+    pub fn glyph_x(&self, index: usize) -> f32 {
+        self.x + index as f32 * GLYPH_ADVANCE as f32 * self.cell_x
+    }
 }
 
 /// Fit a single line to the renderer's actual font advance, with a short ellipsis.
@@ -367,5 +410,52 @@ pub const fn glyph_rows(ch: char) -> [u8; 7] {
         '`' => [0x08, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00],
         '^' => [0x04, 0x0A, 0x11, 0x00, 0x00, 0x00, 0x00],
         _ => [0x00; 7],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use veilshell_core::Rgba;
+
+    #[test]
+    fn glyph_masks_are_rasterized_and_cached_at_physical_pixel_sizes() {
+        let label = TextLabel {
+            x: 24.25,
+            y: 8.0,
+            text: "HW".into(),
+            scale: 2,
+            color: Rgba::from_rgb_u8(255, 255, 255),
+            align: TextAlign::Center,
+        };
+        let TextLayout::TrueType(logical) = layout_text_glyphs(&label) else {
+            return; // TrueType is optional; the bitmap path is tested separately.
+        };
+        let retina = PixelScale { x: 2.0, y: 2.0 };
+        let fractional = PixelScale { x: 2.0, y: 1.5 };
+        let TextLayout::TrueType(double) = layout_text_glyphs_scaled(&label, retina) else {
+            panic!("expected TrueType layout");
+        };
+        let TextLayout::TrueType(mixed) = layout_text_glyphs_scaled(&label, fractional) else {
+            panic!("expected TrueType layout");
+        };
+        let TextLayout::TrueType(repeated) = layout_text_glyphs_scaled(&label, retina) else {
+            panic!("expected TrueType layout");
+        };
+        assert_eq!(logical.len(), 2);
+        assert_eq!(double.len(), logical.len());
+        assert_eq!(mixed.len(), logical.len());
+        let low = &logical[0];
+        let high = &double[0];
+        let mixed = &mixed[0];
+        assert!(high.glyph.width > low.glyph.width);
+        assert!(high.glyph.height > mixed.glyph.height);
+        assert_eq!(high.px_tenths, mixed.px_tenths);
+        assert_ne!(high.px_height_tenths, mixed.px_height_tenths);
+        assert!(!Arc::ptr_eq(&high.glyph, &mixed.glyph));
+        assert!(Arc::ptr_eq(&high.glyph, &repeated[0].glyph));
+        // Pixel snapping takes place *after* mapping the logical text origin.
+        let origin = |g: &PositionedGlyph| g.x - g.glyph.offset_x;
+        assert!((2 * origin(low) - origin(high)).abs() <= 1);
     }
 }

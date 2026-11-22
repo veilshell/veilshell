@@ -1,6 +1,8 @@
 -- Standalone session; do not source the user's regular Hyprland config.
 hl.monitor({ output = "", mode = "preferred", position = "auto", scale = "auto" })
 hl.config({
+    -- GSettings is shared by the user's other desktops.
+    cursor = { sync_gsettings_theme = false },
     misc = {
         disable_hyprland_logo = true,
         disable_splash_rendering = true,

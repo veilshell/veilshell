@@ -26,5 +26,12 @@ done
 "$VEILCTL" snapshot --demo --scene home --home-position 0.5 --width 390 --height 518 --out "$OUT_DIR/home-page-drag.png"
 "$VEILCTL" snapshot --demo --scene shade --progress 0.55 --out "$OUT_DIR/shade-pull.png"
 
+for scale in 1.5 2; do
+    "$VEILCTL" snapshot --scene home --width 960 --height 640 --scale "$scale" \
+        --out "$OUT_DIR/home-installed-${scale}x.png"
+    "$VEILCTL" snapshot --demo --scene shade --width 390 --height 640 --scale "$scale" \
+        --out "$OUT_DIR/shade-portrait-${scale}x.png"
+done
+
 echo "All Tier 2 snapshots generated in $OUT_DIR"
 ls -lh "$OUT_DIR"

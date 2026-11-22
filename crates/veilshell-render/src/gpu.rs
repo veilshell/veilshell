@@ -11,11 +11,12 @@ use bytemuck::{Pod, Zeroable};
 use veilshell_core::{Rgba, ThemePalette};
 
 use crate::font::{
-    glyph_rows, layout_text_glyphs, measure_text_width, PositionedGlyph, TextLayout, GLYPH_ADVANCE,
-    GLYPH_H, GLYPH_W,
+    glyph_rows, layout_text_glyphs_scaled, BitmapLayout, PositionedGlyph, TextLayout, GLYPH_H,
+    GLYPH_W,
 };
 use crate::primitives::{
-    DrawCommand, DrawList, ImageQuad, RgbaImage, RoundedRect, SceneOutput, TextAlign, TextLabel,
+    DrawCommand, DrawList, ImageQuad, PixelScale, RenderTarget, RgbaImage, RoundedRect,
+    SceneOutput, TextLabel,
 };
 use crate::scene::{build_scene, build_scene_layout, build_top_strip_scene, SceneContext};
 use crate::{RenderError, RenderFrame, RendererBackend, SceneKind, SnapshotSpec, WallpaperImage};
@@ -32,6 +33,7 @@ const KIND_ALPHA_GLYPH: u32 = 5;
 
 const INITIAL_INSTANCE_CAPACITY: usize = 512;
 const INITIAL_ATLAS_SIZE: u32 = 1024;
+const MAX_ATLAS_SIZE: u32 = 4096;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -44,7 +46,7 @@ struct ViewportUniforms {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum AtlasKey {
-    Glyph { ch: char, px_tenths: u16 },
+    Glyph { ch: char, px_tenths: (u16, u16) },
     Image(u64),
 }
 
@@ -129,7 +131,7 @@ impl GpuAtlas {
     ) -> Option<AtlasSlot> {
         let key = AtlasKey::Glyph {
             ch: pg.ch,
-            px_tenths: pg.px_tenths,
+            px_tenths: (pg.px_tenths, pg.px_height_tenths),
         };
         if let Some(slot) = self.entries.get(&key).copied() {
             return Some(slot);
@@ -239,24 +241,27 @@ impl GpuAtlas {
         Some(slot)
     }
 
-    fn reset_or_grow(&mut self, device: &wgpu::Device, max_dim: u32) -> bool {
+    fn reset(&mut self) {
         self.cursor_x = 0;
         self.cursor_y = 0;
         self.row_h = 0;
         self.entries.clear();
+    }
 
-        let target_dim = (self.width.saturating_mul(2)).min(max_dim).min(4096);
-        if self.width < 2048.min(max_dim) && target_dim > self.width {
-            self.width = target_dim;
-            self.height = target_dim;
-            self.texture = create_atlas_texture(device, target_dim, target_dim);
-            self.view = self
-                .texture
-                .create_view(&wgpu::TextureViewDescriptor::default());
-            true
-        } else {
-            false
+    fn grow(&mut self, device: &wgpu::Device) -> bool {
+        let limit = device.limits().max_texture_dimension_2d.min(MAX_ATLAS_SIZE);
+        let target_dim = (self.width * 2).min(limit);
+        if target_dim <= self.width {
+            return false;
         }
+        self.reset();
+        self.width = target_dim;
+        self.height = target_dim;
+        self.texture = create_atlas_texture(device, target_dim, target_dim);
+        self.view = self
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        true
     }
 }
 
@@ -815,11 +820,27 @@ impl WgpuRenderer {
         height: u32,
         list: &DrawList,
     ) -> Result<(), RenderError> {
-        if width == 0 || height == 0 {
-            return Err(RenderError::InvalidViewport);
-        }
+        self.render_to_texture_view_scaled(
+            view,
+            format,
+            RenderTarget::unscaled(width, height)?,
+            list,
+        )
+    }
 
-        let primitives = self.encode_frame_primitives(list, width as f32, height as f32);
+    /// Render logical draw commands directly into a texture of the target's physical size.
+    ///
+    /// # Errors
+    /// Returns [`RenderError::Gpu`] if the physical size exceeds device limits.
+    pub fn render_to_texture_view_scaled(
+        &mut self,
+        view: &wgpu::TextureView,
+        format: wgpu::TextureFormat,
+        target: RenderTarget,
+        list: &DrawList,
+    ) -> Result<(), RenderError> {
+        let (width, height) = self.check_target_size(target)?;
+        let primitives = self.encode_frame_primitives(list, target)?;
         self.upload_frame_data(width, height, &primitives);
         self.ensure_pipeline(format);
 
@@ -883,14 +904,23 @@ impl WgpuRenderer {
         height: u32,
         list: &DrawList,
     ) -> Result<RenderFrame, RenderError> {
-        if width == 0 || height == 0 {
-            return Err(RenderError::InvalidViewport);
-        }
+        self.rasterize_scaled(RenderTarget::unscaled(width, height)?, list)
+    }
 
-        let primitives = self.encode_frame_primitives(list, width as f32, height as f32);
+    /// Rasterize logical draw commands into a straight `RGBA8` frame at physical size.
+    ///
+    /// # Errors
+    /// Returns [`RenderError::Gpu`] if the target exceeds device limits or GPU readback fails.
+    pub fn rasterize_scaled(
+        &mut self,
+        target: RenderTarget,
+        list: &DrawList,
+    ) -> Result<RenderFrame, RenderError> {
+        let (width, height) = self.check_target_size(target)?;
+        self.ensure_offscreen_target(width, height)?;
+        let primitives = self.encode_frame_primitives(list, target)?;
         self.upload_frame_data(width, height, &primitives);
         self.ensure_pipeline(wgpu::TextureFormat::Rgba8Unorm);
-        self.ensure_offscreen_target(width, height);
 
         let target = self
             .offscreen
@@ -903,30 +933,12 @@ impl WgpuRenderer {
                 label: Some("veilshell-offscreen-encoder"),
             });
 
-        {
-            let pipeline = &self.pipelines[&wgpu::TextureFormat::Rgba8Unorm];
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("veilshell-sdf-offscreen-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target.view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            if !primitives.is_empty() {
-                rpass.set_pipeline(pipeline);
-                rpass.set_bind_group(0, &self.sdf_bind_group, &[]);
-                rpass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-                rpass.draw(0..6, 0..primitives.len() as u32);
-            }
-        }
+        self.record_sdf_pass(
+            &mut encoder,
+            &target.view,
+            wgpu::TextureFormat::Rgba8Unorm,
+            primitives.len() as u32,
+        );
 
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -981,18 +993,32 @@ impl WgpuRenderer {
         })
     }
 
+    fn check_target_size(&self, target: RenderTarget) -> Result<(u32, u32), RenderError> {
+        let (width, height) = target.physical_size();
+        let max = self.device.limits().max_texture_dimension_2d;
+        if width > max || height > max {
+            return Err(RenderError::Gpu(format!(
+                "{width}x{height} render target exceeds GPU texture dimension limit {max}"
+            )));
+        }
+        Ok((width, height))
+    }
+
     fn encode_frame_primitives(
         &mut self,
         list: &DrawList,
-        width: f32,
-        height: f32,
-    ) -> Vec<GpuPrimitive> {
-        if let Some(prims) = encode_draw_list(list, width, height, &self.queue, &mut self.atlas) {
-            return prims;
+        target: RenderTarget,
+    ) -> Result<Vec<GpuPrimitive>, RenderError> {
+        if let Some(prims) = encode_draw_list(list, target, &self.queue, &mut self.atlas) {
+            return Ok(prims);
         }
-        let max_dim = self.device.limits().max_texture_dimension_2d.min(4096);
-        let grew = self.atlas.reset_or_grow(&self.device, max_dim);
-        if grew {
+        // Old icon pages and font sizes can accumulate. Only grow when the
+        // current frame itself doesn't fit after discarding those entries.
+        self.atlas.reset();
+        if let Some(prims) = encode_draw_list(list, target, &self.queue, &mut self.atlas) {
+            return Ok(prims);
+        }
+        while self.atlas.grow(&self.device) {
             let wp_view = self
                 .wallpaper_texture
                 .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1004,8 +1030,14 @@ impl WgpuRenderer {
                 &self.wallpaper_sampler,
                 &self.atlas.view,
             );
+            if let Some(prims) = encode_draw_list(list, target, &self.queue, &mut self.atlas) {
+                return Ok(prims);
+            }
         }
-        encode_draw_list(list, width, height, &self.queue, &mut self.atlas).unwrap_or_default()
+        Err(RenderError::Gpu(format!(
+            "scene exceeds {}x{} GPU glyph/image atlas",
+            self.atlas.width, self.atlas.height
+        )))
     }
 
     fn upload_frame_data(&mut self, width: u32, height: u32, primitives: &[GpuPrimitive]) {
@@ -1106,15 +1138,24 @@ impl WgpuRenderer {
         }
     }
 
-    fn ensure_offscreen_target(&mut self, width: u32, height: u32) {
+    fn ensure_offscreen_target(&mut self, width: u32, height: u32) -> Result<(), RenderError> {
         let matches = self
             .offscreen
             .as_ref()
             .is_some_and(|t| t.width == width && t.height == height);
         if matches {
-            return;
+            return Ok(());
         }
 
+        let unpadded = width * 4;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = unpadded.div_ceil(align) * align;
+        let buffer_size = u64::from(padded_bytes_per_row) * u64::from(height);
+        if buffer_size > self.device.limits().max_buffer_size {
+            return Err(RenderError::Gpu(format!(
+                "{width}x{height} readback exceeds GPU buffer size limit"
+            )));
+        }
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("veilshell-offscreen-color"),
             size: wgpu::Extent3d {
@@ -1131,10 +1172,6 @@ impl WgpuRenderer {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let unpadded = width * 4;
-        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let padded_bytes_per_row = unpadded.div_ceil(align) * align;
-        let buffer_size = u64::from(padded_bytes_per_row) * u64::from(height);
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("veilshell-offscreen-readback"),
             size: buffer_size,
@@ -1150,6 +1187,7 @@ impl WgpuRenderer {
             readback,
             padded_bytes_per_row,
         });
+        Ok(())
     }
 }
 
@@ -1163,12 +1201,15 @@ impl RendererBackend for WgpuRenderer {
         spec: &SnapshotSpec,
         palette: &ThemePalette,
     ) -> Result<RenderFrame, RenderError> {
-        let (w, h) = spec.viewport.physical_pixels();
-        if w == 0 || h == 0 || !spec.viewport.scale.is_finite() || spec.viewport.scale <= 0.0 {
-            return Err(RenderError::InvalidViewport);
-        }
-        let list = build_scene(spec.scene, w as f32, h as f32, palette, &self.context);
-        self.rasterize(w, h, &list)
+        let target = spec.viewport.render_target()?;
+        let list = build_scene(
+            spec.scene,
+            spec.viewport.width as f32,
+            spec.viewport.height as f32,
+            palette,
+            &self.context,
+        );
+        self.rasterize_scaled(target, &list)
     }
 }
 
@@ -1320,17 +1361,18 @@ const fn rgba_arr(c: Rgba) -> [f32; 4] {
 
 fn encode_draw_list(
     list: &DrawList,
-    width: f32,
-    height: f32,
+    target: RenderTarget,
     queue: &wgpu::Queue,
     atlas: &mut GpuAtlas,
 ) -> Option<Vec<GpuPrimitive>> {
+    let (width, height) = target.physical_size();
+    let scale = target.pixel_scale();
     let mut out = Vec::with_capacity(list.commands.len() * 4);
     for cmd in &list.commands {
         match cmd {
             DrawCommand::BackdropGradient { top, bottom } => {
                 out.push(GpuPrimitive {
-                    rect: [0.0, 0.0, width, height],
+                    rect: [0.0, 0.0, width as f32, height as f32],
                     color0: rgba_arr(*top),
                     color1: rgba_arr(*bottom),
                     params0: [0.0; 4],
@@ -1345,24 +1387,26 @@ fn encode_draw_list(
                 color,
             } => {
                 if *radius > 1.0 && color.a > 0.001 {
+                    let (cx, cy, radius) =
+                        (*cx * scale.x, *cy * scale.y, *radius * scale.uniform());
                     out.push(GpuPrimitive {
-                        rect: [*cx - *radius, *cy - *radius, *radius * 2.0, *radius * 2.0],
+                        rect: [cx - radius, cy - radius, radius * 2.0, radius * 2.0],
                         color0: rgba_arr(*color),
                         color1: [0.0; 4],
-                        params0: [*cx, *cy, *radius, 0.0],
+                        params0: [cx, cy, radius, 0.0],
                         params1: [0.0; 4],
                         meta: [KIND_GLOW, 0, 0, 0],
                     });
                 }
             }
-            DrawCommand::Rect(rect) => push_rect_primitive(&mut out, *rect),
+            DrawCommand::Rect(rect) => push_rect_primitive(&mut out, *rect, scale),
             DrawCommand::Text(label) => {
-                if !push_text_primitives(&mut out, label, queue, atlas) {
+                if !push_text_primitives(&mut out, label, scale, queue, atlas) {
                     return None;
                 }
             }
             DrawCommand::Image(quad) => {
-                if !push_image_primitive(&mut out, quad, queue, atlas) {
+                if !push_image_primitive(&mut out, quad, scale, queue, atlas) {
                     return None;
                 }
             }
@@ -1374,6 +1418,7 @@ fn encode_draw_list(
 fn push_image_primitive(
     out: &mut Vec<GpuPrimitive>,
     quad: &ImageQuad,
+    scale: PixelScale,
     queue: &wgpu::Queue,
     atlas: &mut GpuAtlas,
 ) -> bool {
@@ -1387,21 +1432,24 @@ fn push_image_primitive(
         return false;
     };
     out.push(GpuPrimitive {
-        rect: [quad.x, quad.y, quad.w, quad.h],
+        rect: quad.physical_bounds(scale),
         color0: [1.0, 1.0, 1.0, quad.alpha],
         color1: [0.0; 4],
         params0: [slot.x as f32, slot.y as f32, slot.w as f32, slot.h as f32],
-        params1: [quad.radius, 0.0, 0.0, 0.0],
+        params1: [quad.radius * scale.uniform(), 0.0, 0.0, 0.0],
         meta: [KIND_IMAGE, 0, 0, 0],
     });
     true
 }
 
-fn push_rect_primitive(out: &mut Vec<GpuPrimitive>, rect: RoundedRect) {
+fn push_rect_primitive(out: &mut Vec<GpuPrimitive>, rect: RoundedRect, scale: PixelScale) {
     if rect.w <= 0.0 || rect.h <= 0.0 {
         return;
     }
-    let pad = if rect.shadow_alpha > 0.001 && rect.shadow_radius > 0.5 {
+    let has_shadow = rect.shadow_alpha > 0.001 && rect.shadow_radius > 0.5;
+    let has_border = rect.border_width > 0.01;
+    let rect = rect.scaled(scale);
+    let pad = if has_shadow {
         rect.shadow_radius + rect.shadow_offset_y.abs() + 2.0
     } else {
         2.0
@@ -1412,14 +1460,14 @@ fn push_rect_primitive(out: &mut Vec<GpuPrimitive>, rect: RoundedRect) {
         color1: rgba_arr(rect.border_color),
         params0: [
             rect.radius,
-            rect.border_width,
+            if has_border { rect.border_width } else { 0.0 },
             rect.top_highlight_alpha,
             pad,
         ],
         params1: [
             rect.shadow_radius,
             rect.shadow_offset_y,
-            rect.shadow_alpha,
+            if has_shadow { rect.shadow_alpha } else { 0.0 },
             0.0,
         ],
         meta: [KIND_RECT, 0, 0, 0],
@@ -1429,6 +1477,7 @@ fn push_rect_primitive(out: &mut Vec<GpuPrimitive>, rect: RoundedRect) {
 fn push_text_primitives(
     out: &mut Vec<GpuPrimitive>,
     label: &TextLabel,
+    scale: PixelScale,
     queue: &wgpu::Queue,
     atlas: &mut GpuAtlas,
 ) -> bool {
@@ -1436,7 +1485,7 @@ fn push_text_primitives(
         return true;
     }
     let color = rgba_arr(label.color);
-    match layout_text_glyphs(label) {
+    match layout_text_glyphs_scaled(label, scale) {
         TextLayout::TrueType(glyphs) => {
             for pg in glyphs {
                 let Some(slot) = atlas.get_or_upload_glyph(queue, &pg) else {
@@ -1459,18 +1508,9 @@ fn push_text_primitives(
             true
         }
         TextLayout::Bitmap5x7 => {
-            let scale = label.scale.max(1);
-            let total_w = measure_text_width(&label.text, scale) as f32;
-            let start_x = match label.align {
-                TextAlign::Left => label.x,
-                TextAlign::Center => label.x - total_w * 0.5,
-                TextAlign::Right => label.x - total_w,
-            }
-            .round();
-            let start_y = label.y.round();
-            let advance = (GLYPH_ADVANCE * scale) as f32;
-            let gw = (GLYPH_W * scale) as f32;
-            let gh = (GLYPH_H * scale) as f32;
+            let layout = BitmapLayout::new(label, scale);
+            let gw = GLYPH_W as f32 * layout.cell_x;
+            let gh = GLYPH_H as f32 * layout.cell_y;
 
             for (idx, ch) in label.text.chars().enumerate() {
                 let rows = glyph_rows(ch);
@@ -1483,12 +1523,11 @@ fn push_text_primitives(
                     | (u32::from(rows[3]) << 15);
                 let bits_hi =
                     u32::from(rows[4]) | (u32::from(rows[5]) << 5) | (u32::from(rows[6]) << 10);
-                let gx = start_x + idx as f32 * advance;
                 out.push(GpuPrimitive {
-                    rect: [gx, start_y, gw, gh],
+                    rect: [layout.glyph_x(idx), layout.y, gw, gh],
                     color0: color,
                     color1: [0.0; 4],
-                    params0: [scale as f32, 0.0, 0.0, 0.0],
+                    params0: [layout.cell_x, layout.cell_y, 0.0, 0.0],
                     params1: [0.0; 4],
                     meta: [KIND_GLYPH, bits_lo, bits_hi, 0],
                 });
@@ -1525,4 +1564,36 @@ fn unpremultiply_padded_rows(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn wgpu_grows_atlas_for_high_resolution_assets() {
+        let Ok(mut gpu) = WgpuRenderer::new() else {
+            return;
+        };
+        if gpu.device().limits().max_texture_dimension_2d < MAX_ATLAS_SIZE {
+            return;
+        }
+
+        let mut list = DrawList::default();
+        // A padded 2048-wide image needs another growth step.
+        list.push_image(ImageQuad {
+            x: 0.0,
+            y: 0.0,
+            w: 20.0,
+            h: 10.0,
+            radius: 0.0,
+            alpha: 1.0,
+            image: Arc::new(RgbaImage::new(2048, 8, vec![255; 2048 * 8 * 4]).unwrap()),
+        });
+        let target = RenderTarget::new((20, 10), (40, 20)).unwrap();
+        let frame = gpu.rasterize_scaled(target, &list).unwrap();
+        assert_eq!((frame.width, frame.height), (40, 20));
+        assert!(frame.rgba.iter().all(|&channel| channel == 255));
+    }
 }

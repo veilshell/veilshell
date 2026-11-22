@@ -14,7 +14,7 @@ use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::{
     wl_output, wl_pointer, wl_seat, wl_shm, wl_surface, wl_touch,
 };
-use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
+use smithay_client_toolkit::reexports::client::{Connection, Proxy, QueueHandle};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
 use smithay_client_toolkit::seat::touch::TouchHandler;
@@ -33,6 +33,8 @@ use veilshell_core::{
     OskState, Spring, SpringParams, ThemePalette,
 };
 use veilshell_render::power::{PowerAction, PowerInput, PowerMenu};
+#[cfg(feature = "wgpu")]
+use veilshell_render::SdfSoftwareRenderer;
 use veilshell_render::{
     build_scene, build_scene_layout, build_top_strip_scene, home_page_count, home_reveal_travel,
     recents_stride, shade_reveal_travel, ActiveRenderer, DrawList, HitTarget, SceneContext,
@@ -44,6 +46,7 @@ use crate::capture::ToplevelCaptureState;
 use crate::gpu::WgpuWaylandSurface;
 use crate::motion::{horizontal, slider_pct_for_y, vertical, DragMotion, DragVelocity, SliderDrag};
 use crate::osk::{OskRepeat, OskWaylandState};
+use crate::scale::{FractionalScaleGlobals, SurfaceFrame, SurfaceScaling};
 use crate::{LayerRole, LayerSurfaceSpec, WaylandRuntimeConfig};
 
 /// Errors raised while connecting to or running the `Wayland` layer-shell client.
@@ -192,8 +195,15 @@ struct ManagedSurface {
     // (and its Vulkan/EGL swapchain) is always destroyed before the underlying `wl_surface`.
     #[cfg(feature = "wgpu")]
     gpu_surface: Option<WgpuWaylandSurface>,
+    // The fractional-scale and viewport objects belong to this wl_surface.
+    scaling: SurfaceScaling,
     layer: LayerSurface,
     pool: Option<SlotPool>,
+    #[cfg(feature = "wgpu")]
+    shm_fallback: Option<Box<SdfSoftwareRenderer>>,
+    #[cfg(feature = "wgpu")]
+    retry_at: Option<Instant>,
+    // Layer configure sizes and all layout/input coordinates are logical.
     width: u32,
     height: u32,
     configured: bool,
@@ -202,9 +212,22 @@ struct ManagedSurface {
 }
 
 impl ManagedSurface {
-    fn create(app: &LayerApp, role: LayerRole) -> Result<Self, WaylandError> {
+    fn create(app: &LayerApp, role: LayerRole) -> Self {
         let spec = LayerSurfaceSpec::for_role(role, app.viewport_w, app.viewport_h);
-        let wl_surface = app.compositor.create_surface(&app.qh);
+        // On older surfaces SCTK infers the scale from entered outputs. Seed
+        // it from the known target so the first pre-enter buffer is sharp.
+        // On v6+, the surface itself receives preferred_buffer_scale.
+        let initial_factor = if app.compositor.wl_compositor().version() < 6 {
+            app.target_output
+                .as_ref()
+                .and_then(|output| app.output_state.info(output))
+                .map_or(1, |info| info.scale_factor.max(1))
+        } else {
+            1
+        };
+        let wl_surface = app
+            .compositor
+            .create_surface_with_data(&app.qh, None, initial_factor, ());
         let layer = app.layer_shell.create_layer_surface(
             &app.qh,
             wl_surface,
@@ -246,6 +269,12 @@ impl ManagedSurface {
             spec.height
         };
         layer.set_size(req_w, req_h);
+        let scaling = SurfaceScaling::new(
+            app.fractional_scale.as_ref(),
+            &app.qh,
+            layer.wl_surface(),
+            initial_factor,
+        );
         layer.commit();
 
         #[cfg(feature = "wgpu")]
@@ -261,32 +290,22 @@ impl ManagedSurface {
             }
         });
 
-        #[cfg(feature = "wgpu")]
-        let need_shm = gpu_surface.is_none();
-        #[cfg(not(feature = "wgpu"))]
-        let need_shm = true;
-
-        let pool = if need_shm {
-            let initial_bytes = (spec.width.max(1) as usize) * (spec.height.max(1) as usize) * 4;
-            Some(
-                SlotPool::new((initial_bytes * 2).max(1024 * 64), &app.shm)
-                    .map_err(|e| WaylandError::Runtime(format!("shm slot pool: {e}")))?,
-            )
-        } else {
-            None
-        };
-
-        Ok(Self {
+        Self {
             #[cfg(feature = "wgpu")]
             gpu_surface,
+            scaling,
             layer,
-            pool,
+            pool: None,
+            #[cfg(feature = "wgpu")]
+            shm_fallback: None,
+            #[cfg(feature = "wgpu")]
+            retry_at: None,
             width: spec.width,
             height: spec.height,
             configured: false,
             frame_pending: false,
             redraw_pending: false,
-        })
+        }
     }
 
     fn present_draw_list(
@@ -297,24 +316,39 @@ impl ManagedSurface {
         list: &DrawList,
         request_frame_callback: bool,
     ) -> bool {
-        if !self.configured || self.width == 0 || self.height == 0 {
+        if !self.configured {
             return false;
         }
+        #[cfg(feature = "wgpu")]
+        {
+            self.retry_at = None;
+        }
+        let Some(frame) = self.scaling.frame((self.width, self.height)) else {
+            eprintln!(
+                "veilshell: invalid buffer size for {}x{} surface",
+                self.width, self.height
+            );
+            return false;
+        };
 
         #[cfg(feature = "wgpu")]
         if let (Some(gpu_surf), Some(gpu_renderer)) =
             (self.gpu_surface.as_mut(), renderer.as_wgpu_mut())
         {
-            match gpu_surf.present_draw_list(
-                gpu_renderer,
-                self.width,
-                self.height,
-                list,
-                self.layer.wl_surface(),
-                qh,
-                request_frame_callback,
-            ) {
-                Ok(()) => return true,
+            let surface = self.layer.wl_surface();
+            let scaling = &mut self.scaling;
+            match gpu_surf.present_draw_list(gpu_renderer, frame.target, list, || {
+                scaling.apply(surface, frame);
+                if request_frame_callback {
+                    surface.frame(qh, FrameCallbackData(surface.clone()));
+                }
+            }) {
+                Ok(true) => return true,
+                Ok(false) => {
+                    // A timeout committed nothing and cannot produce a callback.
+                    self.retry_at = Some(Instant::now() + Duration::from_millis(16));
+                    return false;
+                }
                 Err(err) => {
                     eprintln!(
                         "veilshell: wgpu present failed ({err}); falling back to wl_shm for this surface"
@@ -324,28 +358,25 @@ impl ManagedSurface {
             }
         }
 
-        match renderer.rasterize(self.width, self.height, list) {
-            Ok(frame) => self.commit_shm_frame(qh, shm, &frame, request_frame_callback),
-            Err(err) => {
-                eprintln!("veilshell: rasterize failed: {err}");
-                false
-            }
-        }
+        self.present_shm_draw_list(qh, shm, renderer, list, frame, request_frame_callback)
     }
 
-    fn commit_shm_frame(
+    fn present_shm_draw_list(
         &mut self,
         qh: &QueueHandle<LayerApp>,
         shm: &Shm,
-        frame: &veilshell_render::RenderFrame,
+        renderer: &mut ActiveRenderer,
+        list: &DrawList,
+        frame: SurfaceFrame,
         request_frame_callback: bool,
     ) -> bool {
-        if !self.configured || self.width == 0 || self.height == 0 {
+        let (width, height) = frame.target.physical_size();
+        let Some((width, height, stride, pool_bytes)) = shm_buffer_geometry(width, height) else {
+            eprintln!("veilshell: invalid wl_shm buffer size {width}x{height}");
             return false;
-        }
+        };
         if self.pool.is_none() {
-            let initial_bytes = (self.width as usize) * (self.height as usize) * 4;
-            match SlotPool::new((initial_bytes * 2).max(1024 * 64), shm) {
+            match SlotPool::new(pool_bytes, shm) {
                 Ok(pool) => self.pool = Some(pool),
                 Err(err) => {
                     eprintln!("veilshell: lazy shm slot pool failed: {err}");
@@ -357,37 +388,50 @@ impl ManagedSurface {
             return false;
         };
 
-        let argb = frame.to_argb8888_premultiplied();
-        let stride = i32::try_from(self.width * 4).unwrap_or(i32::MAX);
-        let (buffer, canvas) = match pool.create_buffer(
-            i32::try_from(self.width).unwrap_or(1),
-            i32::try_from(self.height).unwrap_or(1),
-            stride,
-            wl_shm::Format::Argb8888,
-        ) {
-            Ok(pair) => pair,
+        // If this surface cannot use a swapchain, avoid GPU readback and
+        // any dependency on the GPU's maximum renderable dimensions.
+        #[cfg(feature = "wgpu")]
+        let rasterized = if renderer.as_wgpu().is_some() {
+            self.shm_fallback
+                .get_or_insert_with(Box::default)
+                .rasterize_scaled(frame.target, list)
+        } else {
+            renderer.rasterize_scaled(frame.target, list)
+        };
+        #[cfg(not(feature = "wgpu"))]
+        let rasterized = renderer.rasterize_scaled(frame.target, list);
+        let pixels = match rasterized {
+            Ok(pixels) => pixels,
             Err(err) => {
-                eprintln!(
-                    "veilshell: shm create_buffer({}x{}) failed: {err}",
-                    self.width, self.height
-                );
+                eprintln!("veilshell: rasterize failed: {err}");
                 return false;
             }
         };
-
-        let copy_len = canvas.len().min(argb.len());
-        canvas[..copy_len].copy_from_slice(&argb[..copy_len]);
+        let (buffer, canvas) =
+            match pool.create_buffer(width, height, stride, wl_shm::Format::Argb8888) {
+                Ok(pair) => pair,
+                Err(err) => {
+                    eprintln!("veilshell: shm create_buffer({width}x{height}) failed: {err}");
+                    return false;
+                }
+            };
+        pixels.write_argb8888_premultiplied(canvas);
 
         let surface = self.layer.wl_surface();
-        surface.damage_buffer(
-            0,
-            0,
-            i32::try_from(self.width).unwrap_or(1),
-            i32::try_from(self.height).unwrap_or(1),
-        );
         if let Err(err) = buffer.attach_to(surface) {
             eprintln!("veilshell: buffer.attach_to failed: {err}");
             return false;
+        }
+        self.scaling.apply(surface, frame);
+        if surface.version() >= 4 {
+            surface.damage_buffer(0, 0, width, height);
+        } else {
+            surface.damage(
+                0,
+                0,
+                i32::try_from(self.width).unwrap_or(i32::MAX),
+                i32::try_from(self.height).unwrap_or(i32::MAX),
+            );
         }
         if request_frame_callback {
             surface.frame(qh, FrameCallbackData(surface.clone()));
@@ -397,6 +441,20 @@ impl ManagedSurface {
     }
 }
 
+/// Dimensions and bytes accepted by `wl_shm` and its signed-size slot pool.
+fn shm_buffer_geometry(width: u32, height: u32) -> Option<(i32, i32, i32, usize)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let width = i32::try_from(width).ok()?;
+    let height = i32::try_from(height).ok()?;
+    let stride = width.checked_mul(4)?;
+    let len = u64::try_from(i64::from(stride) * i64::from(height)).ok()?;
+    // SCTK rounds slots up to 64 bytes. Leave room for at least two buffers.
+    let pool_bytes = i32::try_from((len.next_multiple_of(64) * 2).max(64 * 1024)).ok()?;
+    Some((width, height, stride, pool_bytes as usize))
+}
+
 pub(crate) struct LayerApp {
     qh: QueueHandle<Self>,
     registry_state: RegistryState,
@@ -404,6 +462,7 @@ pub(crate) struct LayerApp {
     layer_shell: LayerShell,
     seat_state: SeatState,
     output_state: OutputState,
+    fractional_scale: Option<FractionalScaleGlobals>,
     pub(crate) shm: Shm,
     target_output: Option<wl_output::WlOutput>,
     output_name: Option<String>,
@@ -447,19 +506,14 @@ impl LayerApp {
         if self.active_scene == SceneKind::Osk {
             self.pill = None;
         } else if self.pill.is_none() {
-            match ManagedSurface::create(self, LayerRole::BottomPill) {
-                Ok(surf) => self.pill = Some(surf),
-                Err(err) => eprintln!("veilshell: failed to create bottom pill surface: {err}"),
-            }
+            self.pill = Some(ManagedSurface::create(self, LayerRole::BottomPill));
         }
 
         if self.active_scene == SceneKind::Pill {
             self.overlay = None;
             self.overlay_layout = None;
             if self.top_strip.is_none() {
-                if let Ok(surf) = ManagedSurface::create(self, LayerRole::TopStrip) {
-                    self.top_strip = Some(surf);
-                }
+                self.top_strip = Some(ManagedSurface::create(self, LayerRole::TopStrip));
             }
         } else {
             // Destroying the origin of the pull would cancel the Wayland grab.
@@ -472,10 +526,7 @@ impl LayerApp {
             }
             if self.overlay.is_none() {
                 let role = LayerRole::from_scene(self.active_scene);
-                match ManagedSurface::create(self, role) {
-                    Ok(surf) => self.overlay = Some(surf),
-                    Err(err) => eprintln!("veilshell: failed to create overlay surface: {err}"),
-                }
+                self.overlay = Some(ManagedSurface::create(self, role));
             }
         }
     }
@@ -544,10 +595,6 @@ impl LayerApp {
         }
 
         self.sync_surfaces();
-        if scene != SceneKind::Pill && self.overlay.is_none() {
-            self.show_scene(SceneKind::Pill, false);
-            return;
-        }
         self.draw_pill();
         self.draw_top_strip();
         self.draw_overlay();
@@ -673,6 +720,70 @@ impl LayerApp {
             Some(SurfaceKind::Overlay)
         } else {
             None
+        }
+    }
+
+    fn managed_surface_mut(&mut self, kind: SurfaceKind) -> Option<&mut ManagedSurface> {
+        match kind {
+            SurfaceKind::Pill => self.pill.as_mut(),
+            SurfaceKind::TopStrip => self.top_strip.as_mut(),
+            SurfaceKind::Overlay => self.overlay.as_mut(),
+        }
+    }
+
+    fn draw_surface(&mut self, kind: SurfaceKind) {
+        match kind {
+            SurfaceKind::Pill => self.draw_pill(),
+            SurfaceKind::TopStrip => self.draw_top_strip(),
+            SurfaceKind::Overlay => self.draw_overlay(),
+        }
+    }
+
+    pub(crate) fn fractional_scale_changed(&mut self, surface: &wl_surface::WlSurface, units: u32) {
+        if let Some(kind) = self.surface_kind(surface) {
+            if self
+                .managed_surface_mut(kind)
+                .is_some_and(|s| s.scaling.update_fractional(units))
+            {
+                self.draw_surface(kind);
+            }
+        }
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn swapchain_retries(&self) -> impl Iterator<Item = (SurfaceKind, Instant)> + '_ {
+        [
+            (SurfaceKind::Pill, &self.pill),
+            (SurfaceKind::TopStrip, &self.top_strip),
+            (SurfaceKind::Overlay, &self.overlay),
+        ]
+        .into_iter()
+        .filter_map(|(kind, surface)| Some((kind, surface.as_ref()?.retry_at?)))
+    }
+
+    fn event_timeout(&self) -> Option<Duration> {
+        let osk = self.osk_repeat_timeout();
+        #[cfg(feature = "wgpu")]
+        {
+            let now = Instant::now();
+            self.swapchain_retries()
+                .map(|(_, retry_at)| retry_at.saturating_duration_since(now))
+                .chain(osk)
+                .min()
+        }
+        #[cfg(not(feature = "wgpu"))]
+        osk
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn retry_swapchain_draws(&mut self) {
+        let now = Instant::now();
+        let retry = self
+            .swapchain_retries()
+            .filter_map(|(kind, at)| (at <= now).then_some(kind))
+            .collect::<Vec<_>>();
+        for kind in retry {
+            self.draw_surface(kind);
         }
     }
 
@@ -1452,7 +1563,7 @@ pub fn run_layer_surface(
 /// Run the full multi-surface `calloop` + `wlr-layer-shell` shell daemon.
 ///
 /// Allocates surfaces lazily: only the compact `BottomPill` + `TopStrip` exist while dormant
-/// over apps (`< 1 MiB` SHM), and full-screen overlays are dropped cleanly upon dismissal.
+/// over apps, and full-screen overlays are dropped cleanly upon dismissal.
 ///
 /// # Errors
 /// Returns [`WaylandError`] if connecting to `Wayland`, binding required globals, or selecting the
@@ -1500,6 +1611,7 @@ pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
         layer_shell,
         seat_state: SeatState::new(&globals, &qh),
         output_state: OutputState::new(&globals, &qh),
+        fractional_scale: FractionalScaleGlobals::bind(&globals, &qh),
         shm,
         target_output: None,
         output_name: config.output_name.clone(),
@@ -1602,10 +1714,12 @@ pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
 
     while !app.exit {
         event_loop
-            .dispatch(app.osk_repeat_timeout(), &mut app)
+            .dispatch(app.event_timeout(), &mut app)
             .map_err(|e| WaylandError::Runtime(e.to_string()))?;
         if !app.exit {
             app.tick_osk_repeat();
+            #[cfg(feature = "wgpu")]
+            app.retry_swapchain_draws();
         }
     }
 
@@ -1626,9 +1740,19 @@ impl CompositorHandler for LayerApp {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _new_factor: i32,
+        surface: &wl_surface::WlSurface,
+        new_factor: i32,
     ) {
+        // SCTK delivers preferred_buffer_scale on v6 and output-derived
+        // scale changes on older surfaces. Neither changes logical geometry.
+        if let Some(kind) = self.surface_kind(surface) {
+            if self
+                .managed_surface_mut(kind)
+                .is_some_and(|s| s.scaling.update_integer(new_factor))
+            {
+                self.draw_surface(kind);
+            }
+        }
     }
 
     fn transform_changed(
@@ -1756,15 +1880,10 @@ impl LayerShellHandler for LayerApp {
             self.cancel_osk_drag();
         }
 
-        let surf = match kind {
-            SurfaceKind::Pill => self.pill.as_mut(),
-            SurfaceKind::TopStrip => self.top_strip.as_mut(),
-            SurfaceKind::Overlay => self.overlay.as_mut(),
-        };
         let mut new_w = None;
         let mut new_h = None;
         let mut resized = false;
-        if let Some(target) = surf {
+        if let Some(target) = self.managed_surface_mut(kind) {
             if configure.new_size.0 > 0 {
                 resized |= target.configured && target.width != configure.new_size.0;
                 target.width = configure.new_size.0;
@@ -1995,3 +2114,16 @@ impl ProvidesRegistryState for LayerApp {
 
 delegate_registry!(LayerApp);
 delegate_dispatch2!(LayerApp);
+
+#[cfg(test)]
+mod tests {
+    use super::shm_buffer_geometry;
+
+    #[test]
+    fn shm_geometry_uses_physical_width_for_stride_and_both_axes_for_pool() {
+        assert_eq!(shm_buffer_geometry(452, 41), Some((452, 41, 1808, 148_352)));
+        assert!(shm_buffer_geometry(0, 41).is_none());
+        assert!(shm_buffer_geometry(1_000_000_000, 27).is_none());
+        assert!(shm_buffer_geometry(500_000, 500_000).is_none());
+    }
+}

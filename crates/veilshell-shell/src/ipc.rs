@@ -9,9 +9,10 @@ use std::thread;
 use std::time::Duration;
 
 use veilshell_render::{SceneKind, WallpaperImage};
-use veilshell_theme::load_best_available;
 use veilshell_wayland::channel::Sender;
 use veilshell_wayland::DaemonCommand;
+
+use crate::session::ShellSession;
 
 /// Resolve the active IPC socket path (`VEILSHELL_SOCKET`, else `$XDG_RUNTIME_DIR/veilshell.sock`).
 #[must_use]
@@ -50,28 +51,34 @@ pub fn send_daemon_command(socket_path: &Path, line: &str) -> std::io::Result<St
 pub fn spawn_ipc_listener(
     socket_path: &Path,
     cmd_tx: Sender<DaemonCommand>,
+    session: ShellSession,
 ) -> std::io::Result<()> {
-    if socket_path.exists() {
-        let _ = fs::remove_file(socket_path);
-    }
+    // Do not replace a running overlay's endpoint (or an unrelated file).
     let listener = UnixListener::bind(socket_path)?;
 
-    thread::Builder::new()
+    let result = thread::Builder::new()
         .name("veilshell-ipc".into())
         .spawn(move || {
             for incoming in listener.incoming() {
                 let Ok(stream) = incoming else {
                     break;
                 };
-                if handle_client(stream, &cmd_tx) {
+                if handle_client(stream, &cmd_tx, session) {
                     break;
                 }
             }
-        })
-        .map(|_| ())
+        });
+    if result.is_err() {
+        let _ = fs::remove_file(socket_path);
+    }
+    result.map(|_| ())
 }
 
-fn handle_client(mut stream: UnixStream, cmd_tx: &Sender<DaemonCommand>) -> bool {
+fn handle_client(
+    mut stream: UnixStream,
+    cmd_tx: &Sender<DaemonCommand>,
+    session: ShellSession,
+) -> bool {
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(cloned) => cloned,
         Err(_) => return false,
@@ -101,7 +108,7 @@ fn handle_client(mut stream: UnixStream, cmd_tx: &Sender<DaemonCommand>) -> bool
             let _ = writeln!(stream, "ok scene {}", scene.as_str());
         }
         "reload-theme" => {
-            let palette = load_best_available();
+            let palette = session.palette();
             let name = palette.name.clone();
             let _ = cmd_tx.send(DaemonCommand::UpdatePalette(palette));
             let _ = writeln!(stream, "ok theme {name}");
@@ -172,5 +179,26 @@ fn handle_wallpaper_cmd(stream: &mut UnixStream, trimmed: &str, cmd_tx: &Sender<
                 let _ = writeln!(stream, "err wallpaper '{arg}': {err}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use veilshell_wayland::channel;
+
+    #[test]
+    fn a_second_daemon_does_not_unlink_an_existing_control_socket() {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let path = std::env::temp_dir().join(format!("veilshell-test-{}.sock", now.as_nanos()));
+        let original = UnixListener::bind(&path).unwrap();
+        let (commands, _) = channel::channel();
+        let failure = spawn_ipc_listener(&path, commands, ShellSession::Overlay).unwrap_err();
+        let can_connect = UnixStream::connect(&path).is_ok();
+        drop(original);
+        fs::remove_file(&path).unwrap();
+        assert_eq!(failure.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(can_connect);
     }
 }

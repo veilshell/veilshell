@@ -8,18 +8,17 @@ use std::path::Path;
 use veilshell_core::{Rgba, ThemePalette};
 
 use crate::font::{
-    glyph_rows, layout_text_glyphs, measure_text_width, TextLayout, GLYPH_ADVANCE, GLYPH_H, GLYPH_W,
+    glyph_rows, layout_text_glyphs_scaled, BitmapLayout, TextLayout, GLYPH_H, GLYPH_W,
 };
 use crate::primitives::{
-    DrawCommand, DrawList, ImageQuad, RoundedRect, SceneOutput, TextAlign, TextLabel,
+    DrawCommand, DrawList, ImageQuad, PixelScale, RenderTarget, RoundedRect, SceneOutput, TextLabel,
 };
 use crate::scene::{build_scene, build_scene_layout, build_top_strip_scene, SceneContext};
 use crate::{RenderError, RenderFrame, RendererBackend, SceneKind, SnapshotSpec};
 
 #[derive(Clone, Debug)]
 struct BackdropCache {
-    width: u32,
-    height: u32,
+    target: RenderTarget,
     prefix: Vec<DrawCommand>,
     rgba: Vec<u8>,
 }
@@ -92,9 +91,20 @@ impl SdfSoftwareRenderer {
         height: u32,
         list: &DrawList,
     ) -> Result<RenderFrame, RenderError> {
-        if width == 0 || height == 0 {
-            return Err(RenderError::InvalidViewport);
-        }
+        self.rasterize_scaled(RenderTarget::unscaled(width, height)?, list)
+    }
+
+    /// Sample the logical draw list directly on the physical pixel grid.
+    ///
+    /// # Errors
+    /// Returns [`RenderError::InvalidViewport`] if the frame size overflows.
+    pub fn rasterize_scaled(
+        &self,
+        target: RenderTarget,
+        list: &DrawList,
+    ) -> Result<RenderFrame, RenderError> {
+        let (width, height) = target.physical_size();
+        let scale = target.pixel_scale();
 
         let prefix_len = list
             .commands
@@ -107,14 +117,16 @@ impl SdfSoftwareRenderer {
             })
             .count();
 
-        let total_bytes = (width as usize) * (height as usize) * 4;
+        let total_bytes = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or(RenderError::InvalidViewport)?;
         let mut rgba = if prefix_len > 0 {
             let prefix = &list.commands[..prefix_len];
             let cached = {
                 let borrow = self.backdrop_cache.borrow();
                 borrow.as_ref().and_then(|c| {
-                    (c.width == width && c.height == height && c.prefix.as_slice() == prefix)
-                        .then(|| c.rgba.clone())
+                    (c.target == target && c.prefix.as_slice() == prefix).then(|| c.rgba.clone())
                 })
             };
 
@@ -123,11 +135,10 @@ impl SdfSoftwareRenderer {
             } else {
                 let mut buf = vec![0_u8; total_bytes];
                 for cmd in prefix {
-                    execute_command(&mut buf, width, height, cmd);
+                    execute_command(&mut buf, width, height, scale, cmd);
                 }
                 *self.backdrop_cache.borrow_mut() = Some(BackdropCache {
-                    width,
-                    height,
+                    target,
                     prefix: prefix.to_vec(),
                     rgba: buf.clone(),
                 });
@@ -138,7 +149,7 @@ impl SdfSoftwareRenderer {
         };
 
         for cmd in &list.commands[prefix_len..] {
-            execute_command(&mut rgba, width, height, cmd);
+            execute_command(&mut rgba, width, height, scale, cmd);
         }
 
         Ok(RenderFrame {
@@ -149,7 +160,7 @@ impl SdfSoftwareRenderer {
     }
 }
 
-fn execute_command(rgba: &mut [u8], width: u32, height: u32, cmd: &DrawCommand) {
+fn execute_command(rgba: &mut [u8], width: u32, height: u32, scale: PixelScale, cmd: &DrawCommand) {
     match cmd {
         DrawCommand::BackdropGradient { top, bottom } => {
             draw_backdrop_gradient(rgba, width, height, *top, *bottom);
@@ -159,10 +170,24 @@ fn execute_command(rgba: &mut [u8], width: u32, height: u32, cmd: &DrawCommand) 
             cy,
             radius,
             color,
-        } => draw_radial_glow(rgba, width, height, *cx, *cy, *radius, *color),
-        DrawCommand::Rect(rect) => draw_rounded_rect(rgba, width, height, *rect),
-        DrawCommand::Text(label) => draw_text(rgba, width, height, label),
-        DrawCommand::Image(quad) => draw_image_quad(rgba, width, height, quad),
+        } => {
+            if *radius > 1.0 {
+                draw_radial_glow(
+                    rgba,
+                    width,
+                    height,
+                    *cx * scale.x,
+                    *cy * scale.y,
+                    *radius * scale.uniform(),
+                    *color,
+                );
+            }
+        }
+        DrawCommand::Rect(rect) => {
+            draw_rounded_rect(rgba, width, height, rect.scaled(scale), scale);
+        }
+        DrawCommand::Text(label) => draw_text(rgba, width, height, label, scale),
+        DrawCommand::Image(quad) => draw_image_quad(rgba, width, height, quad, scale),
     }
 }
 
@@ -176,12 +201,15 @@ impl RendererBackend for SdfSoftwareRenderer {
         spec: &SnapshotSpec,
         palette: &ThemePalette,
     ) -> Result<RenderFrame, RenderError> {
-        let (w, h) = spec.viewport.physical_pixels();
-        if w == 0 || h == 0 || !spec.viewport.scale.is_finite() || spec.viewport.scale <= 0.0 {
-            return Err(RenderError::InvalidViewport);
-        }
-        let list = build_scene(spec.scene, w as f32, h as f32, palette, &self.context);
-        self.rasterize(w, h, &list)
+        let target = spec.viewport.render_target()?;
+        let list = build_scene(
+            spec.scene,
+            spec.viewport.width as f32,
+            spec.viewport.height as f32,
+            palette,
+            &self.context,
+        );
+        self.rasterize_scaled(target, &list)
     }
 }
 
@@ -209,6 +237,16 @@ impl RenderFrame {
     #[must_use]
     pub fn to_argb8888_premultiplied(&self) -> Vec<u8> {
         let mut out = vec![0_u8; self.rgba.len()];
+        self.write_argb8888_premultiplied(&mut out);
+        out
+    }
+
+    /// Convert to premultiplied `BGRA8`, writing directly into a caller-provided buffer.
+    ///
+    /// # Panics
+    /// Panics if `out` is too short to hold the frame.
+    pub fn write_argb8888_premultiplied(&self, out: &mut [u8]) {
+        let out = &mut out[..self.rgba.len()];
         for (src, dst) in self.rgba.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
             let a = u16::from(src[3]);
             let r = ((u16::from(src[0]) * a + 127) / 255) as u8;
@@ -219,7 +257,6 @@ impl RenderFrame {
             dst[2] = r;
             dst[3] = src[3];
         }
-        out
     }
 }
 
@@ -300,7 +337,7 @@ fn draw_backdrop_gradient(buf: &mut [u8], width: u32, height: u32, top: Rgba, bo
 }
 
 fn draw_radial_glow(buf: &mut [u8], w: u32, h: u32, cx: f32, cy: f32, radius: f32, color: Rgba) {
-    if radius <= 1.0 || color.a <= 0.001 {
+    if color.a <= 0.001 {
         return;
     }
     let min_x = ((cx - radius).floor().max(0.0) as u32).min(w);
@@ -337,7 +374,7 @@ fn sdf_rounded_box(px: f32, py: f32, half_w: f32, half_h: f32, r: f32) -> f32 {
     }
 }
 
-fn draw_rounded_rect(buf: &mut [u8], w: u32, h: u32, rect: RoundedRect) {
+fn draw_rounded_rect(buf: &mut [u8], w: u32, h: u32, rect: RoundedRect, scale: PixelScale) {
     if rect.w <= 0.0 || rect.h <= 0.0 {
         return;
     }
@@ -347,7 +384,8 @@ fn draw_rounded_rect(buf: &mut [u8], w: u32, h: u32, rect: RoundedRect) {
     let cy = rect.y + half_h;
     let r = rect.radius.min(half_w).min(half_h).max(0.0);
 
-    let pad = if rect.shadow_alpha > 0.001 && rect.shadow_radius > 0.5 {
+    let has_shadow = rect.shadow_alpha > 0.001 && rect.shadow_radius > 0.5 * scale.uniform();
+    let pad = if has_shadow {
         rect.shadow_radius + rect.shadow_offset_y.abs() + 2.0
     } else {
         2.0
@@ -357,8 +395,7 @@ fn draw_rounded_rect(buf: &mut [u8], w: u32, h: u32, rect: RoundedRect) {
     let min_y = ((rect.y - pad).floor().max(0.0) as u32).min(h);
     let max_y = ((rect.y + rect.h + pad).ceil().max(0.0) as u32).min(h);
 
-    let has_shadow = rect.shadow_alpha > 0.001 && rect.shadow_radius > 0.5;
-    let has_border = rect.border_width > 0.01 && rect.border_color.a > 0.001;
+    let has_border = rect.border_width > 0.01 * scale.uniform() && rect.border_color.a > 0.001;
     let has_sheen = rect.top_highlight_alpha > 0.001;
 
     for y in min_y..max_y {
@@ -432,7 +469,7 @@ fn draw_rounded_rect(buf: &mut [u8], w: u32, h: u32, rect: RoundedRect) {
     }
 }
 
-fn draw_text(buf: &mut [u8], width: u32, height: u32, label: &TextLabel) {
+fn draw_text(buf: &mut [u8], width: u32, height: u32, label: &TextLabel, scale: PixelScale) {
     if label.text.is_empty() || label.color.a <= 0.001 {
         return;
     }
@@ -440,7 +477,7 @@ fn draw_text(buf: &mut [u8], width: u32, height: u32, label: &TextLabel) {
     let width_i64 = i64::from(width);
     let height_i64 = i64::from(height);
 
-    match layout_text_glyphs(label) {
+    match layout_text_glyphs_scaled(label, scale) {
         TextLayout::TrueType(glyphs) => {
             for pg in glyphs {
                 let gw = pg.glyph.width as usize;
@@ -468,43 +505,34 @@ fn draw_text(buf: &mut [u8], width: u32, height: u32, label: &TextLabel) {
             }
         }
         TextLayout::Bitmap5x7 => {
-            let scale = label.scale.max(1);
-            let total_w = measure_text_width(&label.text, scale) as f32;
-            let start_x = match label.align {
-                TextAlign::Left => label.x,
-                TextAlign::Center => label.x - total_w * 0.5,
-                TextAlign::Right => label.x - total_w,
-            }
-            .round() as i64;
-            let start_y = label.y.round() as i64;
-            let advance_i64 = i64::from(GLYPH_ADVANCE * scale);
+            draw_bitmap_text(buf, width, height, label, scale);
+        }
+    }
+}
 
-            for (ch_idx, ch) in label.text.chars().enumerate() {
-                let rows = glyph_rows(ch);
-                let Ok(ch_off) = i64::try_from(ch_idx) else {
-                    break;
-                };
-                let gx = start_x + ch_off * advance_i64;
-                for (ry, mask) in rows.iter().enumerate().take(GLYPH_H as usize) {
-                    for rx in 0..GLYPH_W {
-                        if (mask & (1 << (GLYPH_W - 1 - rx))) == 0 {
-                            continue;
-                        }
-                        for sy in 0..scale {
-                            let py = start_y + i64::from(ry as u32 * scale + sy);
-                            if py < 0 || py >= height_i64 {
-                                continue;
-                            }
-                            let row_off = (py as usize) * (width as usize);
-                            for sx in 0..scale {
-                                let px = gx + i64::from(rx * scale + sx);
-                                if px < 0 || px >= width_i64 {
-                                    continue;
-                                }
-                                let idx = (row_off + px as usize) * 4;
-                                blend_pixel(buf, idx, label.color);
-                            }
-                        }
+fn draw_bitmap_text(buf: &mut [u8], width: u32, height: u32, label: &TextLabel, scale: PixelScale) {
+    let layout = BitmapLayout::new(label, scale);
+    // Round the cell edges to pixel centers, matching the GPU fragment test.
+    let edge = |px: f32, extent: u32| ((px - 0.5).ceil() as u32).min(extent);
+    for (idx, ch) in label.text.chars().enumerate() {
+        let gx = layout.glyph_x(idx);
+        for (ry, mask) in glyph_rows(ch)
+            .into_iter()
+            .enumerate()
+            .take(GLYPH_H as usize)
+        {
+            let y0 = edge(layout.y + ry as f32 * layout.cell_y, height);
+            let y1 = edge(layout.y + (ry + 1) as f32 * layout.cell_y, height);
+            for rx in 0..GLYPH_W {
+                if mask & (1 << (GLYPH_W - 1 - rx)) == 0 {
+                    continue;
+                }
+                let x0 = edge(gx + rx as f32 * layout.cell_x, width);
+                let x1 = edge(gx + (rx + 1) as f32 * layout.cell_x, width);
+                for y in y0..y1 {
+                    let row_off = y as usize * width as usize;
+                    for x in x0..x1 {
+                        blend_pixel(buf, (row_off + x as usize) * 4, label.color);
                     }
                 }
             }
@@ -512,7 +540,7 @@ fn draw_text(buf: &mut [u8], width: u32, height: u32, label: &TextLabel) {
     }
 }
 
-fn draw_image_quad(buf: &mut [u8], buf_w: u32, buf_h: u32, quad: &ImageQuad) {
+fn draw_image_quad(buf: &mut [u8], buf_w: u32, buf_h: u32, quad: &ImageQuad, scale: PixelScale) {
     if quad.w <= 0.0 || quad.h <= 0.0 || quad.alpha <= 0.001 {
         return;
     }
@@ -521,16 +549,20 @@ fn draw_image_quad(buf: &mut [u8], buf_w: u32, buf_h: u32, quad: &ImageQuad) {
         return;
     }
 
-    let half_w = quad.w * 0.5;
-    let half_h = quad.h * 0.5;
-    let cx = quad.x + half_w;
-    let cy = quad.y + half_h;
-    let corner_r = quad.radius.min(half_w).min(half_h).max(0.0);
+    let [x, y, w, h] = quad.physical_bounds(scale);
+    let half_w = w * 0.5;
+    let half_h = h * 0.5;
+    let cx = x + half_w;
+    let cy = y + half_h;
+    let corner_r = (quad.radius * scale.uniform())
+        .min(half_w)
+        .min(half_h)
+        .max(0.0);
 
-    let min_x = ((quad.x - 1.0).floor().max(0.0) as u32).min(buf_w);
-    let max_x = ((quad.x + quad.w + 1.0).ceil().max(0.0) as u32).min(buf_w);
-    let min_y = ((quad.y - 1.0).floor().max(0.0) as u32).min(buf_h);
-    let max_y = ((quad.y + quad.h + 1.0).ceil().max(0.0) as u32).min(buf_h);
+    let min_x = ((x - 1.0).floor().max(0.0) as u32).min(buf_w);
+    let max_x = ((x + w + 1.0).ceil().max(0.0) as u32).min(buf_w);
+    let min_y = ((y - 1.0).floor().max(0.0) as u32).min(buf_h);
+    let max_y = ((y + h + 1.0).ceil().max(0.0) as u32).min(buf_h);
 
     let img_w = img.width as f32;
     let img_h = img.height as f32;
@@ -541,7 +573,7 @@ fn draw_image_quad(buf: &mut [u8], buf_w: u32, buf_h: u32, quad: &ImageQuad) {
     for py_idx in min_y..max_y {
         let py = py_idx as f32 + 0.5;
         let rel_y = py - cy;
-        let tex_v = ((py - quad.y) / quad.h).clamp(0.0, 1.0);
+        let tex_v = ((py - y) / h).clamp(0.0, 1.0);
         let ty = (tex_v * img_h - 0.5).clamp(0.0, img_h - 1.0);
         let y0 = (ty.floor() as u32).min(last_src_y);
         let y1 = (y0 + 1).min(last_src_y);
@@ -556,7 +588,7 @@ fn draw_image_quad(buf: &mut [u8], buf_w: u32, buf_h: u32, quad: &ImageQuad) {
                 continue;
             }
 
-            let tex_u = ((px - quad.x) / quad.w).clamp(0.0, 1.0);
+            let tex_u = ((px - x) / w).clamp(0.0, 1.0);
             let tx = (tex_u * img_w - 0.5).clamp(0.0, img_w - 1.0);
             let x0 = (tx.floor() as u32).min(last_src_x);
             let x1 = (x0 + 1).min(last_src_x);
@@ -595,5 +627,57 @@ fn draw_image_quad(buf: &mut [u8], buf_w: u32, buf_h: u32, quad: &ImageQuad) {
                 },
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TextAlign;
+
+    #[test]
+    fn analytic_edges_are_antialiased_on_the_physical_grid() {
+        let mut list = DrawList::default();
+        list.push_rect(RoundedRect::filled(
+            4.25,
+            2.0,
+            20.0,
+            8.0,
+            0.0,
+            Rgba::from_rgb_u8(255, 255, 255),
+        ));
+        let renderer = SdfSoftwareRenderer::default();
+        for (target, edge, alpha) in [
+            (RenderTarget::new((40, 20), (60, 30)).unwrap(), 6, 159),
+            (RenderTarget::new((40, 20), (80, 40)).unwrap(), 8, 128),
+        ] {
+            let frame = renderer.rasterize_scaled(target, &list).unwrap();
+            assert_eq!((frame.width, frame.height), target.physical_size());
+            let at = |x| frame.rgba[((6 * frame.width + x) * 4 + 3) as usize];
+            assert_eq!(at(edge - 1), 0);
+            assert_eq!(at(edge), alpha);
+            assert_eq!(at(edge + 1), 255);
+        }
+    }
+
+    #[test]
+    fn bitmap_fallback_samples_fractional_cells_without_font_discovery() {
+        let label = TextLabel {
+            x: 4.0,
+            y: 4.0,
+            text: "D".into(),
+            scale: 1,
+            color: Rgba::from_rgb_u8(255, 255, 255),
+            align: TextAlign::Left,
+        };
+        let mut rgba = [0; 20 * 20 * 4];
+        draw_bitmap_text(&mut rgba, 20, 20, &label, PixelScale { x: 1.25, y: 1.5 });
+        let alpha = |x: usize, y: usize| rgba[(y * 20 + x) * 4 + 3];
+        assert_eq!(alpha(5, 5), 0);
+        assert_eq!(alpha(4, 6), 0);
+        assert_eq!(alpha(5, 6), 255);
+        assert_eq!(alpha(8, 6), 255);
+        assert_eq!(alpha(9, 6), 0);
+        assert_eq!(alpha(9, 7), 255);
     }
 }

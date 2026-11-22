@@ -7,6 +7,8 @@ use std::process::{Command, Stdio};
 use veilshell_hw::HardwareSnapshot;
 use veilshell_render::SceneContext;
 
+use crate::session::ShellSession;
+
 const PROFILES: [(&str, &str); 3] = [
     ("balanced", "Balanced"),
     ("power-saver", "Power saver"),
@@ -21,12 +23,15 @@ pub fn apply_hardware(ctx: &mut SceneContext, snapshot: &HardwareSnapshot) {
     ctx.shade.mobile_radio = snapshot.mobile_radio;
     ctx.shade.brightness_available = snapshot.brightness_available;
     ctx.shade.volume_available = snapshot.volume_available;
+    ctx.shade.night_light_available = snapshot.night_light_available;
 }
 
-pub fn refresh_optional(ctx: &mut SceneContext) {
+pub fn refresh_optional(ctx: &mut SceneContext, session: ShellSession) {
     ctx.shade.date = output("date", &["+%A, %B %e"]).unwrap_or_default();
     ctx.shade.power_profile = power_label();
-    ctx.shade.quiet = quiet_configured().then(quiet_status).flatten();
+    ctx.shade.quiet = (session == ShellSession::Overlay && quiet_configured())
+        .then(quiet_status)
+        .flatten();
 }
 
 fn output(bin: &str, args: &[&str]) -> Option<String> {

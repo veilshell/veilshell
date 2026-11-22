@@ -63,7 +63,7 @@ using the [parity spec](DENIAL_PARITY_SPEC.md).
 
 | Feature | Denial | VeilShell Status | Current VeilShell Implementation / Gap Notes |
 |---|---|---|---|
-| Quick Settings Tiles (Wi-Fi, Bluetooth, LTE, Night Light, Auto-Rotate, Tablet Mode) | Integrated control center tiles | **Done** | Denial-style mobile control center: wide Wi-Fi/Bluetooth/LTE capsules and a four-column tile grid. Tiles with no working host backend are hidden, not shown as fake off switches. Live `nmcli`, `bluetoothctl`/`rfkill`, `hyprsunset`, Rotation Lock, and Laptop↔Tablet toggle. |
+| Quick Settings Tiles (Wi-Fi, Bluetooth, LTE, Night Light, Auto-Rotate, Tablet Mode) | Integrated control center tiles | **Done** | Adaptive Connectivity, Display & Sound, and Device groups. Controls pack without leaving slots for unavailable backends. Auto-rotate is limited to the standalone compositor; the overlay's Desktop Mode control only hides VeilShell. |
 | Brightness & Volume Sliders | Interactive sliders in control center | **Done** | Vertical, liquid-style level bars like Denial's ColorOS shade. Tap to set an absolute level or drag from the current level; live `sysfs`/`brightnessctl` and `wpctl` backends. |
 | Battery Telemetry | Live battery % & charging state | **Done** | Pure `sysfs` reader filtering out peripheral `scope=Device` (stylus/keyboard) batteries; can be expanded with charging icon & low-battery warning banner. |
 | Power Profiles (`power-profiles-daemon`) | Power profile selector tile (Power Saver / Balanced / Performance) | **Done** | `powerprofilesctl` profile tile cycles Balanced / Power saver / Performance, shown only when the service answers. |
@@ -86,7 +86,7 @@ using the [parity spec](DENIAL_PARITY_SPEC.md).
 |---|---|---|---|
 | GPU Glassmorphic Renderer | Flutter/Skia GPU compositing | **Done** | Single-pass instanced `wgpu` Vulkan/GLES WGSL SDF renderer + zero-copy `wgpu::Surface` Wayland swapchain + CPU SDF fallback (`--renderer auto\|wgpu\|software`). |
 | TrueType / OpenType Typography | Native Skia text rendering | **Done** | `ab_glyph` system font atlas with automatic 5×7 HUD bitmap fallback. |
-| App Icons (PNG + SVG) | Full desktop icon rendering | **Partial** | Freedesktop `PNG` icon theme lookup works (`apps.rs`), **but** `.svg` icons (used by many GTK/KDE/Papirus apps) are not rasterized yet and fall back to letter badges. |
+| App Icons (PNG + SVG) | Full desktop icon rendering | **Done** | Freedesktop themes and installed PNG/SVG assets supply the launcher artwork. A letter badge is the fallback for a genuinely missing or unusable icon. |
 | Dynamic Theming & Wallpaper Accent Extraction | Light/dark themes + accent colors borrowed from wallpaper | **Partial** | Live Omarchy Aether `colors.toml` mtime watcher + WCAG AA dark fallback exist; missing automatic wallpaper-dominant-color accent extraction for non-Omarchy distros and a Light/Dark toggle. |
 
 ### 7. Out-of-Scope / Host Compositor & Ecosystem Responsibilities
@@ -116,7 +116,7 @@ If the goal is to boot straight into VeilShell from SDDM / `greetd` with zero mi
 ### Milestone B — Daily-Driver Tablet Polish (Full Denial Shell Parity)
 5. **Recents Carousel Scrolling + Swipe-Up-to-Close** (remove the 3-card cap so all open windows are accessible by touch).
 6. **MPRIS Media Player Card** inside `Shade` (Play/Pause, Next/Prev, track title/artist, progress bar).
-7. **Home App Search Bar** + **SVG Icon Support** (e.g., `resvg`/`tiny-skia` rasterized once into the icon cache).
+7. **Home App Search Bar**.
 8. **Hardware Button OSD Pill** (brief floating glass indicator for physical Volume ± and Brightness ± keys) + **Auto-Wallpaper Detection** for the GPU blur cache.
 
 ### Milestone C — Power-User & Ecosystem Completeness

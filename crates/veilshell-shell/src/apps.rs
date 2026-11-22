@@ -9,6 +9,12 @@ use std::sync::Arc;
 use veilshell_core::{app_badge, parse_desktop_entry, DesktopApp, Rgba};
 use veilshell_render::{AppTile, RgbaImage};
 
+mod icons;
+mod xdg;
+
+use icons::IconLookup;
+use xdg::DataDirs;
+
 const PINNED_ORDER: &[&str] = &[
     "foot",
     "ghostty",
@@ -38,52 +44,85 @@ const TILE_PALETTE: [(u8, u8, u8); 8] = [
 /// Discover user and system `.desktop` applications in priority order.
 #[must_use]
 pub fn discover_desktop_apps() -> Vec<DesktopApp> {
-    let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(
-            PathBuf::from(home)
-                .join(".local")
-                .join("share")
-                .join("applications"),
-        );
-    }
-    dirs.push(PathBuf::from("/usr/local/share/applications"));
-    dirs.push(PathBuf::from("/usr/share/applications"));
+    discover_in(&DataDirs::from_env())
+}
 
+fn discover_in(data: &DataDirs) -> Vec<DesktopApp> {
     let mut seen_ids = HashSet::new();
     let mut apps = Vec::new();
 
-    for dir in dirs {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("desktop") {
-                continue;
-            }
-            let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
+    for root in data.paths() {
+        let applications = root.join("applications");
+        let mut dirs = vec![applications.clone()];
+        while let Some(dir) = dirs.pop() {
+            let Ok(entries) = fs::read_dir(dir) else {
                 continue;
             };
-            if !seen_ids.insert(file_name.to_owned()) {
-                continue;
-            }
-            let Ok(raw) = fs::read_to_string(&path) else {
-                continue;
-            };
-            if let Some(app) = parse_desktop_entry(&raw, file_name) {
-                apps.push(app);
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    // Follow file symlinks (e.g. Flatpak exports), not directory symlinks.
+                    dirs.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|s| s.to_str()) != Some("desktop") {
+                    continue;
+                }
+                let Some(relative) = path.strip_prefix(&applications).ok().and_then(Path::to_str)
+                else {
+                    continue;
+                };
+                let id = relative.replace('/', "-");
+                if seen_ids.contains(&id) {
+                    continue;
+                }
+                let Some(raw) = xdg::read_text(&path) else {
+                    continue;
+                };
+                if let Some(mut app) = parse_desktop_entry(&raw, &id) {
+                    if let Some(icon) = app.icon.as_mut().filter(|icon| icon.contains('\\')) {
+                        *icon = unescape_icon(icon);
+                    }
+                    apps.push(app);
+                }
+                // An entry marked Hidden/NoDisplay still masks a system entry with this ID.
+                seen_ids.insert(id);
             }
         }
     }
 
-    apps.sort_by(|a, b| {
-        let pa = pinned_rank(&a.id);
-        let pb = pinned_rank(&b.id);
-        pa.cmp(&pb)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    apps.sort_by_cached_key(|app| {
+        (
+            pinned_rank(&app.id),
+            app.name.to_lowercase(),
+            app.id.clone(),
+        )
     });
     apps
+}
+
+fn unescape_icon(icon: &str) -> String {
+    let mut chars = icon.chars();
+    let mut value = String::with_capacity(icon.len());
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            value.push(ch);
+            continue;
+        }
+        let ch = match chars.next() {
+            Some('s') => ' ',
+            Some('n') => '\n',
+            Some('t') => '\t',
+            Some('r') => '\r',
+            Some('\\') | None => '\\',
+            Some(other) => {
+                value.push('\\');
+                other
+            }
+        };
+        value.push(ch);
+    }
+    value
 }
 
 fn pinned_rank(desktop_id: &str) -> usize {
@@ -95,19 +134,35 @@ fn pinned_rank(desktop_id: &str) -> usize {
 }
 
 /// Convert [`DesktopApp`] records into visual [`AppTile`] items ready for `Home`,
-/// resolving and caching `PNG` app icons from standard freedesktop icon themes.
+/// resolving app icons for an 85-logical-pixel tile at up to 2× display scale.
 #[must_use]
 pub fn apps_to_tiles(apps: &[DesktopApp]) -> Vec<AppTile> {
-    let mut icon_cache: HashMap<String, Option<Arc<RgbaImage>>> = HashMap::new();
+    let mut lookup = None;
+    make_tiles(apps, |name| {
+        lookup.get_or_insert_with(IconLookup::from_env).load(name)
+    })
+}
+
+fn make_tiles(
+    apps: &[DesktopApp],
+    mut load_icon: impl FnMut(&str) -> Option<Arc<RgbaImage>>,
+) -> Vec<AppTile> {
+    // Cache shared image identities (and misses) only during this refresh.
+    const MAX_CACHED_ICONS: usize = 256;
+    let mut icon_cache: HashMap<_, Option<Arc<RgbaImage>>> = HashMap::new();
     apps.iter()
         .enumerate()
         .map(|(idx, app)| {
             let (r, g, b) = TILE_PALETTE[idx % TILE_PALETTE.len()];
             let icon = app.icon.as_deref().and_then(|name| {
-                icon_cache
-                    .entry(name.to_owned())
-                    .or_insert_with(|| load_app_icon(name))
-                    .clone()
+                if let Some(image) = icon_cache.get(name) {
+                    return image.clone();
+                }
+                let image = load_icon(name);
+                if icon_cache.len() < MAX_CACHED_ICONS {
+                    icon_cache.insert(name, image.clone());
+                }
+                image
             });
             AppTile {
                 id: app.id.clone(),
@@ -121,158 +176,17 @@ pub fn apps_to_tiles(apps: &[DesktopApp]) -> Vec<AppTile> {
         .collect()
 }
 
-/// Resolve a freedesktop `.desktop` `Icon=` name or path to an existing `PNG` file.
+/// Resolve a freedesktop `Icon=` name or absolute path to a `PNG` or `SVG` candidate.
 #[must_use]
 pub fn resolve_icon_path(icon_name: &str) -> Option<PathBuf> {
-    let trimmed = icon_name.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let raw_path = Path::new(trimmed);
-    if raw_path.is_absolute() {
-        return resolve_absolute_png(raw_path);
-    }
-
-    let stem = trimmed
-        .strip_suffix(".png")
-        .or_else(|| trimmed.strip_suffix(".PNG"))
-        .unwrap_or(trimmed);
-    let lower = stem.to_ascii_lowercase();
-    let mut candidates = Vec::with_capacity(2);
-    candidates.push(stem.to_owned());
-    if lower != stem {
-        candidates.push(lower);
-    }
-
-    if let Some(found) = resolve_local_icon(&candidates) {
-        return Some(found);
-    }
-    if let Some(found) = resolve_system_icon(&candidates) {
-        return Some(found);
-    }
-    candidates
-        .iter()
-        .map(|cand| Path::new("/usr/share/pixmaps").join(format!("{cand}.png")))
-        .find(|p| p.is_file())
+    IconLookup::from_env().resolve(icon_name)
 }
 
-fn resolve_absolute_png(raw_path: &Path) -> Option<PathBuf> {
-    if raw_path.is_file()
-        && raw_path
-            .extension()
-            .and_then(|s| s.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
-    {
-        return Some(raw_path.to_path_buf());
-    }
-    let with_ext = raw_path.with_extension("png");
-    with_ext.is_file().then_some(with_ext)
-}
-
-fn resolve_local_icon(candidates: &[String]) -> Option<PathBuf> {
-    let home_dir = PathBuf::from(std::env::var_os("HOME")?);
-    let local_icon_roots = [
-        home_dir.join(".local").join("share").join("icons"),
-        home_dir
-            .join(".local")
-            .join("share")
-            .join("applications")
-            .join("icons"),
-    ];
-    for cand in candidates {
-        for root in &local_icon_roots {
-            let direct = root.join(format!("{cand}.png"));
-            if direct.is_file() {
-                return Some(direct);
-            }
-        }
-    }
-    let local_hicolor = home_dir
-        .join(".local")
-        .join("share")
-        .join("icons")
-        .join("hicolor");
-    for size in ["128x128", "256x256", "96x96", "64x64", "48x48", "512x512"] {
-        for cand in candidates {
-            let p = local_hicolor
-                .join(size)
-                .join("apps")
-                .join(format!("{cand}.png"));
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
-    None
-}
-
-fn resolve_system_icon(candidates: &[String]) -> Option<PathBuf> {
-    const THEMES: &[&str] = &[
-        "hicolor",
-        "Yaru",
-        "Adwaita",
-        "AdwaitaLegacy",
-        "Papirus",
-        "breeze",
-    ];
-    const SIZES: &[&str] = &[
-        "128x128",
-        "128x128@2",
-        "128x128@2x",
-        "256x256",
-        "256x256@2",
-        "96x96",
-        "64x64",
-        "64x64@2",
-        "48x48",
-        "48x48@2",
-        "512x512",
-        "192x192",
-        "32x32",
-    ];
-    const CONTEXTS: &[&str] = &[
-        "apps",
-        "categories",
-        "devices",
-        "places",
-        "actions",
-        "mimetypes",
-    ];
-
-    for theme in THEMES {
-        let theme_root = Path::new("/usr/share/icons").join(theme);
-        if !theme_root.is_dir() {
-            continue;
-        }
-        for size in SIZES {
-            let size_dir = theme_root.join(size);
-            if !size_dir.is_dir() {
-                continue;
-            }
-            for ctx in CONTEXTS {
-                let ctx_dir = size_dir.join(ctx);
-                if !ctx_dir.is_dir() {
-                    continue;
-                }
-                for cand in candidates {
-                    let p = ctx_dir.join(format!("{cand}.png"));
-                    if p.is_file() {
-                        return Some(p);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Resolve, decode, and downscale a freedesktop `.desktop` `PNG` icon to `<= 96x96`.
+/// Load the best usable `PNG` or `SVG` icon as straight `RGBA8`, at most 170×170 pixels.
+/// JPEG data in a `.png` file is also supported for compatibility.
 #[must_use]
 pub fn load_app_icon(icon_name: &str) -> Option<Arc<RgbaImage>> {
-    let path = resolve_icon_path(icon_name)?;
-    let decoded = RgbaImage::load_png(path).ok()?;
-    Some(Arc::new(decoded.resize_fit(96, 96)))
+    IconLookup::from_env().load(icon_name)
 }
 
 /// Prepare a shell launch command, wrapping terminal apps in a Wayland terminal emulator.
@@ -314,56 +228,4 @@ pub fn current_clock_hhmm() -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn converts_desktop_apps_to_tiles_with_badges_and_exec() {
-        let apps = vec![
-            DesktopApp {
-                id: "foot.desktop".into(),
-                name: "Foot".into(),
-                exec: "foot".into(),
-                icon: Some("foot".into()),
-                terminal: false,
-                categories: vec![],
-            },
-            DesktopApp {
-                id: "btop.desktop".into(),
-                name: "btop++".into(),
-                exec: "btop".into(),
-                icon: None,
-                terminal: true,
-                categories: vec![],
-            },
-        ];
-        let tiles = apps_to_tiles(&apps);
-        assert_eq!(tiles.len(), 2);
-        assert_eq!(tiles[0].badge, "FOOT");
-        assert_eq!(tiles[0].exec, "foot");
-        assert!(tiles[1].exec.contains("btop"));
-        assert!(tiles[1].icon.is_none());
-    }
-
-    #[test]
-    fn resolves_and_downscales_absolute_png_icons_with_missing_fallback() {
-        assert!(resolve_icon_path("definitely-missing-veilshell-icon-xyz").is_none());
-        assert!(load_app_icon("definitely-missing-veilshell-icon-xyz").is_none());
-
-        let tmp = std::env::temp_dir().join("veilshell_test_app_icon.png");
-        let big = RgbaImage::new(192, 192, vec![120; 192 * 192 * 4]).expect("valid image");
-        let frame = veilshell_render::RenderFrame {
-            width: big.width,
-            height: big.height,
-            rgba: big.rgba,
-        };
-        frame.save_png(&tmp).expect("write test icon");
-
-        let resolved = resolve_icon_path(tmp.to_string_lossy().as_ref());
-        assert_eq!(resolved.as_deref(), Some(tmp.as_path()));
-        let loaded = load_app_icon(tmp.to_string_lossy().as_ref()).expect("loads PNG icon");
-        assert!(loaded.width <= 96 && loaded.height <= 96);
-
-        let _ = std::fs::remove_file(tmp);
-    }
-}
+mod tests;

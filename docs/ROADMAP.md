@@ -43,8 +43,8 @@
 - [x] Cached-backdrop fast SDF rasterizer & verified non-blank Tier 3 live Hyprland screenshots (`home`, `shade`, `recents`, `pill`)
 
 #### Sprint 2B — Live Hardware Intelligence, Quick Settings Controls & Theme Auto-Reload (Complete)
-- [x] `veilshell-hw` zero-dep Linux `sysfs`/CLI backend (`LinuxHardware`, `SensorGuard`): detachable USB Type Cover auto-switching via DMI-matched `hardware-profiles/*.toml` (`detect_dmi_device`, `load_matching_profile`), `iio-sensor-proxy` auto-rotation via `monitor-sensor --accel` + Rotation Lock + `wl_output`/configure resize handling
-- [x] Live Quick Settings hardware telemetry & controls (`HardwareController`): `nmcli` Wi-Fi & WWAN/LTE, `bluetoothctl`/`rfkill` Bluetooth, `sysfs` battery (filtering peripheral `scope=Device` stylus batteries) & backlight slider (clamped >= 5%), `wpctl` PipeWire volume, Night Light (`/usr/share/omarchy/bin/omarchy-toggle-nightlight` with `hyprctl hyprsunset` fallback), and `veilctl hw` inspection
+- [x] `veilshell-hw` Linux `sysfs`/CLI backend: detachable USB Type Cover auto-switching via DMI-matched profiles and `iio-sensor-proxy` auto-rotation with rotation lock in standalone mode.
+- [x] Live Quick Settings hardware telemetry & controls: Wi-Fi and WWAN, Bluetooth, system battery and backlight, PipeWire volume, Night Light via the session's `hyprsunset` when available, and `veilctl hw` inspection.
 - [x] Adaptive Laptop/Tablet startup (`veilshell --policy <auto|laptop|tablet>`, `initial_visible: false` in Laptop Mode), live Aether `colors.toml` mtime watcher, Omarchy `adapters/omarchy/hooks/30-veilshell-theme` reload hook, and optional `adapters/omarchy/systemd/veilshell.service` user unit
 
 ### Phase 3 — Built-In Touch OSK, GPU (`wgpu`) Acceleration & Native Visual Polish
@@ -57,7 +57,7 @@
 
 #### Sprint 3B — GPU (`wgpu`) Acceleration, Typography/Icons & Live Recents Thumbnails (Complete)
 - [x] `wgpu` Vulkan/GLES WGSL SDF renderer backend consuming the existing `DrawList` + pre-blurred static wallpaper glass cache (blur once on wallpaper change) + zero-copy `wgpu::Surface` Wayland presentation & automatic `SdfSoftwareRenderer` fallback (preferring Vulkan before GLES so lazy XWayland sessions never stall)
-- [x] `ab_glyph` system TrueType/OpenType font atlas (with 5×7 HUD fallback) and freedesktop `.desktop` `PNG` app icon theme loader with glass tile fallback badges
+- [x] System TrueType/OpenType fonts (with 5×7 HUD fallback) and freedesktop PNG/SVG app icons. Wayland surfaces render at the compositor's integer or fractional output scale without changing its settings.
 - [x] Live window thumbnails in the Recents Deck via `ext-foreign-toplevel-list-v1` + `ext-image-copy-capture-v1` (with `wl_shm` format conversion & premultiplied area-box downscaling)
 
 ### Phase 4 — Packaging, Multi-Compositor Ports & `v0.1.0` Release
@@ -74,9 +74,9 @@
 #### Sprint 4B — Day-to-day tablet parity
 
 - [x] Finger-following Home and Quick Settings reveals with reversible drags and spring settling, plus interactive Home paging.
-- [x] Denial-mobile control center: fullscreen frost, connectivity capsules, vertical brightness/volume levels, four-column tiles, and `powerprofilesctl`/mako tiles shown only when available. Landscape uses the two-column layout.
+- [x] Responsive control center: Connectivity, Display & Sound, and Device sections, compacting to the available controls and using both columns in landscape.
 - [x] Denial-style Recents deck: frameless live window previews with app icon/name above each card, higher-resolution captures, swipe paging, and swipe-up-to-close.
-- [ ] Notification page of the split shade: actionable banners, history, dismissal, and lock-screen privacy. Quick Settings now has the Denial-style control layout and Do Not Disturb tile.
+- [ ] Notification center: actionable banners, history, dismissal, and lock-screen privacy.
 - [x] Keyboard hold-to-repeat for Backspace and arrows, and a terminal utility row with Escape, Tab and all four arrows.
 - [ ] Keyboard long-press accents and optional local suggestions that are disabled for sensitive fields.
 - [ ] Editable Home: reorder icons, create folders, persist layout, share a dock across pages, and open a separate alphabetical app drawer. Desktop launcher adds search, recents and physical-keyboard navigation.

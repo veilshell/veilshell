@@ -11,12 +11,9 @@ use std::ptr::NonNull;
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
 };
-use smithay_client_toolkit::compositor::FrameCallbackData;
 use smithay_client_toolkit::reexports::client::protocol::wl_surface;
-use smithay_client_toolkit::reexports::client::{Connection, Proxy, QueueHandle};
-use veilshell_render::{DrawList, WgpuRenderer};
-
-use crate::client::LayerApp;
+use smithay_client_toolkit::reexports::client::{Connection, Proxy};
+use veilshell_render::{DrawList, RenderTarget, WgpuRenderer};
 
 /// Zero-copy Vulkan/GLES `Wayland` swapchain bound to a single `wlr-layer-shell` `wl_surface`.
 pub(crate) struct WgpuWaylandSurface {
@@ -50,8 +47,8 @@ impl WgpuWaylandSurface {
         })
     }
 
-    /// Configure (or reconfigure) the swapchain for `(width, height)` after a `layer_surface` configure.
-    pub(crate) fn configure(
+    /// Configure (or reconfigure) the swapchain for the current physical extent.
+    fn configure(
         &mut self,
         adapter: &wgpu::Adapter,
         device: &wgpu::Device,
@@ -60,6 +57,12 @@ impl WgpuWaylandSurface {
     ) -> Result<(), String> {
         if width == 0 || height == 0 {
             return Err("cannot configure zero-sized wgpu surface".to_owned());
+        }
+        let max = device.limits().max_texture_dimension_2d;
+        if width > max || height > max {
+            return Err(format!(
+                "{width}x{height} wgpu surface exceeds GPU texture dimension limit {max}"
+            ));
         }
         if let Some(cfg) = &mut self.config {
             if cfg.width == width && cfg.height == height {
@@ -128,18 +131,18 @@ impl WgpuWaylandSurface {
         Ok(())
     }
 
-    /// Render `list` directly into the next `Wayland` swapchain image and present it zero-copy.
-    #[allow(clippy::too_many_arguments)]
+    /// Render `list` directly into the next physical `Wayland` swapchain image.
+    ///
+    /// `before_present` queues app-owned Wayland state for the WSI's commit.
+    /// Returns `Ok(false)` on a temporary acquire timeout (no buffer committed).
     pub(crate) fn present_draw_list(
         &mut self,
         renderer: &mut WgpuRenderer,
-        width: u32,
-        height: u32,
+        target: RenderTarget,
         list: &DrawList,
-        wl_surface: &wl_surface::WlSurface,
-        qh: &QueueHandle<LayerApp>,
-        request_frame_callback: bool,
-    ) -> Result<(), String> {
+        before_present: impl FnOnce(),
+    ) -> Result<bool, String> {
+        let (width, height) = target.physical_size();
         self.configure(renderer.adapter(), renderer.device(), width, height)?;
         let format = self
             .config
@@ -153,26 +156,33 @@ impl WgpuWaylandSurface {
                 if let Some(cfg) = &self.config {
                     self.surface.configure(renderer.device(), cfg);
                 }
-                self.surface
-                    .get_current_texture()
-                    .map_err(|e| format!("wgpu acquire after reconfigure failed: {e}"))?
+                match self.surface.get_current_texture() {
+                    Ok(tex) => tex,
+                    Err(wgpu::SurfaceError::Timeout) => return Ok(false),
+                    Err(e) => return Err(format!("wgpu acquire after reconfigure failed: {e}")),
+                }
             }
-            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
+            Err(wgpu::SurfaceError::Timeout) => return Ok(false),
             Err(err) => return Err(format!("wgpu acquire failed: {err}")),
         };
+        let actual = (frame.texture.width(), frame.texture.height());
+        if actual != (width, height) {
+            return Err(format!(
+                "swapchain returned {}x{} for requested {width}x{height} buffer",
+                actual.0, actual.1
+            ));
+        }
 
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         renderer
-            .render_to_texture_view(&view, format, width, height, list)
+            .render_to_texture_view_scaled(&view, format, target, list)
             .map_err(|e| e.to_string())?;
 
-        if request_frame_callback {
-            wl_surface.frame(qh, FrameCallbackData(wl_surface.clone()));
-        }
+        before_present();
         frame.present();
-        Ok(())
+        Ok(true)
     }
 }
 

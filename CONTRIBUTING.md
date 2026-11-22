@@ -27,13 +27,16 @@ compositor harnesses:
        --scene home --width 1280 --height 853 --out /tmp/home.png
    ```
    Verify landscape (`1280×853`), portrait (`853×1280`), layout balance, and WCAG AA contrast.
-2. **Tier 3 — Hyprland virtual-output + `grim` visual harness** (inside a Hyprland session):
+2. **Tier 3 — Nested Hyprland + `grim` visual harness** (requires `jq` and a parent Wayland compositor compatible with Hyprland's nested backend):
    ```bash
    ./scripts/test-headless-hyprland.sh /tmp/veilshell-hypr-test
    ```
-   Creates a temporary virtual monitor (`hyprctl output create headless`), tests
-   live `veilctl` IPC, presents real `wlr-layer-shell` surfaces, and captures
-   compositor screenshots with `grim`.
+   Starts a private compositor with a temporary config and socket. It only
+   changes a virtual output inside that compositor, never in the parent
+   desktop. It checks `veilctl` mode isolation and captures the live surfaces
+   at 100%, 150%, and 200% in portrait and landscape. Inspect these captures
+   for sharp text and real installed app icons; set
+   `VEILSHELL_TEST_RENDERER=software` or `wgpu` to test a specific backend.
 
 ## Great Starting Areas ("Good First Issues")
 

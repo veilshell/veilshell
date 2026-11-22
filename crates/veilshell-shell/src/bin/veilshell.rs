@@ -14,7 +14,7 @@ use veilshell_compositor::{
     WindowInfo,
 };
 use veilshell_core::{
-    ModeEvent, ModePolicy, ModeStateMachine, Orientation, RotationLock, ShellMode,
+    ModeEvent, ModePolicy, ModeStateMachine, Orientation, RotationLock, ShellMode, ThemePalette,
 };
 use veilshell_hw::linux::{read_sysfs_backlight, read_sysfs_battery};
 use veilshell_hw::{HardwareBackend, HardwareController, LinuxHardware, SensorGuard};
@@ -24,9 +24,9 @@ use veilshell_render::{
 };
 use veilshell_shell::apps::{apps_to_tiles, current_clock_hhmm, discover_desktop_apps};
 use veilshell_shell::ipc::{default_socket_path, spawn_ipc_listener};
+use veilshell_shell::session::ShellSession;
 use veilshell_shell::shade;
 use veilshell_shell::ShellState;
-use veilshell_theme::{load_best_available, OmarchyAetherProvider};
 use veilshell_wayland::channel::{self, Sender};
 use veilshell_wayland::{
     run_shell_daemon, DaemonCommand, ShellAction, ShellActionHandler, WaylandRuntimeConfig,
@@ -109,6 +109,7 @@ impl CompositorBackend for ActiveCompositor {
 struct LiveActionHandler {
     compositor: ActiveCompositor,
     hw: LinuxHardware,
+    session: ShellSession,
     mode_sm: ModeStateMachine,
     rotation: RotationLock,
     target_output: Option<String>,
@@ -117,6 +118,14 @@ struct LiveActionHandler {
 }
 
 impl LiveActionHandler {
+    fn apply_mode_layout(&mut self, mode: ShellMode) {
+        if self.session.owns_compositor() {
+            if let Err(err) = self.compositor.apply_shell_mode(mode) {
+                eprintln!("veilshell: apply_shell_mode failed: {err}");
+            }
+        }
+    }
+
     fn request_power(&self, action: PowerAction, ctx: &mut SceneContext) {
         if !self
             .session_tx
@@ -172,6 +181,9 @@ impl LiveActionHandler {
     }
 
     fn apply_effective_orientation(&mut self, next: Orientation) {
+        if !self.session.owns_compositor() || !self.auto_rotate {
+            return;
+        }
         if let Some(output) = self.resolve_rotation_output() {
             if let Err(err) = self.compositor.set_output_orientation(&output, next) {
                 eprintln!("veilshell: set_output_orientation({output}) failed: {err}");
@@ -183,7 +195,7 @@ impl LiveActionHandler {
         ctx.clock_text = current_clock_hhmm();
         if scene == SceneKind::Shade {
             self.sync_hardware_snapshot(ctx);
-            shade::refresh_optional(ctx);
+            shade::refresh_optional(ctx, self.session);
             ctx.shade.feedback = None;
         } else {
             self.sync_fast_sysfs(ctx);
@@ -250,16 +262,17 @@ impl LiveActionHandler {
                     }
                 })
             }
-            "night_light" => self.hw.set_night_light(!ctx.night_light).map(|()| {
-                ctx.night_light = !ctx.night_light;
-            }),
-            "autorotate" => {
+            "night_light" if ctx.shade.night_light_available => {
+                self.hw.set_night_light(!ctx.night_light).map(|()| {
+                    ctx.night_light = !ctx.night_light;
+                })
+            }
+            "autorotate" if self.auto_rotate && self.session.owns_compositor() => {
                 let previous = self.rotation.effective();
                 self.rotation.set_locked(!self.rotation.is_locked());
                 ctx.rotation_locked = self.rotation.is_locked();
                 let next = self.rotation.effective();
-                if self.auto_rotate
-                    && !ctx.rotation_locked
+                if !ctx.rotation_locked
                     && next != previous
                     && self.mode_sm.effective_mode() == ShellMode::Tablet
                 {
@@ -267,10 +280,8 @@ impl LiveActionHandler {
                 }
                 return;
             }
-            "tablet_mode" => {
-                if let Some(next_mode) = self.mode_sm.handle(ModeEvent::ToggleManual) {
-                    let _ = self.compositor.apply_shell_mode(next_mode);
-                }
+            "tablet_mode" if !self.session.owns_compositor() => {
+                self.mode_sm.handle(ModeEvent::ToggleManual);
                 ctx.tablet_mode = self.mode_sm.effective_mode() == ShellMode::Tablet;
                 return;
             }
@@ -282,7 +293,7 @@ impl LiveActionHandler {
                 }
                 return;
             }
-            "quiet" => {
+            "quiet" if self.session == ShellSession::Overlay && ctx.shade.quiet.is_some() => {
                 if let Some(quiet) = shade::toggle_quiet() {
                     ctx.shade.quiet = Some(quiet);
                 } else {
@@ -369,9 +380,7 @@ impl ShellActionHandler for LiveActionHandler {
         let mut vis_override = None;
         if let Some(attached) = keyboard_attached {
             if let Some(next_mode) = self.mode_sm.handle(ModeEvent::KeyboardAttached(attached)) {
-                if let Err(err) = self.compositor.apply_shell_mode(next_mode) {
-                    eprintln!("veilshell: apply_shell_mode failed: {err}");
-                }
+                self.apply_mode_layout(next_mode);
                 let tablet = next_mode == ShellMode::Tablet;
                 ctx.tablet_mode = tablet;
                 vis_override = Some(tablet);
@@ -379,13 +388,11 @@ impl ShellActionHandler for LiveActionHandler {
         }
 
         if let Some(ori) = orientation {
+            ctx.shade.auto_rotate_available = self.auto_rotate && self.session.owns_compositor();
             let prev = self.rotation.effective();
             self.rotation.observe(Some(ori));
             let next = self.rotation.effective();
-            if self.auto_rotate
-                && next != prev
-                && self.mode_sm.effective_mode() == ShellMode::Tablet
-            {
+            if next != prev && self.mode_sm.effective_mode() == ShellMode::Tablet {
                 self.apply_effective_orientation(next);
             }
         }
@@ -399,6 +406,7 @@ impl ShellActionHandler for LiveActionHandler {
         if parts.next() != Some("mode") {
             return (format!("err unknown command '{cmd}'"), None);
         }
+        let previous_mode = self.mode_sm.effective_mode();
         let event = match parts.next() {
             Some("auto") => {
                 let kbd = self.hw.detect_keyboard_attached();
@@ -415,12 +423,11 @@ impl ShellActionHandler for LiveActionHandler {
                 )
             }
         };
-        if let Some(next_mode) = self.mode_sm.handle(event) {
-            if let Err(err) = self.compositor.apply_shell_mode(next_mode) {
-                return (format!("err compositor rejected mode: {err}"), None);
-            }
-        }
+        self.mode_sm.handle(event);
         let mode = self.mode_sm.effective_mode();
+        if mode != previous_mode {
+            self.apply_mode_layout(mode);
+        }
         let policy = self.mode_sm.policy();
         let tablet = mode == ShellMode::Tablet;
         ctx.tablet_mode = tablet;
@@ -459,21 +466,27 @@ fn spawn_hardware_watchers(
     cmd_tx: &Sender<DaemonCommand>,
     stop: Arc<AtomicBool>,
     hw: LinuxHardware,
+    session: ShellSession,
+    watch_rotation: bool,
 ) -> (Option<SensorGuard>, Option<thread::JoinHandle<()>>) {
-    let sensor_tx = cmd_tx.clone();
-    let sensor_guard = SensorGuard::spawn(move |ori| {
-        let _ = sensor_tx.send(DaemonCommand::HardwareUpdate {
-            keyboard_attached: None,
-            orientation: Some(ori),
-        });
-    });
+    let sensor_guard = if watch_rotation && session.owns_compositor() {
+        let sensor_tx = cmd_tx.clone();
+        SensorGuard::spawn(move |ori| {
+            let _ = sensor_tx.send(DaemonCommand::HardwareUpdate {
+                keyboard_attached: None,
+                orientation: Some(ori),
+            });
+        })
+    } else {
+        None
+    };
 
     let poll_tx = cmd_tx.clone();
     let handle = thread::Builder::new()
         .name("veilshell-watchers".into())
         .spawn(move || {
             let mut last_kbd = hw.detect_keyboard_attached();
-            let theme_path = OmarchyAetherProvider::default_path();
+            let theme_path = session.desktop_theme_path();
             let mut last_theme_mtime = read_mtime(theme_path.as_ref());
             let mut last_bat = read_sysfs_battery().map(|(pct, _)| pct);
 
@@ -508,7 +521,7 @@ fn spawn_hardware_watchers(
                 let cur_mtime = read_mtime(theme_path.as_ref());
                 if cur_mtime.is_some() && cur_mtime != last_theme_mtime {
                     last_theme_mtime = cur_mtime;
-                    let palette = load_best_available();
+                    let palette = session.palette();
                     let _ = poll_tx.send(DaemonCommand::UpdatePalette(palette));
                 }
             }
@@ -638,25 +651,24 @@ fn main() -> ExitCode {
         CliOutcome::Exit(code) => return code,
     };
 
-    let palette = load_best_available();
+    let session = ShellSession::current();
+    let palette = session.palette();
     let discovered = discover_desktop_apps();
     let hw = LinuxHardware::auto_detect();
     let preferred_scale = hw.profile().map_or(1.0, |p| p.preferred_scale);
-    let auto_rotate = hw.profile().is_none_or(|p| p.auto_rotate_in_tablet_mode);
-    let profile_id = hw.profile().map(|p| p.id.clone());
+    let watch_rotation = hw.profile().is_none_or(|p| p.auto_rotate_in_tablet_mode);
     let mode_sm = ModeStateMachine::new(opts.policy, hw.detect_keyboard_attached());
     let initial_visible =
         mode_sm.effective_mode() == ShellMode::Tablet || opts.scene != SceneKind::Pill;
 
-    let standalone =
-        env::var_os("VEILSHELL_SESSION_DIR").is_some_and(|path| PathBuf::from(path).is_dir());
     let mut scene_ctx = SceneContext {
         clock_text: current_clock_hhmm(),
         tablet_mode: initial_visible,
         home_apps: apps_to_tiles(&discovered),
-        power_menu: standalone.then_some(PowerMenu::default()),
+        power_menu: session.owns_compositor().then_some(PowerMenu::default()),
         ..SceneContext::default()
     };
+    scene_ctx.shade.auto_rotate_available = false;
 
     let compositor = match HyprlandBackend::from_env().filter(HyprlandBackend::is_available) {
         Some(hypr) => ActiveCompositor::Hyprland(hypr),
@@ -664,54 +676,45 @@ fn main() -> ExitCode {
     };
 
     let (cmd_tx, cmd_rx) = channel::channel();
-    let handler = LiveActionHandler {
+    let mut handler = LiveActionHandler {
         compositor,
         hw: hw.clone(),
+        session,
         mode_sm,
         rotation: RotationLock::default(),
         target_output: opts.output_name.clone(),
-        auto_rotate,
-        session_tx: standalone.then(|| cmd_tx.clone()),
+        auto_rotate: false,
+        session_tx: session.owns_compositor().then(|| cmd_tx.clone()),
     };
     handler.sync_hardware_snapshot(&mut scene_ctx);
-    shade::refresh_optional(&mut scene_ctx);
-    handler.refresh_context(SceneKind::Recents, &mut scene_ctx);
 
     if opts.dry_run || env::var_os("WAYLAND_DISPLAY").is_none() {
-        let state = ShellState::new(MockBackend::default(), hw, palette);
-        print!("{}", state.status_report());
-        if let Some(id) = profile_id {
-            println!("  profile    : {id}");
-        }
-        println!("  scene      : {}", opts.scene.as_str());
-        println!("  policy     : {:?}", opts.policy);
-        println!("  visible    : {initial_visible}");
-        match ActiveRenderer::new(opts.renderer, scene_ctx.clone()) {
-            Ok(active) => println!("  renderer   : {}", active.backend_label()),
-            Err(err) => println!("  renderer   : unavailable ({err})"),
-        }
-        println!("  apps       : {}", scene_ctx.home_apps.len());
-        println!("  windows    : {}", scene_ctx.recents_cards.len());
-        println!("  socket     : {}", opts.socket_path.display());
-        if !opts.dry_run {
-            println!("  wayland    : WAYLAND_DISPLAY not set (use inside a Wayland session)");
-        }
+        handler.refresh_context(SceneKind::Recents, &mut scene_ctx);
+        print_dry_run(&opts, hw, palette, scene_ctx, initial_visible);
         return ExitCode::SUCCESS;
     }
 
-    if let Err(err) = spawn_ipc_listener(&opts.socket_path, cmd_tx.clone()) {
+    if let Err(err) = spawn_ipc_listener(&opts.socket_path, cmd_tx.clone(), session) {
         eprintln!(
-            "veilshell: warning — could not bind IPC socket {}: {err}",
+            "veilshell: could not bind IPC socket {}: {err}",
             opts.socket_path.display()
         );
+        return ExitCode::FAILURE;
     }
 
     let stop_watchers = Arc::new(AtomicBool::new(false));
     let (sensor_guard, watcher_handle) = if opts.no_watchers {
         (None, None)
     } else {
-        spawn_hardware_watchers(&cmd_tx, Arc::clone(&stop_watchers), hw)
+        spawn_hardware_watchers(
+            &cmd_tx,
+            Arc::clone(&stop_watchers),
+            hw,
+            session,
+            watch_rotation,
+        )
     };
+    handler.auto_rotate = sensor_guard.is_some();
 
     let config = WaylandRuntimeConfig {
         display_override: None,
@@ -741,6 +744,35 @@ fn main() -> ExitCode {
     }
 }
 
+fn print_dry_run(
+    opts: &CliOptions,
+    hw: LinuxHardware,
+    palette: ThemePalette,
+    ctx: SceneContext,
+    visible: bool,
+) {
+    let profile_id = hw.profile().map(|profile| profile.id.clone());
+    let state = ShellState::new(MockBackend::default(), hw, palette);
+    print!("{}", state.status_report());
+    if let Some(id) = profile_id {
+        println!("  profile    : {id}");
+    }
+    println!("  scene      : {}", opts.scene.as_str());
+    println!("  policy     : {:?}", opts.policy);
+    println!("  visible    : {visible}");
+    let (apps, windows) = (ctx.home_apps.len(), ctx.recents_cards.len());
+    match ActiveRenderer::new(opts.renderer, ctx) {
+        Ok(active) => println!("  renderer   : {}", active.backend_label()),
+        Err(err) => println!("  renderer   : unavailable ({err})"),
+    }
+    println!("  apps       : {apps}");
+    println!("  windows    : {windows}");
+    println!("  socket     : {}", opts.socket_path.display());
+    if !opts.dry_run {
+        println!("  wayland    : WAYLAND_DISPLAY not set (use inside a Wayland session)");
+    }
+}
+
 fn parse_flag(args: &[String], flag: &str) -> Option<String> {
     args.windows(2)
         .find(|pair| pair[0] == flag)
@@ -767,4 +799,69 @@ fn print_help() {
          \t-V, --version                          Print version information",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn handler(session: ShellSession) -> LiveActionHandler {
+        LiveActionHandler {
+            compositor: ActiveCompositor::Mock(MockBackend::default()),
+            hw: LinuxHardware::new(None),
+            session,
+            mode_sm: ModeStateMachine::new(ModePolicy::Auto, true),
+            rotation: RotationLock::default(),
+            target_output: Some("eDP-1".to_owned()),
+            auto_rotate: true,
+            session_tx: None,
+        }
+    }
+
+    #[test]
+    fn overlay_mode_and_sensor_events_do_not_change_the_host_compositor() {
+        let mut shell = handler(ShellSession::Overlay);
+        let mut ctx = SceneContext::default();
+        assert_eq!(
+            shell.on_hardware_update(Some(false), Some(Orientation::Rotate90), &mut ctx),
+            Some(true)
+        );
+        assert!(ctx.tablet_mode);
+        assert!(!ctx.shade.auto_rotate_available);
+        assert_eq!(
+            shell.on_custom_command("mode laptop", &mut ctx).1,
+            Some(false)
+        );
+        assert_eq!(
+            shell.on_custom_command("mode tablet", &mut ctx).1,
+            Some(true)
+        );
+        let ActiveCompositor::Mock(mock) = shell.compositor else {
+            unreachable!();
+        };
+        assert_eq!(mock.applied_mode(), ShellMode::Laptop);
+        assert_eq!(
+            mock.list_outputs().unwrap()[0].orientation,
+            Orientation::Normal
+        );
+    }
+
+    #[test]
+    fn standalone_can_manage_its_own_compositor() {
+        let mut shell = handler(ShellSession::Standalone);
+        let mut ctx = SceneContext::default();
+        assert_eq!(
+            shell.on_hardware_update(Some(false), Some(Orientation::Rotate90), &mut ctx),
+            Some(true)
+        );
+        assert!(ctx.shade.auto_rotate_available);
+        let ActiveCompositor::Mock(mock) = shell.compositor else {
+            unreachable!();
+        };
+        assert_eq!(mock.applied_mode(), ShellMode::Tablet);
+        assert_eq!(
+            mock.list_outputs().unwrap()[0].orientation,
+            Orientation::Rotate90
+        );
+    }
 }

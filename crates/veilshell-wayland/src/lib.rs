@@ -6,6 +6,7 @@ pub mod client;
 mod gpu;
 mod motion;
 mod osk;
+mod scale;
 
 pub use client::{
     run_layer_surface, run_shell_daemon, DaemonCommand, RuntimeStatus, ShellAction,
@@ -182,6 +183,8 @@ pub struct TouchEvent {
 pub struct WaylandRuntimeConfig {
     pub display_override: Option<String>,
     pub output_name: Option<String>,
+    /// Hardware profile hint retained for compatibility. The compositor's
+    /// per-surface scale governs live Wayland buffers.
     pub preferred_scale: f32,
     pub exit_after_ms: Option<u64>,
     pub initial_visible: bool,

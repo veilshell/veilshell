@@ -21,12 +21,15 @@ default = ["wgpu"]
 wgpu = ["veilshell-render/wgpu", "veilshell-wayland/wgpu"]
 
 [dependencies]
+png.workspace = true
+resvg = { version = "=0.50.0", default-features = false }
 veilshell-compositor.workspace = true
 veilshell-core.workspace = true
 veilshell-hw.workspace = true
 veilshell-render.workspace = true
 veilshell-theme.workspace = true
 veilshell-wayland.workspace = true
+zune-jpeg = { version = "=0.5.15", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true

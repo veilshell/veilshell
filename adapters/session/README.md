@@ -5,7 +5,10 @@ authenticates the user; it is not a greeter theme and **does not support
 autologin**. The adapter uses a dedicated Hyprland Lua config and starts VeilShell
 in tablet mode. It does not load the user's normal Hyprland or Omarchy config,
 start global user targets, or publish over another desktop's activation
-environment.
+environment. The daemon uses its built-in palette rather than syncing
+Omarchy's theme, and it does not invoke Omarchy's Night Light or notification
+helpers. The compositor also leaves the user's shared GSettings cursor
+preferences alone. VeilShell can still read installed apps and icon themes.
 
 Requires Bash 5.1+, Hyprland 0.57+ with Lua, `hypridle` with `inhibit_sleep = 3`,
 `hyprlock` with a working distro PAM configuration, and util-linux `flock`.
@@ -19,7 +22,7 @@ From the repository root, build and explicitly install the files below. Nothing
 here changes SDDM settings or makes VeilShell the default.
 
 ```bash
-cargo build --release --locked --bin veilshell --bin veilctl
+cargo build --release --bin veilshell --bin veilctl
 sudo install -Dm755 target/release/veilshell /usr/bin/veilshell
 sudo install -Dm755 target/release/veilctl /usr/bin/veilctl
 sudo install -Dm755 adapters/session/veilshell-session /usr/bin/veilshell-session
@@ -45,6 +48,12 @@ delay is not a hard guarantee against resuming unlocked if startup fails. There
 is no automatic suspend timer. Native touch unlock, portal activation, a
 polkit agent, autostart, and a real SDDM login/wake hardware test are still
 required before calling this a daily-driver session.
+
+Test it by logging **out** of Omarchy and choosing **VeilShell (Preview)** at
+SDDM. After logging back into Omarchy, check that its layout, shortcuts,
+and services are unchanged. This is a separate compositor, not a VM: hardware
+settings (Wi-Fi, audio level, brightness) are shared, and the preview is not
+designed for simultaneous desktops under the same user account.
 
 To remove the **session picker entry** without touching SDDM or other sessions:
 

@@ -140,9 +140,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     if kind == KIND_GLOW {
         let radius = in.params0.z;
-        if radius <= 1.0 || in.color0.a <= 0.001 {
-            discard;
-        }
         let d = frag - in.params0.xy;
         let dist2 = dot(d, d) / (radius * radius);
         if dist2 >= 1.0 {
@@ -167,7 +164,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let dist = sdf_rounded_box(rel, half_ext, r);
         var out = vec4<f32>(0.0, 0.0, 0.0, 0.0);
 
-        if shadow_alpha > 0.001 && shadow_radius > 0.5 && dist > -1.0 {
+        if shadow_alpha > 0.001 && dist > -1.0 {
             let sdist = sdf_rounded_box(rel - vec2<f32>(0.0, shadow_offset_y), half_ext, r);
             if sdist < shadow_radius {
                 let norm = clamp(max(sdist, 0.0) / shadow_radius, 0.0, 1.0);
@@ -189,7 +186,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 }
             }
 
-            if border_width > 0.01 && in.color1.a > 0.001 {
+            if border_width > 0.0 && in.color1.a > 0.001 {
                 let inner_cov = clamp(dist + border_width + 0.5, 0.0, 1.0);
                 let border_cov = fill_cov * inner_cov;
                 if border_cov > 0.001 {
@@ -215,7 +212,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
         let atlas_sz = max(u_viewport.atlas_size, vec2<f32>(1.0, 1.0));
         let local_uv = clamp(
-            (frag - in.rect.xy) / max(in.rect.zw, vec2<f32>(1.0, 1.0)),
+            (frag - in.rect.xy) / in.rect.zw,
             vec2<f32>(0.0, 0.0),
             vec2<f32>(1.0, 1.0),
         );
@@ -231,12 +228,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     if kind == KIND_ALPHA_GLYPH {
-        let atlas_sz = max(u_viewport.atlas_size, vec2<f32>(1.0, 1.0));
-        let local = frag - in.rect.xy;
-        let min_px = vec2<f32>(0.5, 0.5);
-        let max_px = max(in.params0.zw - vec2<f32>(0.5, 0.5), vec2<f32>(0.5, 0.5));
-        let sample_px = in.params0.xy + clamp(local, min_px, max_px);
-        let cov = textureSampleLevel(t_atlas, s_wallpaper, sample_px / atlas_sz, 0.0).a;
+        // Rasterized glyph masks are already in physical pixels.
+        let local = vec2<i32>(frag - in.rect.xy);
+        let cov = textureLoad(t_atlas, vec2<i32>(in.params0.xy) + local, 0).a;
         let a = clamp(in.color0.a * cov, 0.0, 1.0);
         if a <= 0.001 {
             discard;
@@ -245,10 +239,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // KIND_GLYPH: crisp 5x7 ASCII bitmap glyph packed into meta.y (rows 0..4) & meta.z (rows 4..7)
-    let scale = max(in.params0.x, 1.0);
-    let local = frag - in.rect.xy;
-    let rx_i = i32(floor(local.x / scale));
-    let ry_i = i32(floor(local.y / scale));
+    let local = (frag - in.rect.xy) / in.params0.xy;
+    let rx_i = i32(floor(local.x));
+    let ry_i = i32(floor(local.y));
     if rx_i < 0 || rx_i >= 5 || ry_i < 0 || ry_i >= 7 {
         discard;
     }

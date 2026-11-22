@@ -12,10 +12,11 @@ keybindings, or desktop workflow — engineered specifically for **older 5W /
 - **Distro-agnostic foundation:** Clean Rust trait boundaries keep core UI,
   physics, rendering, and hardware adapters independent of any single Linux
   distribution.
-- **First-class Omarchy & Hyprland compatibility:** Live Laptop ↔ Tablet mode
-  switching (both Lua `eval` for Omarchy 4.5+ and legacy `keyword` IPC) with
-  native Omarchy Aether `colors.toml` theme sync and zero interference with your
-  desktop session.
+- **Omarchy & Hyprland compatibility:** Laptop ↔ Tablet mode shows or hides
+  the overlay without rewriting the host compositor's monitor or layout
+  settings. Omarchy Aether `colors.toml` theme sync is read-only.
+- **Optional standalone login:** Select **VeilShell (Preview)** in SDDM to
+  start a separate Hyprland session, without replacing your usual desktop.
 - **Edge performance budget:** Event-driven `calloop` main loop (`0%` idle CPU
   when dormant), single-pass `wgpu` Vulkan/GLES instanced WGSL SDF rendering
   with zero-copy `Wayland` swapchains + blur-once GPU wallpaper glass cache,
@@ -33,9 +34,9 @@ keybindings, or desktop workflow — engineered specifically for **older 5W /
 | [`veilshell-theme`](crates/veilshell-theme) | `ThemeProvider` trait + live Omarchy Aether `colors.toml` loader + WCAG AA dark fallback | Phase 0 (Done) |
 | [`veilshell-compositor`](crates/veilshell-compositor) | `CompositorBackend` trait + live Hyprland Unix-socket IPC (Lua `eval` + legacy `keyword` fallback, recency-sorted `j/clients` with `stableId`, `j/monitors`, workspace switch, app launch) + `MockBackend` | Phase 3 (Done) |
 | [`veilshell-render`](crates/veilshell-render) | Renderer-agnostic glassmorphic `DrawList` + `SceneOutput` hit-testing for all 5 scenes, `wgpu` Vulkan/GLES WGSL SDF backend with shelf-packed GPU glyph/icon/thumbnail atlas & blur-once wallpaper cache, CPU SDF fallback, `ab_glyph` TrueType typography (+ 5×7 HUD fallback), `ARGB8888` encoder, and `PNG` exporter | Phase 3 (Done) |
-| [`veilshell-wayland`](crates/veilshell-wayland) | Event-driven `calloop` + `smithay-client-toolkit` multi-surface `wlr-layer-shell` runtime (`BottomPill`, `TopStrip`, `TouchOsk`, reused `Overlay`), zero-copy `wgpu::Surface` presentation + `wl_shm` fallback, `zwp_input_method_v2` + `zwp_virtual_keyboard_v1` OSK, `ext-foreign-toplevel-list-v1` + `ext-image-copy-capture-v1` live Recents thumbnails, output pinning (`--output`), `wl_touch`/`wl_pointer` gestures | Phase 3 (Done) |
+| [`veilshell-wayland`](crates/veilshell-wayland) | Event-driven multi-surface `wlr-layer-shell` runtime, integer and fractional output scaling, zero-copy `wgpu::Surface` presentation + `wl_shm` fallback, Wayland OSK input and live Recents thumbnails, output pinning (`--output`), `wl_touch`/`wl_pointer` gestures | Phase 3 (Done) |
 | [`veilshell-hw`](crates/veilshell-hw) | `HardwareSnapshot`, `HardwareBackend` + `HardwareController` traits, pure zero-dep Linux `sysfs`/CLI telemetry (`LinuxHardware`, `SensorGuard`), DMI matcher, and declarative `hardware-profiles/*.toml` parser | Phase 2 (Done) |
-| [`veilshell-shell`](crates/veilshell-shell) | `ShellState` orchestration, `.desktop` discovery & freedesktop `PNG` icon loader, `veilctl` Unix IPC socket, live hardware/theme watcher, `veilshell` daemon & `veilctl` CLI | Phase 3 (Done) |
+| [`veilshell-shell`](crates/veilshell-shell) | `ShellState` orchestration, XDG `.desktop` discovery and freedesktop PNG/SVG icons, `veilctl` Unix IPC socket, live hardware/theme watcher, `veilshell` daemon & `veilctl` CLI | Phase 3 (Done) |
 
 Distro integration glue lives under [`adapters/`](adapters/omarchy/README.md),
 and device quirk profiles live under [`hardware-profiles/`](hardware-profiles/microsoft-surface-go-3.toml).
@@ -74,7 +75,7 @@ veilctl mode toggle      # Toggle Laptop (hidden / 0% CPU) <-> Tablet Mode
 veilctl reload-theme     # Hot-reload Aether colors.toml
 veilctl quit             # Stop the daemon cleanly
 
-# Run Tier 3 live Hyprland virtual-output + grim visual verification (inside Hyprland)
+# Capture a private nested Hyprland at 100%, 150%, and 200% (requires a Wayland parent)
 ./scripts/test-headless-hyprland.sh /tmp/veilshell-hypr-test
 ```
 
@@ -90,8 +91,11 @@ A horizontal swipe on the bottom pill still changes workspaces.
 
 For Omarchy users, optional instant theme-hook (`adapters/omarchy/hooks/30-veilshell-theme`)
 and `systemd --user` (`adapters/omarchy/systemd/veilshell.service`) integration guides live in [`adapters/omarchy/README.md`](adapters/omarchy/README.md).
+Set `VEILSHELL_ICON_THEME` before starting VeilShell to override icon lookup
+for the shell only. It does not change your desktop's icon theme.
 For SDDM, see the [standalone session preview](adapters/session/README.md).
-It currently requires a physical keyboard for password unlock.
+It is an opt-in entry, not a greeter theme or an autologin setup, and currently
+requires a physical keyboard for password unlock.
 
 ## Documentation
 

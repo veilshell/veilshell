@@ -20,7 +20,6 @@ const SYSFS_USB_DEVICES: &str = "/sys/bus/usb/devices";
 const SYSFS_DMI_VENDOR: &str = "/sys/class/dmi/id/sys_vendor";
 const SYSFS_DMI_PRODUCT: &str = "/sys/class/dmi/id/product_name";
 const SYSFS_RFKILL: &str = "/sys/class/rfkill";
-const OMARCHY_NIGHTLIGHT_BIN: &str = "/usr/share/omarchy/bin/omarchy-toggle-nightlight";
 
 /// Live `Linux` hardware telemetry and control implementation using `sysfs` and standard `CLI` tools.
 #[derive(Clone, Debug)]
@@ -136,7 +135,8 @@ impl HardwareBackend for LinuxHardware {
             volume_pct,
             volume_available: volume.is_some(),
             muted,
-            night_light,
+            night_light: night_light.unwrap_or(false),
+            night_light_available: night_light.is_some(),
             keyboard_attached,
             orientation: Orientation::Normal,
         }
@@ -176,14 +176,12 @@ impl HardwareController for LinuxHardware {
     }
 
     fn set_night_light(&mut self, enabled: bool) -> Result<(), HardwareError> {
-        if read_hyprsunset_enabled() == enabled {
+        // Only control the current compositor's service; never start another
+        // desktop's Hyprsunset through an Omarchy-wide helper.
+        let current =
+            read_hyprsunset_enabled().ok_or(HardwareError::Unavailable("session hyprsunset"))?;
+        if current == enabled {
             return Ok(());
-        }
-        if Path::new(OMARCHY_NIGHTLIGHT_BIN).exists() {
-            return run_status(OMARCHY_NIGHTLIGHT_BIN, &[]);
-        }
-        if run_stdout("which", &["omarchy-toggle-nightlight"]).is_some() {
-            return run_status("omarchy-toggle-nightlight", &[]);
         }
         if enabled {
             run_status("hyprctl", &["hyprsunset", "temperature", "4000"])
@@ -517,10 +515,15 @@ fn read_bluetooth_enabled() -> Option<bool> {
     run_stdout("bluetoothctl", &["show"]).and_then(|out| parse_bluetoothctl_powered(&out))
 }
 
-fn read_hyprsunset_enabled() -> bool {
+fn read_hyprsunset_enabled() -> Option<bool> {
+    // Without an instance explicitly selected, Hyprctl can target some
+    // other running compositor (e.g. in a nested or separate session).
+    if std::env::var("HYPRLAND_INSTANCE_SIGNATURE").map_or(true, |s| s.is_empty()) {
+        return None;
+    }
     run_stdout("hyprctl", &["hyprsunset", "temperature"])
         .and_then(|out| parse_hyprsunset_temp(&out))
-        .is_some_and(|kelvin| kelvin < 6000)
+        .map(|kelvin| kelvin < 6000)
 }
 
 fn run_stdout(bin: &str, args: &[&str]) -> Option<String> {
@@ -567,9 +570,7 @@ fn run_status(bin: &str, args: &[&str]) -> Result<(), HardwareError> {
 }
 
 fn leaked_static_name(bin: &str) -> &'static str {
-    if bin.ends_with("omarchy-toggle-nightlight") {
-        "omarchy-toggle-nightlight"
-    } else if bin.ends_with("brightnessctl") {
+    if bin.ends_with("brightnessctl") {
         "brightnessctl"
     } else if bin.ends_with("bluetoothctl") {
         "bluetoothctl"

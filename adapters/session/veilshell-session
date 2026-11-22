@@ -12,9 +12,16 @@ fail() {
 config_dir=${VEILSHELL_SESSION_CONFIG_DIR:-/usr/share/veilshell/session}
 
 require_session() {
-    [[ -d ${VEILSHELL_SESSION_DIR:-} && -n ${WAYLAND_DISPLAY:-} &&
+    local -a endpoints=()
+    [[ ${VEILSHELL_SESSION_DIR:-} == /* && -n ${WAYLAND_DISPLAY:-} &&
         -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]] ||
         fail "not running inside a standalone VeilShell session"
+    if ! mapfile -t endpoints <"$VEILSHELL_SESSION_DIR/display" ||
+        (( ${#endpoints[@]} != 2 )) ||
+        [[ ${endpoints[0]} != "$WAYLAND_DISPLAY" ||
+            ${endpoints[1]} != "$HYPRLAND_INSTANCE_SIGNATURE" ]]; then
+        fail "display does not match the standalone VeilShell session"
+    fi
 }
 
 lock_and_wait() {
@@ -133,7 +140,7 @@ export VEILSHELL_SESSION_CONFIG_DIR="$config_dir"
 export VEILSHELL_SOCKET="$session_dir/control.sock"
 export XDG_SESSION_TYPE=wayland XDG_SESSION_DESKTOP=VeilShell XDG_CURRENT_DESKTOP=Hyprland
 export HYPRLAND_NO_SD_VARS=1 HYPRLAND_NO_SD_TARGET=1 HYPRLAND_NO_SD_NOTIFY=1
-unset DISPLAY HYPRLAND_INSTANCE_SIGNATURE SWAYSOCK I3SOCK
+unset DISPLAY HYPRLAND_INSTANCE_SIGNATURE SWAYSOCK I3SOCK NOTIFY_SOCKET
 
 Hyprland --config "$config_dir/hyprland.lua" &
 hyprland_pid=$!

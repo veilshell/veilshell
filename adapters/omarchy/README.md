@@ -2,11 +2,14 @@
 
 This directory holds optional, thin integration glue for [Omarchy](https://omarchy.org) users so that VeilShell works alongside an unmodified Omarchy + Hyprland installation.
 
-Core VeilShell crates **never** hardcode Omarchy paths or assumptions:
+No adapter installation is required to run the overlay manually. The
+VeilShell overlay does not change your window gaps, rounding, or monitor
+rules, including when the keyboard detaches. `veilctl mode` requires the
+running daemon; it never changes Hyprland settings on its own.
 
 - **Theme sync:** `veilshell-theme` reads `~/.local/state/omarchy/current/theme/colors.toml` via `OmarchyAetherProvider` when available, and falls back to the built-in dark theme on any other Linux distribution. In addition to VeilShell's built-in 1.5s `colors.toml` mtime watcher, you can install the instant theme hook below.
-- **Compositor IPC:** `HyprlandBackend` automatically speaks Omarchy 4.5+ Lua `eval` (`hl.config` / `hl.monitor`) and falls back to legacy `.conf` `keyword` commands on standard Hyprland setups.
-- **Night Light sync:** Quick Settings' Night Light tile invokes `/usr/share/omarchy/bin/omarchy-toggle-nightlight` when present, falling back cleanly to direct `hyprctl hyprsunset` commands on non-Omarchy systems.
+- **Icons and scaling:** VeilShell reads installed icons and uses the output scale already chosen by the compositor; it does not set your icon theme or display scale.
+- **Quick Settings:** Controls such as Wi-Fi, brightness, and volume still affect the actual device when you use them. Night Light only appears when this Hyprland instance's Hyprsunset is already running; VeilShell does not start or restart it.
 - **Session integration:**
   - **Omarchy 4.5+ (Lua Hyprland):** Use [`veilshell.lua`](veilshell.lua) (sets `hl.layer_rule` `no_anim` for `veilshell` and shows optional `o.bind` keybindings for `veilctl show home/recents/shade` and `veilctl mode toggle`).
   - **Legacy Hyprland `.conf`:** Use [`veilshell.conf`](veilshell.conf).
@@ -17,3 +20,11 @@ Core VeilShell crates **never** hardcode Omarchy paths or assumptions:
     systemctl --user enable --now veilshell.service
     ```
     Started with `--policy auto`, `veilshell` uses zero surfaces in Laptop Mode when a detachable keyboard/Type Cover is present and springs open automatically upon detach.
+
+For a separate login, see the [standalone SDDM preview](../session/README.md).
+It does not use this adapter's theme hook or user service.
+
+If a test daemon is needed alongside an existing daemon, give it a different
+`--socket` and point its `veilctl` commands at that socket with `VEILSHELL_SOCKET`.
+VeilShell refuses to replace an existing socket. After an unclean exit,
+remove the stale socket only after confirming no daemon is using it.

@@ -9,6 +9,70 @@ use std::sync::Arc;
 
 use veilshell_core::Rgba;
 
+/// Mapping from a logical scene viewport to the exact extent of its pixel buffer.
+///
+/// Keep the draw list and hit regions in logical coordinates. The render target
+/// only affects rasterization, including on fractional scales where rounding
+/// the buffer dimensions can make the horizontal and vertical ratios differ.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderTarget {
+    logical: (u32, u32),
+    physical: (u32, u32),
+}
+
+impl RenderTarget {
+    /// Construct a target, rejecting zero dimensions.
+    ///
+    /// # Errors
+    /// Returns [`crate::RenderError::InvalidViewport`] if any dimension is zero.
+    pub const fn new(
+        logical: (u32, u32),
+        physical: (u32, u32),
+    ) -> Result<Self, crate::RenderError> {
+        if logical.0 == 0 || logical.1 == 0 || physical.0 == 0 || physical.1 == 0 {
+            return Err(crate::RenderError::InvalidViewport);
+        }
+        Ok(Self { logical, physical })
+    }
+
+    /// Construct a 1:1 logical-to-physical render target.
+    ///
+    /// # Errors
+    /// Returns [`crate::RenderError::InvalidViewport`] if either dimension is zero.
+    pub const fn unscaled(width: u32, height: u32) -> Result<Self, crate::RenderError> {
+        Self::new((width, height), (width, height))
+    }
+
+    /// Width and height of the render buffer, in physical pixels.
+    #[must_use]
+    pub const fn physical_size(self) -> (u32, u32) {
+        self.physical
+    }
+
+    pub(crate) fn pixel_scale(self) -> PixelScale {
+        PixelScale {
+            x: self.physical.0 as f32 / self.logical.0 as f32,
+            y: self.physical.1 as f32 / self.logical.1 as f32,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PixelScale {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl PixelScale {
+    pub const ONE: Self = Self { x: 1.0, y: 1.0 };
+
+    /// Normally the axes are equal; use the smaller ratio for scalar radii
+    /// and stroke widths when fractional rounding makes them differ slightly.
+    pub fn uniform(self) -> f32 {
+        self.x.min(self.y)
+    }
+}
+
 static NEXT_IMAGE_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_image_id() -> u64 {
@@ -250,6 +314,17 @@ pub struct ImageQuad {
     pub image: Arc<RgbaImage>,
 }
 
+impl ImageQuad {
+    pub(crate) fn physical_bounds(&self, scale: PixelScale) -> [f32; 4] {
+        [
+            self.x * scale.x,
+            self.y * scale.y,
+            self.w * scale.x,
+            self.h * scale.y,
+        ]
+    }
+}
+
 /// Axis-aligned logical-pixel hit-test rectangle.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HitRect {
@@ -347,6 +422,21 @@ pub struct RoundedRect {
 }
 
 impl RoundedRect {
+    pub(crate) fn scaled(self, scale: PixelScale) -> Self {
+        let uniform = scale.uniform();
+        Self {
+            x: self.x * scale.x,
+            y: self.y * scale.y,
+            w: self.w * scale.x,
+            h: self.h * scale.y,
+            radius: self.radius * uniform,
+            border_width: self.border_width * uniform,
+            shadow_radius: self.shadow_radius * uniform,
+            shadow_offset_y: self.shadow_offset_y * scale.y,
+            ..self
+        }
+    }
+
     /// Create a simple filled rounded rectangle without border or shadow.
     #[must_use]
     pub const fn filled(x: f32, y: f32, w: f32, h: f32, radius: f32, fill: Rgba) -> Self {
@@ -403,7 +493,7 @@ pub enum TextAlign {
     Right,
 }
 
-/// Crisp bitmap text label primitive.
+/// Text label positioned in logical coordinates, with a logical font size tier.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextLabel {
     pub x: f32,
@@ -434,7 +524,7 @@ pub enum DrawCommand {
     Image(ImageQuad),
 }
 
-/// Ordered draw list produced by scene layout and consumed by a renderer backend.
+/// Ordered draw list, in logical coordinates, consumed by a renderer backend.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DrawList {
     pub commands: Vec<DrawCommand>,

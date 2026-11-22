@@ -22,8 +22,8 @@ use veilshell_core::{Orientation, ThemePalette};
 #[cfg(feature = "wgpu")]
 pub use gpu::WgpuRenderer;
 pub use primitives::{
-    DrawCommand, DrawList, HitRect, HitRegion, HitTarget, ImageQuad, RgbaImage, RoundedRect,
-    SceneOutput, ShmPixelFormat, TextAlign, TextLabel,
+    DrawCommand, DrawList, HitRect, HitRegion, HitTarget, ImageQuad, RenderTarget, RgbaImage,
+    RoundedRect, SceneOutput, ShmPixelFormat, TextAlign, TextLabel,
 };
 pub use recents::recents_stride;
 pub use scene::{
@@ -117,10 +117,17 @@ impl ViewportSize {
     /// Compute physical framebuffer dimensions after scaling.
     #[must_use]
     pub fn physical_pixels(self) -> (u32, u32) {
-        let scale = self.scale.max(0.25);
-        let w = (self.width as f32 * scale).round() as u32;
-        let h = (self.height as f32 * scale).round() as u32;
+        let scale = f64::from(self.scale.max(0.25));
+        let w = (f64::from(self.width) * scale).round() as u32;
+        let h = (f64::from(self.height) * scale).round() as u32;
         (w, h)
+    }
+
+    fn render_target(self) -> Result<RenderTarget, RenderError> {
+        if !self.scale.is_finite() || self.scale <= 0.0 {
+            return Err(RenderError::InvalidViewport);
+        }
+        RenderTarget::new((self.width, self.height), self.physical_pixels())
     }
 }
 
@@ -449,10 +456,22 @@ impl ActiveRenderer {
         height: u32,
         list: &DrawList,
     ) -> Result<RenderFrame, RenderError> {
+        self.rasterize_scaled(RenderTarget::unscaled(width, height)?, list)
+    }
+
+    /// Rasterize a logical [`DrawList`] directly at the render target's physical size.
+    ///
+    /// # Errors
+    /// Returns [`RenderError`] if the target cannot be allocated or rendered.
+    pub fn rasterize_scaled(
+        &mut self,
+        target: RenderTarget,
+        list: &DrawList,
+    ) -> Result<RenderFrame, RenderError> {
         match self {
-            Self::Software(sw) => sw.rasterize(width, height, list),
+            Self::Software(sw) => sw.rasterize_scaled(target, list),
             #[cfg(feature = "wgpu")]
-            Self::Wgpu(gpu) => gpu.rasterize(width, height, list),
+            Self::Wgpu(gpu) => gpu.rasterize_scaled(target, list),
         }
     }
 }
@@ -533,6 +552,40 @@ mod tests {
             renderer.render_snapshot(&spec, &ThemePalette::default_dark()),
             Err(RenderError::InvalidViewport)
         ));
+    }
+
+    #[test]
+    fn snapshot_scale_changes_pixel_density_not_layout() {
+        let mut renderer = SdfSoftwareRenderer::default();
+        let palette = ThemePalette::default_dark();
+        let spec = SnapshotSpec {
+            scene: SceneKind::Pill,
+            viewport: ViewportSize {
+                width: 301,
+                height: 27,
+                scale: 1.5,
+            },
+            orientation: Orientation::Normal,
+        };
+        let layout = build_scene_layout(spec.scene, 301.0, 27.0, &palette, &renderer.context);
+        let target = RenderTarget::new((301, 27), (452, 41)).unwrap();
+        let frame = renderer.render_snapshot(&spec, &palette).unwrap();
+        assert_eq!((frame.width, frame.height), (452, 41));
+        assert_eq!(
+            frame,
+            renderer
+                .rasterize_scaled(target, &layout.draw_list)
+                .unwrap()
+        );
+        assert_eq!(layout.hit_test(300.0, 26.0), Some(&HitTarget::BottomPill));
+        assert_eq!(layout.hit_test(400.0, 26.0), None);
+        // The 180-logical-pixel pill should be ~270 physical pixels wide.
+        let middle_rows = frame.rgba.chunks_exact(frame.width as usize * 4);
+        let widest = middle_rows
+            .map(|row| row.chunks_exact(4).filter(|px| px[3] >= 128).count())
+            .max()
+            .unwrap();
+        assert!(widest.abs_diff(270) <= 1, "unexpected pill width: {widest}");
     }
 
     #[test]
@@ -899,26 +952,29 @@ mod tests {
         gpu.context.home_apps[0].icon = Some(icon);
         gpu.context.recents_cards[0].thumbnail = Some(thumb);
 
-        for scene in [
-            SceneKind::Pill,
-            SceneKind::Home,
-            SceneKind::Recents,
-            SceneKind::Shade,
-            SceneKind::Osk,
+        for (scene, scale, buffer_size) in [
+            (SceneKind::Pill, 1.0, (480, 28)),
+            (SceneKind::Pill, 1.5, (720, 42)),
+            (SceneKind::Home, 1.0, (480, 321)),
+            (SceneKind::Home, 1.5, (720, 482)),
+            (SceneKind::Recents, 1.0, (480, 321)),
+            (SceneKind::Shade, 1.0, (480, 321)),
+            (SceneKind::Shade, 2.0, (960, 642)),
+            (SceneKind::Osk, 1.0, (480, 321)),
         ] {
             let spec = SnapshotSpec {
                 scene,
                 viewport: ViewportSize {
                     width: 480,
-                    height: if scene == SceneKind::Pill { 28 } else { 320 },
-                    scale: 1.0,
+                    height: if scene == SceneKind::Pill { 28 } else { 321 },
+                    scale,
                 },
                 orientation: Orientation::Normal,
             };
             let sw_frame = sw.render_snapshot(&spec, &palette).expect("sw renders");
             let gpu_frame = gpu.render_snapshot(&spec, &palette).expect("gpu renders");
-            assert_eq!(sw_frame.width, gpu_frame.width);
-            assert_eq!(sw_frame.height, gpu_frame.height);
+            assert_eq!((sw_frame.width, sw_frame.height), buffer_size);
+            assert_eq!((gpu_frame.width, gpu_frame.height), buffer_size);
             assert_eq!(sw_frame.rgba.len(), gpu_frame.rgba.len());
 
             // Compare in premultiplied channel space so transparent RGB noise is weighted by alpha.
@@ -941,7 +997,7 @@ mod tests {
             let mean_diff = sum_abs_diff as f64 / (pixel_count * 4) as f64;
             assert!(
                 mean_diff < 2.0,
-                "scene {scene:?} GPU vs CPU mean channel diff too high: {mean_diff:.3} (adapter: {})",
+                "scene {scene:?} at {scale}x GPU vs CPU mean channel diff too high: {mean_diff:.3} (adapter: {})",
                 gpu.adapter_summary()
             );
         }

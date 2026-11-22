@@ -39,6 +39,8 @@ if name == "Hyprland":
     assert "HYPRLAND_INSTANCE_SIGNATURE" not in os.environ
     assert os.environ["HYPRLAND_NO_SD_VARS"] == "1"
     assert os.environ["HYPRLAND_NO_SD_TARGET"] == "1"
+    assert os.environ["HYPRLAND_NO_SD_NOTIFY"] == "1"
+    assert "NOTIFY_SOCKET" not in os.environ
     runtime = Path(os.environ["XDG_RUNTIME_DIR"])
     os.environ.update(WAYLAND_DISPLAY="isolated", HYPRLAND_INSTANCE_SIGNATURE="fake-hyprland")
     ipc = runtime / "hypr" / "fake-hyprland"
@@ -108,6 +110,7 @@ class SessionTests(unittest.TestCase):
             TEST_LOG=str(self.log),
             DISPLAY="stale",
             HYPRLAND_INSTANCE_SIGNATURE="stale",
+            NOTIFY_SOCKET="stale",
         )
         for key in ("WAYLAND_DISPLAY", "WAYLAND_SOCKET", "VEILSHELL_SESSION_DIR"):
             self.env.pop(key, None)
@@ -165,9 +168,24 @@ class SessionTests(unittest.TestCase):
                 if process.poll() is None:
                     process.kill()
 
-    def test_lock_requests_do_not_spawn_a_second_locker(self):
+    def publish_session(self):
         self.env["WAYLAND_DISPLAY"] = "isolated"
-        self.env["VEILSHELL_SESSION_DIR"] = str(self.runtime)
+        self.env["HYPRLAND_INSTANCE_SIGNATURE"] = "private"
+        session_dir = self.runtime / "veilshell.private"
+        session_dir.mkdir()
+        self.env["VEILSHELL_SESSION_DIR"] = str(session_dir)
+        (session_dir / "display").write_text("isolated\nprivate\n")
+
+    def test_power_helpers_refuse_another_compositor(self):
+        self.publish_session()
+        self.env["HYPRLAND_INSTANCE_SIGNATURE"] = "omarchy"
+        result = self.run_launcher("--power", "suspend")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("display does not match", result.stderr)
+        self.assertFalse(self.log.exists())
+
+    def test_lock_requests_do_not_spawn_a_second_locker(self):
+        self.publish_session()
         with subprocess.Popen([COMMAND, "--lock"], env=self.env) as locker:
             try:
                 self.wait_for("hyprlock started")
@@ -177,8 +195,7 @@ class SessionTests(unittest.TestCase):
                 locker.terminate()
 
     def test_suspend_requires_compositor_lock(self):
-        self.env["WAYLAND_DISPLAY"] = "isolated"
-        self.env["VEILSHELL_SESSION_DIR"] = str(self.runtime)
+        self.publish_session()
         self.env["TEST_POWER"] = "yes"
         result = self.run_launcher("--power", "suspend")
         self.assertNotEqual(result.returncode, 0)

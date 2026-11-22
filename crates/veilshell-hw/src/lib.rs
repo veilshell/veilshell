@@ -49,6 +49,7 @@ pub struct HardwareSnapshot {
     pub volume_available: bool,
     pub muted: bool,
     pub night_light: bool,
+    pub night_light_available: bool,
     pub keyboard_attached: bool,
     pub orientation: Orientation,
 }
@@ -71,6 +72,7 @@ impl Default for HardwareSnapshot {
             volume_available: true,
             muted: false,
             night_light: false,
+            night_light_available: true,
             keyboard_attached: true,
             orientation: Orientation::Normal,
         }

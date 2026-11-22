@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use veilshell_compositor::{CompositorBackend, HyprlandBackend, MockBackend};
-use veilshell_core::{ModePolicy, Orientation};
+use veilshell_core::Orientation;
 use veilshell_hw::{detect_dmi_device, HardwareBackend, LinuxHardware};
 use veilshell_render::{
     ActiveRenderer, RendererBackend, RendererPreference, SceneContext, SceneKind, SnapshotSpec,
@@ -14,8 +14,9 @@ use veilshell_render::{
 };
 use veilshell_shell::apps::{apps_to_tiles, current_clock_hhmm, discover_desktop_apps};
 use veilshell_shell::ipc::{default_socket_path, send_daemon_command};
+use veilshell_shell::session::ShellSession;
 use veilshell_shell::ShellState;
-use veilshell_theme::{format_hex, load_best_available, OmarchyAetherProvider};
+use veilshell_theme::format_hex;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -205,7 +206,7 @@ fn cmd_hw() {
 }
 
 fn cmd_status() {
-    let palette = load_best_available();
+    let palette = ShellSession::current().palette();
     let hw = LinuxHardware::auto_detect();
     let profile_id = hw.profile().map(|p| p.id.clone());
     if let Some(hypr) = HyprlandBackend::from_env().filter(HyprlandBackend::is_available) {
@@ -242,10 +243,11 @@ fn cmd_status() {
 }
 
 fn cmd_theme() {
-    let palette = load_best_available();
+    let session = ShellSession::current();
+    let palette = session.palette();
     let contrast = palette.foreground.contrast_ratio(palette.background);
     println!("Active theme: {}", palette.name);
-    if let Some(path) = OmarchyAetherProvider::default_path() {
+    if let Some(path) = session.desktop_theme_path() {
         println!(
             "  source     : {} ({})",
             path.display(),
@@ -277,68 +279,28 @@ fn cmd_theme() {
 }
 
 fn cmd_mode(arg: Option<&str>) -> ExitCode {
-    let Some(mode_arg) = arg else {
+    let Some(mode_arg @ ("auto" | "laptop" | "tablet" | "toggle")) = arg else {
         eprintln!("usage: veilctl mode <auto|laptop|tablet|toggle>");
         return ExitCode::FAILURE;
     };
-    let policy_action = match mode_arg {
-        "auto" => Some(ModePolicy::Auto),
-        "laptop" => Some(ModePolicy::ForceLaptop),
-        "tablet" => Some(ModePolicy::ForceTablet),
-        "toggle" => None,
-        _ => {
-            eprintln!("usage: veilctl mode <auto|laptop|tablet|toggle>");
-            return ExitCode::FAILURE;
-        }
-    };
 
-    // Route through the running daemon first so UI surfaces show/hide in sync with compositor mode.
+    // Switching VeilShell's visibility must never fall back to changing the
+    // host compositor when there is no daemon.
     let sock = default_socket_path();
-    if let Ok(reply) = send_daemon_command(&sock, &format!("mode {mode_arg}")) {
-        print!("{reply}");
-        return if reply.starts_with("err") {
-            ExitCode::FAILURE
-        } else {
-            ExitCode::SUCCESS
-        };
-    }
-
-    let palette = load_best_available();
-    let hw = LinuxHardware::auto_detect();
-    if let Some(hypr) = HyprlandBackend::from_env().filter(HyprlandBackend::is_available) {
-        let mut state = ShellState::new(hypr, hw, palette);
-        let result = match policy_action {
-            Some(p) => state.set_policy(p),
-            None => state.toggle_mode(),
-        };
-        return match result {
-            Ok(mode) => {
-                println!(
-                    "Applied {:?} on live Hyprland (policy: {:?})",
-                    mode,
-                    state.policy()
-                );
+    match send_daemon_command(&sock, &format!("mode {mode_arg}")) {
+        Ok(reply) => {
+            print!("{reply}");
+            if reply.starts_with("err") || reply.trim().is_empty() {
+                ExitCode::FAILURE
+            } else {
                 ExitCode::SUCCESS
             }
-            Err(err) => {
-                eprintln!("failed to apply mode on Hyprland: {err}");
-                ExitCode::FAILURE
-            }
-        };
-    }
-
-    let mut state = ShellState::new(MockBackend::default(), hw, palette);
-    let result = match policy_action {
-        Some(p) => state.set_policy(p),
-        None => state.toggle_mode(),
-    };
-    match result {
-        Ok(mode) => {
-            println!("Mode set to {:?} (policy: {:?})", mode, state.policy());
-            ExitCode::SUCCESS
         }
         Err(err) => {
-            eprintln!("failed to switch mode: {err}");
+            eprintln!(
+                "could not contact the VeilShell daemon at {}: {err}",
+                sock.display()
+            );
             ExitCode::FAILURE
         }
     }
@@ -424,10 +386,11 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
         parse_flag(args, "--out").unwrap_or_else(|| format!("veilshell-{}.png", scene.as_str())),
     );
 
+    let session = ShellSession::current();
     let palette = if demo {
         veilshell_core::ThemePalette::default_dark()
     } else {
-        load_best_available()
+        session.palette()
     };
     let mut ctx = SceneContext::default();
     if let Some(raw) = parse_flag(args, "--progress") {
@@ -468,8 +431,9 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
         ctx.brightness_pct = snap.brightness_pct;
         ctx.volume_pct = snap.volume_pct;
         veilshell_shell::shade::apply_hardware(&mut ctx, &snap);
+        ctx.shade.auto_rotate_available = false;
         if scene == SceneKind::Shade {
-            veilshell_shell::shade::refresh_optional(&mut ctx);
+            veilshell_shell::shade::refresh_optional(&mut ctx, session);
         }
         ctx.home_apps = apps_to_tiles(&discover_desktop_apps());
     }
@@ -537,7 +501,7 @@ fn print_help() {
          \tstatus                            Show shell mode, theme, hardware, compositor, and daemon state\n\
          \thw                                Show live Linux hardware telemetry & matched device profile\n\
          \tshow <pill|home|recents|shade|osk> Switch the running daemon's active surface\n\
-         \tmode <auto|laptop|tablet|toggle>  Evaluate or apply the Laptop/Tablet mode policy\n\
+         \tmode <auto|laptop|tablet|toggle>  Change the running daemon's visibility policy\n\
          \twallpaper <PNG_PATH|clear>        Update or clear the GPU pre-blurred glass wallpaper\n\
          \treload-theme                      Reload colors.toml in the running daemon\n\
          \tquit                              Stop the running daemon cleanly\n\
