@@ -51,7 +51,7 @@ if name == "Hyprland":
     hypr.bind(str(ipc / ".socket.sock"))
     log("Hyprland started")
     subprocess.run(["veilshell-session", "--publish-display"], check=True)
-elif name in ("veilshell", "hypridle"):
+elif name in ("veilshell", "hypridle", "veilshell-autostart"):
     assert os.environ["WAYLAND_DISPLAY"] == "isolated"
     assert os.environ["HYPRLAND_INSTANCE_SIGNATURE"] == "fake-hyprland"
     assert Path(os.environ["VEILSHELL_SOCKET"]).parent == Path(os.environ["VEILSHELL_SESSION_DIR"])
@@ -61,8 +61,10 @@ elif name in ("veilshell", "hypridle"):
         if "TEST_SHELL_STATUS" in os.environ:
             time.sleep(0.2)
             sys.exit(int(os.environ["TEST_SHELL_STATUS"]))
-    elif os.getenv("TEST_IDLE_FAIL"):
+    elif name == "hypridle" and os.getenv("TEST_IDLE_FAIL"):
         sys.exit(1)
+    elif name == "veilshell-autostart" and "TEST_AUTOSTART_STATUS" in os.environ:
+        sys.exit(int(os.environ["TEST_AUTOSTART_STATUS"]))
 elif name == "hyprlock":
     assert "--grace" in sys.argv and sys.argv[sys.argv.index("--grace") + 1] == "0"
     log("hyprlock started")
@@ -92,6 +94,7 @@ class SessionTests(unittest.TestCase):
         self.runtime = self.root / "runtime"
         self.runtime.mkdir(mode=0o700)
         bindir = self.root / "bin"
+        self.bindir = bindir
         bindir.mkdir()
         mock = bindir / "mock"
         mock.write_text(MOCK)
@@ -164,6 +167,31 @@ class SessionTests(unittest.TestCase):
                 process.send_signal(signal.SIGTERM)
                 self.assertEqual(process.wait(timeout=6), 143)
                 self.assertIn("veilshell stopped", self.log.read_text())
+            finally:
+                if process.poll() is None:
+                    process.kill()
+
+    def test_optional_autostart_failure_does_not_end_session(self):
+        (self.bindir / "veilshell-autostart").symlink_to("mock")
+        self.env["TEST_AUTOSTART_STATUS"] = "7"
+        with subprocess.Popen([COMMAND], env=self.env) as process:
+            try:
+                self.wait_for("veilshell-autostart started")
+                self.assertIsNone(process.poll())
+                process.terminate()
+                self.assertEqual(process.wait(timeout=6), 143)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+
+    def test_optional_autostart_stops_on_logout(self):
+        (self.bindir / "veilshell-autostart").symlink_to("mock")
+        with subprocess.Popen([COMMAND], env=self.env) as process:
+            try:
+                self.wait_for("veilshell-autostart started")
+                process.terminate()
+                self.assertEqual(process.wait(timeout=6), 143)
+                self.assertIn("veilshell-autostart stopped", self.log.read_text())
             finally:
                 if process.poll() is None:
                     process.kill()

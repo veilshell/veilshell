@@ -173,6 +173,12 @@ veilshell --policy tablet --scene home &
 shell_pid=$!
 pids+=("$shell_pid")
 
+# Optional services share teardown, but their exit must not end the session.
+if command -v veilshell-autostart >/dev/null; then
+    veilshell-autostart &
+    pids+=("$!")
+fi
+
 status=0
 if ! kill -0 "$shell_pid" 2>/dev/null; then
     # wait -n only considers running jobs on older Bash versions.
@@ -181,7 +187,7 @@ if ! kill -0 "$shell_pid" 2>/dev/null; then
 elif ! kill -0 "$idle_pid" 2>/dev/null; then
     child=$idle_pid
 else
-    wait -n -p child "${pids[@]}" || status=$?
+    wait -n -p child "$hyprland_pid" "$idle_pid" "$shell_pid" || status=$?
 fi
 if [[ ${child:-} == "$idle_pid" ]]; then
     fail "hypridle exited; ending the preview session"

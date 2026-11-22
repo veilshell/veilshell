@@ -40,24 +40,11 @@ Install `adapters/session/veilshell-autostart` as an executable on `PATH`, e.g.
 PyGObject with the GLib typelib (`python-gobject` on Arch), and GNU `sleep`.
 No PyGObject import is needed if nothing is enabled.
 
-In the standalone launcher only, **after both compositor sockets are ready**
-and `WAYLAND_DISPLAY` and `HYPRLAND_INSTANCE_SIGNATURE` have been exported,
-start the helper if installed:
-
-```bash
-if command -v veilshell-autostart >/dev/null; then
-    veilshell-autostart &
-    pids+=("$!")
-fi
-```
-
-Use this PID for TERM and wait during the launcher's existing teardown, but
-**exclude it from the `wait -n` session-ending list**. The helper is optional
-and may exit normally without starting anything; compositor, shell, and
-required service PIDs should still be monitored independently. Allow it the
-existing 3-second teardown window; it sends TERM and then KILL to its own
-process group, outside the launcher's group. It locks the session directory
-without adding a file the launcher must remove. `--check` should not run it.
+The standalone launcher starts the helper if installed, after both compositor
+sockets are ready and their endpoints have been exported. Its PID is tracked
+for teardown but its exit does not end the session. The helper sends TERM and
+then KILL to its own process group, not the launcher's group. `--check` never
+starts it.
 
 Run `python3 scripts/test-session-autostart.py` to test real child launches and
 teardown using fake display sockets and temporary XDG directories. A real

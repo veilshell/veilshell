@@ -37,6 +37,18 @@ visual review use [the source-derived tokens](DENIAL_PARITY_SPEC.md), matched
 screenshots, and gesture captures together. Keep temporary images and logs
 out of Git unless curated and license-checked. Never capture credentials.
 
+### Initial Denial guest captures
+
+The signed Arch packages `denial 0.6.8-1` and
+`denial-flutter-engine 1:0.6.8-1` booted through SDDM in a separate Arch/KVM
+guest with Mesa software rendering and `DENIAL_SHELL_PROFILE=mobile`.
+Initial landscape captures (`1280×800`, scale 1) are grouped in
+`../veilshell-lab/denial-0.6.8-captures/` in the development lab. The stock
+Home shows a large date/clock widget integrated into the grid. A virtual
+touch swipe opens Quick Settings, with an empty notification panel on the
+left and controls on the right. The wallpaper and app catalog are still the
+guest defaults; these are reference captures, not matched VeilShell diffs.
+
 ## Verified VeilShell baseline
 
 At VeilShell `1bdd1df`, the Arch/KVM guest with Hyprland `0.57.2` ran SDDM
@@ -51,6 +63,11 @@ The isolated nested Hyprland harness separately exercised GPU and software
 rendering at 100%, 150%, and 200% in landscape and portrait. It does not
 replace SDDM or hardware tests. Touch unlock, portal/polkit/autostart
 isolation, notifications, and Wi-Fi/Bluetooth setup remain open.
+
+The [locker-local touch input component](TOUCH_LOCK.md) is not yet connected
+to Wayland or PAM. The launcher can use the
+[opt-in XDG autostart helper](../adapters/session/AUTOSTART.md) if installed
+and configured; this does not yet provide the rest of the desktop services.
 
 ## Integration gates
 
