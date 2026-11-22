@@ -32,6 +32,9 @@ target is **Surface Go 3 + Hyprland**, with Omarchy as an optional
 integration. Don't infer support for other distro, kernel, or compositor
 versions from that target.
 
+Follow the [overlay validation guide](OVERLAY_VALIDATION.md) for the first
+functional path, from source install to a recorded reference-tablet run.
+
 - [ ] Verify touch navigation, app launch, Recents focus and close, Quick
   Settings, and in-app text entry in portrait and landscape on the reference
   tablet.
@@ -142,7 +145,8 @@ Mode, which simply hides VeilShell.
 
 ### Portability follow-up
 
-- [ ] Replace the live mock fallback with an explicit unavailable backend and expose capability-based fallbacks in the UI.
+- [x] Reject live startup without a working Hyprland backend instead of falling back to mock data.
+- [ ] Expose capability-based fallbacks in the UI.
 - [ ] Add a read-only `veilctl doctor` to report protocol, compositor, and service capabilities and why features are unavailable.
 - [ ] Verify the adapter contract with a second live compositor (e.g. Niri or Sway) before considering a stable external plugin API.
 - [ ] Arch Linux / AUR `PKGBUILD` (`packaging/arch/PKGBUILD`).

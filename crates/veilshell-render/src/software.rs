@@ -74,6 +74,7 @@ impl SdfSoftwareRenderer {
             height as f32,
             palette,
             self.context.top_drag_y,
+            self.context.top_pressed,
         );
         self.rasterize(width, height, &list)
     }

@@ -326,7 +326,7 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
     }
 
     let default_h = if scene == SceneKind::Pill {
-        28_u32
+        veilshell_wayland::EDGE_HANDLE_DEPTH
     } else if scene == SceneKind::Osk {
         284_u32
     } else {

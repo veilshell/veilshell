@@ -64,6 +64,7 @@ pub(crate) enum DragMotion {
         travel: f32,
         sign: f32,
         opening: bool,
+        edge_open: bool,
     },
     HomePage {
         from: f32,
@@ -78,6 +79,17 @@ impl DragMotion {
             travel: travel.max(1.0),
             sign,
             opening,
+            edge_open: false,
+        }
+    }
+
+    pub(crate) fn edge_reveal(travel: f32, sign: f32) -> Self {
+        Self::Reveal {
+            from: 0.0,
+            travel: travel.max(1.0),
+            sign,
+            opening: true,
+            edge_open: true,
         }
     }
 
@@ -103,16 +115,21 @@ impl DragMotion {
                 travel,
                 sign,
                 opening,
+                edge_open,
                 ..
             } => {
                 let speed = (vy * sign / travel).clamp(-6.0, 6.0);
-                let projected = value + (speed * 0.10).clamp(-0.40, 0.40);
-                let threshold = if opening { 0.36 } else { 0.64 };
-                (
-                    f32::from(u8::from(projected >= threshold)),
-                    speed,
-                    SpringParams::snappy(),
-                )
+                let commit = if edge_open {
+                    let distance = value * travel;
+                    // A short pull can commit without speed; even a fast flick
+                    // needs real travel. An inward reversal cancels a short pull.
+                    let fling = (vy * sign * 0.075).clamp(-48.0, 48.0);
+                    distance >= 22.0 && distance + fling >= 64.0
+                } else {
+                    let projected = value + (speed * 0.10).clamp(-0.40, 0.40);
+                    projected >= if opening { 0.36 } else { 0.64 }
+                };
+                (f32::from(u8::from(commit)), speed, SpringParams::snappy())
             }
             Self::HomePage { from, width } => {
                 let origin = from.round().clamp(0.0, pages.saturating_sub(1) as f32);
@@ -158,6 +175,11 @@ fn spring_to(value: f32, target: f32, velocity: f32, params: SpringParams) -> Sp
 /// Lock the axis only after deliberate travel, not on tap jitter.
 pub(crate) fn vertical(dx: f32, dy: f32) -> bool {
     dy.abs() >= 10.0 && dy.abs() > dx.abs() * 1.18
+}
+
+/// Pick up edge pulls earlier without changing in-panel scrolling or dismissal.
+pub(crate) fn edge_vertical(dx: f32, dy: f32) -> bool {
+    dy.abs() >= 6.0 && dy.abs() > dx.abs() * 1.18
 }
 
 pub(crate) fn horizontal(dx: f32, dy: f32) -> bool {
@@ -212,6 +234,22 @@ mod tests {
         let close = DragMotion::reveal(1.0, 240.0, 1.0, false);
         assert_eq!(close.position(0.0, -120.0, 1), 0.5);
         assert_eq!(close.cancel(0.5, 1).target, 1.0);
+    }
+
+    #[test]
+    fn edge_opening_needs_direction_and_travel_not_just_a_flick() {
+        assert!(!edge_vertical(0.0, 5.0));
+        assert!(!edge_vertical(9.0, 8.0));
+        assert!(edge_vertical(3.0, 6.0));
+        for (sign, travel) in [(-1.0, 360.0), (1.0, 380.0)] {
+            let pull = DragMotion::edge_reveal(travel, sign);
+            let settle = |d, v| pull.release(pull.position(0.0, sign * d, 1), (0.0, sign * v), 1);
+            assert_eq!(settle(70.0, 0.0).target, 1.0);
+            assert_eq!(settle(30.0, 700.0).target, 1.0);
+            assert_eq!(settle(12.0, 1000.0).target, 0.0);
+            assert_eq!(settle(30.0, 0.0).target, 0.0);
+            assert_eq!(settle(70.0, -500.0).target, 0.0);
+        }
     }
 
     #[test]

@@ -57,6 +57,10 @@ pub struct SceneContext {
     pub pill_drag_y: f32,
     /// Downward drag indicator in logical pixels for the top shade handle.
     pub top_drag_y: f32,
+    /// Contact feedback before the bottom pill starts moving.
+    pub pill_pressed: bool,
+    /// Contact feedback before the top handle starts moving.
+    pub top_pressed: bool,
     /// Spring progress `0.0..=1.0` for overlay enter/exit transitions.
     pub overlay_progress: f32,
     /// Discovered/pinned applications displayed across pages of `Home`.
@@ -92,6 +96,8 @@ impl Default for SceneContext {
             pill_drag_x: 0.0,
             pill_drag_y: 0.0,
             top_drag_y: 0.0,
+            pill_pressed: false,
+            top_pressed: false,
             overlay_progress: 1.0,
             home_apps: default_demo_apps(),
             home_page: 0,
@@ -300,23 +306,45 @@ pub fn build_scene(
     build_scene_layout(scene, width, height, palette, ctx).draw_list
 }
 
-/// Build the subtle top-center pull handle strip for opening Quick Settings in Tablet Mode.
+/// Resting visual bounds of the top pull handle, in surface-local logical coordinates.
+#[must_use]
+pub fn top_handle_bounds(width: f32, height: f32) -> HitRect {
+    let w = 104.0_f32.min(width * 0.8);
+    HitRect::new((width - w) * 0.5, (height * 0.5 - 3.5).min(8.5), w, 7.0)
+}
+
+/// Resting visual bounds of the bottom pill, in surface-local logical coordinates.
+#[must_use]
+pub fn bottom_pill_bounds(width: f32, height: f32) -> HitRect {
+    let w = 180.0_f32.min(width * 0.8);
+    HitRect::new((width - w) * 0.5, height - 16.0, w, 8.0)
+}
+
+/// Build the top-center pull handle strip for opening Quick Settings in Tablet Mode.
 #[must_use]
 pub fn build_top_strip_scene(
     width: f32,
     height: f32,
     palette: &ThemePalette,
     drag_y: f32,
+    pressed: bool,
 ) -> DrawList {
     let mut list = DrawList::default();
-    let handle_w = (width * 0.34).clamp(56.0, 92.0);
-    let handle_h = 4.5_f32;
+    let bounds = top_handle_bounds(width, height);
+    let active = pressed || drag_y > 2.0;
+    let handle_w = if active {
+        (bounds.w * 1.08).min(width)
+    } else {
+        bounds.w
+    };
+    let handle_h = if active { 10.0_f32 } else { bounds.h }.min(height);
     let hx = (width - handle_w) * 0.5;
-    let hy = ((height - handle_h) * 0.5 + drag_y.clamp(0.0, 6.0)).clamp(2.0, height - handle_h);
-    let fill = if drag_y > 2.0 {
+    let hy = (bounds.y + (bounds.h - handle_h) * 0.5 + drag_y.clamp(0.0, 16.0))
+        .clamp(0.0, (height - handle_h).max(0.0));
+    let fill = if active {
         palette.accent.with_alpha(0.92)
     } else {
-        palette.foreground.with_alpha(0.45)
+        palette.foreground.with_alpha(0.65)
     };
     list.push_rect(
         RoundedRect::filled(hx, hy, handle_w, handle_h, handle_h * 0.5, fill).with_glass_border(
@@ -345,11 +373,16 @@ pub(crate) fn push_bottom_pill_bar(
     palette: &ThemePalette,
     ctx: &SceneContext,
 ) {
-    let pill_w = 180.0_f32.min(width * 0.8);
-    let pill_h = 5.0_f32;
+    let bounds = bottom_pill_bounds(width, height);
+    let active = ctx.pill_pressed || ctx.pill_drag_x.abs() > 2.0 || ctx.pill_drag_y.abs() > 2.0;
+    let pill_w = if active {
+        (bounds.w * 1.08).min(width)
+    } else {
+        bounds.w
+    };
+    let pill_h = if active { 11.0 } else { bounds.h };
     let cx = width * 0.5 + ctx.pill_drag_x.clamp(-60.0, 60.0);
-    let cy = (height - 12.0 + ctx.pill_drag_y.clamp(-14.0, 4.0)).max(6.0);
-    let active = ctx.pill_drag_x.abs() > 2.0 || ctx.pill_drag_y.abs() > 2.0;
+    let cy = (bounds.y + bounds.h * 0.5 + ctx.pill_drag_y.clamp(-16.0, 4.0)).max(6.0);
 
     let fill = if active {
         palette.accent.with_alpha(0.95)

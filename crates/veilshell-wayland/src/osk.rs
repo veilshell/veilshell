@@ -68,15 +68,21 @@ impl Dispatch2<ZwpInputMethodV2, LayerApp> for InputMethodData {
     fn event(
         &self,
         state: &mut LayerApp,
-        _proxy: &ZwpInputMethodV2,
+        proxy: &ZwpInputMethodV2,
         event: zwp_input_method_v2::Event,
         _conn: &Connection,
         _qh: &QueueHandle<LayerApp>,
     ) {
+        // Queued events from a released object must not change a newer binding.
+        if state.osk.input_method.as_ref() != Some(proxy) {
+            return;
+        }
         match event {
             zwp_input_method_v2::Event::Activate => {
                 state.cancel_osk_drag();
-                state.osk.pending_layout = None;
+                // Activation resets the content purpose, even when no
+                // ContentType event follows.
+                state.osk.pending_layout = Some((OskLayer::Letters, false));
                 state.osk.im_pending_active = true;
             }
             zwp_input_method_v2::Event::Deactivate => {
@@ -133,11 +139,11 @@ impl Dispatch2<ZwpInputMethodV2, LayerApp> for InputMethodData {
                 }
             }
             zwp_input_method_v2::Event::Unavailable => {
-                state.cancel_osk_drag();
-                state.osk.input_method = None;
-                state.osk.im_pending_active = false;
-                state.osk.im_active = false;
-                state.osk.auto_opened = false;
+                let auto_opened = state.osk.auto_opened;
+                // Another IME can own this seat. Leave the virtual keyboard
+                // fallback available for manual OSK use, without retrying here.
+                state.osk.release_input_method();
+                state.on_osk_input_lost(auto_opened);
             }
             _ => {}
         }
@@ -187,11 +193,11 @@ pub(crate) struct OskWaylandState {
     im_manager: Option<ZwpInputMethodManagerV2>,
     vk_manager: Option<ZwpVirtualKeyboardManagerV1>,
     seat: Option<WlSeat>,
-    pub(crate) input_method: Option<ZwpInputMethodV2>,
-    pub(crate) virtual_keyboard: Option<ZwpVirtualKeyboardV1>,
-    pub(crate) im_pending_active: bool,
-    pub(crate) im_active: bool,
-    pub(crate) im_serial: u32,
+    input_method: Option<ZwpInputMethodV2>,
+    virtual_keyboard: Option<ZwpVirtualKeyboardV1>,
+    im_pending_active: bool,
+    im_active: bool,
+    im_serial: u32,
     pub(crate) auto_opened: bool,
     pending_layout: Option<(OskLayer, bool)>,
     key_seq: u32,
@@ -221,17 +227,25 @@ impl OskWaylandState {
         }
     }
 
-    /// Attach the input-method listener on the first available `wl_seat` (virtual keyboard
-    /// is created lazily on the first OSK keystroke so startup never disturbs compositor keymaps).
+    /// Claim the first seat while visible. The virtual keyboard stays lazy so
+    /// merely showing the shell does not install a new keymap.
     pub(crate) fn attach_seat(&mut self, seat: &WlSeat, qh: &QueueHandle<LayerApp>) {
-        if self.seat.is_none() {
-            self.seat = Some(seat.clone());
+        // Keep the same seat for IM and VK, even if the compositor denied IM ownership.
+        if self.seat.is_some() {
+            return;
         }
-        if self.input_method.is_none() {
-            if let Some(mgr) = &self.im_manager {
-                self.input_method = Some(mgr.get_input_method(seat, qh, InputMethodData));
-            }
+        self.seat = Some(seat.clone());
+        if let Some(mgr) = &self.im_manager {
+            self.input_method = Some(mgr.get_input_method(seat, qh, InputMethodData));
         }
+    }
+
+    pub(crate) fn detach_seat(&mut self, seat: &WlSeat) -> bool {
+        if self.seat.as_ref() != Some(seat) {
+            return false;
+        }
+        self.destroy();
+        true
     }
 
     fn ensure_virtual_keyboard(&mut self, qh: &QueueHandle<LayerApp>) {
@@ -280,15 +294,22 @@ impl OskWaylandState {
 
     /// Release compositor-bound IME and virtual keyboard objects cleanly.
     pub(crate) fn destroy(&mut self) {
-        if let Some(im) = self.input_method.take() {
-            im.destroy();
-        }
+        self.release_input_method();
         if let Some(vk) = self.virtual_keyboard.take() {
             vk.destroy();
         }
+        self.seat = None;
+    }
+
+    fn release_input_method(&mut self) {
+        if let Some(im) = self.input_method.take() {
+            im.destroy();
+        }
         self.im_active = false;
         self.im_pending_active = false;
+        self.im_serial = 0;
         self.auto_opened = false;
+        self.pending_layout = None;
     }
 
     fn send_vk_stroke(&mut self, evdev_code: u32, shift: bool, ctrl: bool) {

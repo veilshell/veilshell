@@ -27,8 +27,8 @@ pub use primitives::{
 };
 pub use recents::{recents_preview_pixels, recents_stride};
 pub use scene::{
-    build_scene, build_scene_layout, build_top_strip_scene, default_demo_apps, home_page_count,
-    home_reveal_travel, AppTile, RecentsCard, SceneContext,
+    bottom_pill_bounds, build_scene, build_scene_layout, build_top_strip_scene, default_demo_apps,
+    home_page_count, home_reveal_travel, top_handle_bounds, AppTile, RecentsCard, SceneContext,
 };
 pub use shade::{shade_reveal_travel, ShadeStatus};
 pub use software::SdfSoftwareRenderer;
@@ -552,6 +552,26 @@ mod tests {
             renderer.render_snapshot(&spec, &ThemePalette::default_dark()),
             Err(RenderError::InvalidViewport)
         ));
+    }
+
+    #[test]
+    fn both_handles_grow_on_contact_without_any_drag() {
+        fn rect(list: &DrawList) -> RoundedRect {
+            match list.commands.as_slice() {
+                [DrawCommand::Rect(rect)] => *rect,
+                _ => panic!("expected one handle"),
+            }
+        }
+
+        let palette = ThemePalette::default_dark();
+        let mut ctx = SceneContext::default();
+        let bottom = rect(&build_scene(SceneKind::Pill, 960.0, 48.0, &palette, &ctx));
+        ctx.pill_pressed = true;
+        let pressed = rect(&build_scene(SceneKind::Pill, 960.0, 48.0, &palette, &ctx));
+        assert!(pressed.w > bottom.w && pressed.h > bottom.h);
+        let top = rect(&build_top_strip_scene(220.0, 48.0, &palette, 0.0, false));
+        let pressed = rect(&build_top_strip_scene(220.0, 48.0, &palette, 0.0, true));
+        assert!(pressed.w > top.w && pressed.h > top.h);
     }
 
     #[test]

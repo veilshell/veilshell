@@ -4,7 +4,9 @@ use std::fmt;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, FrameCallbackData};
+use smithay_client_toolkit::compositor::{
+    CompositorHandler, CompositorState, FrameCallbackData, Region,
+};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::reexports::calloop::channel::{self, Channel, Event as ChannelEvent};
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
@@ -34,15 +36,17 @@ use veilshell_core::{
 };
 use veilshell_render::power::{PowerAction, PowerInput, PowerMenu};
 use veilshell_render::{
-    build_scene, build_scene_layout, build_top_strip_scene, home_page_count, home_reveal_travel,
-    recents_stride, shade_reveal_travel, ActiveRenderer, DrawList, HitTarget, SceneContext,
-    SceneKind, SceneOutput, WallpaperImage,
+    bottom_pill_bounds, build_scene, build_scene_layout, build_top_strip_scene, home_page_count,
+    home_reveal_travel, recents_stride, shade_reveal_travel, top_handle_bounds, ActiveRenderer,
+    DrawList, HitRect, HitTarget, SceneContext, SceneKind, SceneOutput, WallpaperImage,
 };
 
 use crate::capture::ToplevelCaptureState;
 #[cfg(feature = "wgpu")]
 use crate::gpu::{gpu_attempt, init_renderer, WgpuWaylandSurface};
-use crate::motion::{horizontal, slider_pct_for_y, vertical, DragMotion, DragVelocity, SliderDrag};
+use crate::motion::{
+    edge_vertical, horizontal, slider_pct_for_y, vertical, DragMotion, DragVelocity, SliderDrag,
+};
 use crate::osk::{OskRepeat, OskWaylandState};
 use crate::scale::{FractionalScaleGlobals, SurfaceFrame, SurfaceScaling};
 use crate::{LayerRole, LayerSurfaceSpec, WaylandRuntimeConfig};
@@ -179,6 +183,8 @@ struct ActiveDrag {
     start_y: f32,
     last_x: f32,
     last_y: f32,
+    max_travel: f32,
+    handle_tap_allowed: bool,
     overlay_tap_allowed: bool,
     recent_card: Option<String>,
     active_slider: Option<SliderDrag>,
@@ -186,6 +192,91 @@ struct ActiveDrag {
     motion: Option<DragMotion>,
     velocity: DragVelocity,
     start_time: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RegionRect(i32, i32, i32, i32);
+
+#[derive(Clone, Copy)]
+enum EdgeHandle {
+    Bottom,
+    Top,
+}
+
+impl EdgeHandle {
+    fn bounds(self, width: f32, height: f32) -> HitRect {
+        match self {
+            Self::Bottom => bottom_pill_bounds(width, height),
+            Self::Top => top_handle_bounds(width, height),
+        }
+    }
+
+    fn input_rect(self, (width, height): (u32, u32)) -> Option<RegionRect> {
+        // Stable surface-local target; the animated handle does not move the input zone.
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let w = width as f32;
+        let bounds = self.bounds(w, height as f32);
+        let x0 = (bounds.x - 24.0).max(w * 0.04).floor() as i32;
+        let x1 = (bounds.x + bounds.w + 24.0).min(w * 0.96).ceil() as i32;
+        Some(RegionRect(x0, 0, x1 - x0, i32::try_from(height).ok()?))
+    }
+
+    fn allows_tap(self, width: u32, height: u32, x: f32, y: f32) -> bool {
+        let b = self.bounds(width as f32, height as f32);
+        // Allow a little finger jitter at the mark, but not in the swipe padding.
+        HitRect::new(b.x - 4.0, b.y - 4.0, b.w + 8.0, b.h + 8.0).contains(x, y)
+    }
+}
+
+fn handle_tap(allowed: bool, max_travel: f32) -> bool {
+    allowed && max_travel < 8.0
+}
+
+struct HandleInputRegion {
+    handle: EdgeHandle,
+    region: Region,
+    rect: Option<RegionRect>,
+}
+
+impl HandleInputRegion {
+    fn new(
+        handle: EdgeHandle,
+        compositor: &CompositorState,
+        surface: &wl_surface::WlSurface,
+    ) -> Self {
+        let region = Region::new(compositor).expect("compositor is already bound");
+        // An empty region protects the transparent layer until its first draw.
+        surface.set_input_region(Some(region.wl_region()));
+        Self {
+            handle,
+            region,
+            rect: None,
+        }
+    }
+
+    fn update(&mut self, surface: &wl_surface::WlSurface, size: (u32, u32)) {
+        let rect = self.handle.input_rect(size);
+        if rect == self.rect {
+            return;
+        }
+        if let Some(RegionRect(x, y, w, h)) = self.rect {
+            self.region.subtract(x, y, w, h);
+        }
+        if let Some(RegionRect(x, y, w, h)) = rect {
+            self.region.add(x, y, w, h);
+        }
+        // This gates new contacts only; an implicit grab can leave the region.
+        surface.set_input_region(Some(self.region.wl_region()));
+        self.rect = rect;
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PanelInput {
+    Normal,
+    Preview,
 }
 
 struct ManagedSurface {
@@ -196,6 +287,8 @@ struct ManagedSurface {
     // The fractional-scale and viewport objects belong to this wl_surface.
     scaling: SurfaceScaling,
     layer: LayerSurface,
+    handle_input: Option<HandleInputRegion>,
+    panel_input: PanelInput,
     pool: Option<SlotPool>,
     #[cfg(feature = "wgpu")]
     retry_at: Option<Instant>,
@@ -251,7 +344,14 @@ impl ManagedSurface {
 
         layer.set_anchor(anchor);
         layer.set_exclusive_zone(spec.exclusive_zone);
-        layer.set_keyboard_interactivity(if spec.keyboard_interactivity {
+        // While the finger pulls from a handle, the preview must not compete
+        // for focus with that handle or become a clickable panel.
+        let edge_preview = matches!(role, LayerRole::HomeGrid | LayerRole::QuickSettings)
+            && app
+                .drag
+                .as_ref()
+                .is_some_and(|drag| drag.surface != SurfaceKind::Overlay && drag.motion.is_some());
+        layer.set_keyboard_interactivity(if spec.keyboard_interactivity && !edge_preview {
             KeyboardInteractivity::OnDemand
         } else {
             KeyboardInteractivity::None
@@ -274,6 +374,16 @@ impl ManagedSurface {
             layer.wl_surface(),
             initial_factor,
         );
+        let handle_input = match role {
+            LayerRole::BottomPill => Some(EdgeHandle::Bottom),
+            LayerRole::TopStrip => Some(EdgeHandle::Top),
+            _ => None,
+        }
+        .map(|handle| HandleInputRegion::new(handle, &app.compositor, layer.wl_surface()));
+        if edge_preview {
+            let empty = Region::new(&app.compositor).expect("compositor is already bound");
+            layer.wl_surface().set_input_region(Some(empty.wl_region()));
+        }
         layer.commit();
 
         Self {
@@ -281,6 +391,12 @@ impl ManagedSurface {
             gpu_surface: None,
             scaling,
             layer,
+            handle_input,
+            panel_input: if edge_preview {
+                PanelInput::Preview
+            } else {
+                PanelInput::Normal
+            },
             pool: None,
             #[cfg(feature = "wgpu")]
             retry_at: None,
@@ -337,10 +453,15 @@ impl ManagedSurface {
                 )?),
             };
             let scaling = &mut self.scaling;
+            let handle_input = &mut self.handle_input;
+            let size = (self.width, self.height);
             let callback_queued = &mut self.callback_queued;
             let presented = gpu_attempt("Wayland GPU presentation panicked", || {
                 gpu_surface.present_draw_list(gpu_renderer, frame.target, list, || {
                     scaling.apply(surface, frame);
+                    if let Some(input) = handle_input {
+                        input.update(surface, size);
+                    }
                     if request_frame_callback {
                         *callback_queued =
                             Some(surface.frame(qh, FrameCallbackData(surface.clone())));
@@ -416,6 +537,9 @@ impl ManagedSurface {
             return false;
         }
         self.scaling.apply(surface, frame);
+        if let Some(input) = &mut self.handle_input {
+            input.update(surface, (self.width, self.height));
+        }
         if surface.version() >= 4 {
             surface.damage_buffer(0, 0, width, height);
         } else {
@@ -493,6 +617,7 @@ pub(crate) struct LayerApp {
 
 impl LayerApp {
     fn sync_surfaces(&mut self) {
+        self.sync_osk_visibility();
         if !self.visible {
             self.overlay = None;
             self.overlay_layout = None;
@@ -531,10 +656,12 @@ impl LayerApp {
 
     pub(crate) fn show_scene(&mut self, scene: SceneKind, animate: bool) {
         self.drag = None;
+        self.reset_handle_motion();
         if animate && scene == SceneKind::Pill && self.has_gesture_overlay() {
             self.overlay_spring.set_target(0.0);
             self.overlay_spring.velocity = 0.0;
             self.last_anim_tick = Instant::now();
+            self.draw_pill();
             self.update_overlay_after_motion();
             return;
         }
@@ -549,6 +676,9 @@ impl LayerApp {
     fn show_scene_at(&mut self, scene: SceneKind, spring: Spring, refresh: bool) {
         if scene != self.active_scene {
             self.cancel_osk_drag();
+            if self.active_scene == SceneKind::Osk {
+                self.osk.auto_opened = false;
+            }
             if self.active_scene == SceneKind::Recents {
                 self.capture.invalidate();
             }
@@ -608,6 +738,7 @@ impl LayerApp {
                 self.capture.invalidate();
             }
             self.drag = None;
+            self.reset_handle_motion();
             self.home_spring = None;
             self.renderer.context_mut().recents_throw = None;
             self.refresh_after_open = false;
@@ -620,6 +751,23 @@ impl LayerApp {
         }
     }
 
+    fn sync_osk_visibility(&mut self) {
+        if self.visible {
+            if let Some(seat) = self.seat_state.seats().next() {
+                self.osk.attach_seat(&seat, &self.qh);
+            }
+        } else {
+            self.osk.destroy();
+        }
+    }
+
+    pub(crate) fn on_osk_input_lost(&mut self, auto_opened: bool) {
+        self.cancel_osk_drag();
+        if auto_opened && self.visible && self.active_scene == SceneKind::Osk {
+            self.show_scene(SceneKind::Pill, false);
+        }
+    }
+
     fn draw_pill(&mut self) {
         let Some(surf) = &mut self.pill else {
             return;
@@ -627,6 +775,10 @@ impl LayerApp {
         if !surf.configured || surf.width == 0 || surf.height == 0 {
             return;
         }
+        self.renderer.context_mut().pill_pressed = self
+            .drag
+            .as_ref()
+            .is_some_and(|drag| drag.surface == SurfaceKind::Pill);
         let list = build_scene(
             SceneKind::Pill,
             surf.width as f32,
@@ -644,16 +796,26 @@ impl LayerApp {
         if !surf.configured || surf.width == 0 || surf.height == 0 {
             return;
         }
+        self.renderer.context_mut().top_pressed = self
+            .drag
+            .as_ref()
+            .is_some_and(|drag| drag.surface == SurfaceKind::TopStrip);
         let list = build_top_strip_scene(
             surf.width as f32,
             surf.height as f32,
             &self.palette,
             self.renderer.context().top_drag_y,
+            self.renderer.context().top_pressed,
         );
         self.present_surface(SurfaceKind::TopStrip, &list, false);
     }
 
     pub(crate) fn draw_overlay(&mut self) {
+        let input_ready = self.overlay_input_ready()
+            && self
+                .drag
+                .as_ref()
+                .is_none_or(|drag| drag.surface == SurfaceKind::Overlay);
         let Some(surf) = &mut self.overlay else {
             return;
         };
@@ -663,6 +825,12 @@ impl LayerApp {
         if surf.frame_pending {
             surf.redraw_pending = true;
             return;
+        }
+        if input_ready && surf.panel_input == PanelInput::Preview {
+            surf.layer.wl_surface().set_input_region(None);
+            surf.layer
+                .set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+            surf.panel_input = PanelInput::Normal;
         }
         let (width, height) = (surf.width, surf.height);
         if self.active_scene == SceneKind::Recents {
@@ -942,6 +1110,13 @@ impl LayerApp {
     }
 
     fn begin_drag(&mut self, touch_id: Option<i32>, kind: SurfaceKind, x: f32, y: f32) {
+        let handle = match kind {
+            SurfaceKind::Pill => self.pill.as_ref().map(|s| (EdgeHandle::Bottom, s)),
+            SurfaceKind::TopStrip => self.top_strip.as_ref().map(|s| (EdgeHandle::Top, s)),
+            SurfaceKind::Overlay => None,
+        };
+        let handle_tap_allowed =
+            handle.is_some_and(|(handle, s)| handle.allows_tap(s.width, s.height, x, y));
         let overlay_tap_allowed = kind == SurfaceKind::Overlay && self.overlay_input_ready();
         let recent_card = if overlay_tap_allowed && self.active_scene == SceneKind::Recents {
             self.overlay_layout
@@ -994,6 +1169,8 @@ impl LayerApp {
             start_y: y,
             last_x: x,
             last_y: y,
+            max_travel: 0.0,
+            handle_tap_allowed,
             overlay_tap_allowed,
             recent_card,
             active_slider,
@@ -1002,6 +1179,9 @@ impl LayerApp {
             velocity: DragVelocity::new(now, x, y),
             start_time: now,
         });
+        if kind != SurfaceKind::Overlay {
+            self.draw_surface(kind);
+        }
     }
 
     fn overlay_size(&self) -> (f32, f32) {
@@ -1049,17 +1229,17 @@ impl LayerApp {
         dy: f32,
     ) -> Option<(DragMotion, Option<SceneKind>)> {
         let (w, h) = self.overlay_size();
-        if vertical(dx, dy) {
+        if edge_vertical(dx, dy) {
             match (surface, self.active_scene) {
                 (SurfaceKind::Pill, SceneKind::Pill) if dy < 0.0 => {
                     return Some((
-                        DragMotion::reveal(0.0, home_reveal_travel(h), -1.0, true),
+                        DragMotion::edge_reveal(home_reveal_travel(h), -1.0),
                         Some(SceneKind::Home),
                     ))
                 }
                 (SurfaceKind::TopStrip, SceneKind::Pill) if dy > 0.0 => {
                     return Some((
-                        DragMotion::reveal(0.0, shade_reveal_travel(h), 1.0, true),
+                        DragMotion::edge_reveal(shade_reveal_travel(h), 1.0),
                         Some(SceneKind::Shade),
                     ))
                 }
@@ -1209,13 +1389,19 @@ impl LayerApp {
         self.draw_overlay();
     }
 
-    fn abort_drag(&mut self) {
-        let motion = self.drag.take().and_then(|drag| drag.motion);
+    fn reset_handle_motion(&mut self) {
         let ctx = self.renderer.context_mut();
         ctx.pill_drag_x = 0.0;
         ctx.pill_drag_y = 0.0;
         ctx.top_drag_y = 0.0;
-        ctx.recents_throw = None;
+        ctx.pill_pressed = false;
+        ctx.top_pressed = false;
+    }
+
+    fn abort_drag(&mut self) {
+        let motion = self.drag.take().and_then(|drag| drag.motion);
+        self.reset_handle_motion();
+        self.renderer.context_mut().recents_throw = None;
         self.draw_pill();
         self.draw_top_strip();
         if let Some(motion) = motion {
@@ -1239,6 +1425,7 @@ impl LayerApp {
             repeat.position(x, y);
         }
         let (dx, dy) = (x - drag.start_x, y - drag.start_y);
+        drag.max_travel = drag.max_travel.max(dx.hypot(dy));
         if let Some(id) = drag.recent_card.as_ref().filter(|_| drag.motion.is_none()) {
             let ctx = self.renderer.context_mut();
             if ctx.recents_throw.is_some() || (dy < 0.0 && vertical(dx, dy)) {
@@ -1311,9 +1498,7 @@ impl LayerApp {
             return;
         }
 
-        self.renderer.context_mut().pill_drag_x = 0.0;
-        self.renderer.context_mut().pill_drag_y = 0.0;
-        self.renderer.context_mut().top_drag_y = 0.0;
+        self.reset_handle_motion();
         if let Some((id, offset)) = self.renderer.context_mut().recents_throw.take() {
             let (_, vy) = drag.velocity.at_release(Instant::now());
             if offset <= -96.0 || (offset <= -32.0 && vy <= -650.0) {
@@ -1325,6 +1510,9 @@ impl LayerApp {
             return;
         }
         if let Some(motion) = drag.motion {
+            if drag.surface != SurfaceKind::Overlay {
+                self.draw_surface(drag.surface);
+            }
             self.settle_interactive_drag(motion, Some(drag.velocity.at_release(Instant::now())));
             return;
         }
@@ -1338,7 +1526,16 @@ impl LayerApp {
 
         match drag.surface {
             SurfaceKind::Pill => {
-                if self.active_scene == SceneKind::Pill && vertical(dx, dy) {
+                if handle_tap(drag.handle_tap_allowed, drag.max_travel) {
+                    let scene = if self.active_scene == SceneKind::Pill {
+                        SceneKind::Home
+                    } else {
+                        SceneKind::Pill
+                    };
+                    self.show_scene(scene, true);
+                    return;
+                }
+                if self.active_scene == SceneKind::Pill && !horizontal(dx, dy) {
                     self.draw_pill();
                     return;
                 }
@@ -1369,22 +1566,11 @@ impl LayerApp {
                         );
                         self.draw_pill();
                     }
-                    _ => {
-                        if dist < 16.0 {
-                            let target = if self.active_scene == SceneKind::Pill {
-                                SceneKind::Home
-                            } else {
-                                SceneKind::Pill
-                            };
-                            self.show_scene(target, true);
-                        } else {
-                            self.draw_pill();
-                        }
-                    }
+                    _ => self.draw_pill(),
                 }
             }
             SurfaceKind::TopStrip => {
-                if dist < 10.0 {
+                if handle_tap(drag.handle_tap_allowed, drag.max_travel) {
                     self.show_scene(SceneKind::Shade, true);
                 } else {
                     self.draw_top_strip();
@@ -1724,10 +1910,6 @@ pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
         .roundtrip(&mut app)
         .map_err(|e| WaylandError::Runtime(e.to_string()))?;
 
-    if let Some(seat) = app.seat_state.seats().next() {
-        app.osk.attach_seat(&seat, &qh);
-    }
-
     let matched = app.output_state.outputs().find_map(|out| {
         let info = app.output_state.info(&out)?;
         if let Some(wanted) = &config.output_name {
@@ -2008,7 +2190,9 @@ impl SeatHandler for LayerApp {
     }
 
     fn new_seat(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
-        self.osk.attach_seat(&seat, qh);
+        if self.visible {
+            self.osk.attach_seat(&seat, qh);
+        }
     }
 
     fn new_capability(
@@ -2063,7 +2247,17 @@ impl SeatHandler for LayerApp {
         }
     }
 
-    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {
+    fn remove_seat(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        let auto_opened = self.osk.auto_opened;
+        if self.osk.detach_seat(&seat) {
+            self.on_osk_input_lost(auto_opened);
+            // SCTK removes the seat from its list after this callback.
+            if self.visible {
+                if let Some(next) = self.seat_state.seats().find(|next| next != &seat) {
+                    self.osk.attach_seat(&next, qh);
+                }
+            }
+        }
     }
 }
 
@@ -2195,7 +2389,39 @@ delegate_dispatch2!(LayerApp);
 
 #[cfg(test)]
 mod tests {
-    use super::shm_buffer_geometry;
+    use super::*;
+
+    #[test]
+    fn edge_targets_are_deeper_but_leave_the_sides_to_apps() {
+        assert_eq!(
+            EdgeHandle::Bottom.input_rect((1280, 48)),
+            Some(RegionRect(526, 0, 228, 48))
+        );
+        assert_eq!(
+            EdgeHandle::Bottom.input_rect((853, 48)),
+            Some(RegionRect(312, 0, 229, 48))
+        );
+        assert_eq!(
+            EdgeHandle::Bottom.input_rect((160, 48)),
+            Some(RegionRect(6, 0, 148, 48))
+        );
+        assert_eq!(
+            EdgeHandle::Top.input_rect((220, 48)),
+            Some(RegionRect(34, 0, 152, 48))
+        );
+        assert_eq!(EdgeHandle::Top.input_rect((220, 0)), None);
+    }
+
+    #[test]
+    fn tap_requires_the_mark_and_never_follows_a_reversed_drag() {
+        assert!(EdgeHandle::Bottom.allows_tap(960, 48, 480.0, 36.0));
+        assert!(!EdgeHandle::Bottom.allows_tap(960, 48, 480.0, 10.0));
+        assert!(EdgeHandle::Top.allows_tap(220, 48, 110.0, 12.0));
+        assert!(!EdgeHandle::Top.allows_tap(220, 48, 110.0, 36.0));
+        assert!(handle_tap(true, 3.0));
+        assert!(!handle_tap(true, 10.0));
+        assert!(!handle_tap(false, 0.0));
+    }
 
     #[test]
     fn shm_geometry_uses_physical_width_for_stride_and_both_axes_for_pool() {

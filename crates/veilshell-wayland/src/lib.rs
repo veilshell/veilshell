@@ -115,6 +115,9 @@ pub struct LayerSurfaceSpec {
     pub keyboard_interactivity: bool,
 }
 
+/// Logical depth of the top and bottom gesture zones.
+pub const EDGE_HANDLE_DEPTH: u32 = 48;
+
 impl LayerSurfaceSpec {
     /// Compute the default surface specification for a given [`LayerRole`] and logical viewport.
     #[must_use]
@@ -124,7 +127,7 @@ impl LayerSurfaceSpec {
                 role,
                 anchor: Anchor::bottom_bar(),
                 width: viewport_w,
-                height: 28,
+                height: EDGE_HANDLE_DEPTH,
                 exclusive_zone: 0,
                 keyboard_interactivity: false,
             },
@@ -132,7 +135,7 @@ impl LayerSurfaceSpec {
                 role,
                 anchor: Anchor::top_center(),
                 width: 220,
-                height: 16,
+                height: EDGE_HANDLE_DEPTH,
                 exclusive_zone: 0,
                 keyboard_interactivity: false,
             },
@@ -214,7 +217,7 @@ mod tests {
     fn bottom_pill_is_non_exclusive_bottom_bar() {
         let spec = LayerSurfaceSpec::for_role(LayerRole::BottomPill, 1280, 853);
         assert_eq!(spec.anchor, Anchor::bottom_bar());
-        assert_eq!(spec.height, 28);
+        assert_eq!(spec.height, 48);
         assert_eq!(spec.exclusive_zone, 0);
         assert!(!spec.keyboard_interactivity);
     }
@@ -224,7 +227,7 @@ mod tests {
         let spec = LayerSurfaceSpec::for_role(LayerRole::TopStrip, 1280, 853);
         assert_eq!(spec.anchor, Anchor::top_center());
         assert_eq!(spec.width, 220);
-        assert_eq!(spec.height, 16);
+        assert_eq!(spec.height, 48);
         assert_eq!(spec.exclusive_zone, 0);
         assert!(!spec.keyboard_interactivity);
     }

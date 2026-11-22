@@ -60,13 +60,16 @@ Requires Rust `1.86+`. From a terminal in your existing Hyprland session:
 
 ```bash
 # Show the gesture pill and top handle
-cargo run -p veilshell-shell --bin veilshell -- --policy tablet
+cargo run --release --locked -p veilshell-shell --bin veilshell -- --policy tablet
 ```
 
 On a device with a supported detachable keyboard, start with `--policy auto`
 instead to show the shell when the keyboard detaches and hide it on reattach.
 
-In a second terminal, use `cargo run -p veilshell-shell --bin veilctl -- status`
+The live daemon stops with a diagnostic if it cannot connect to Hyprland;
+`--dry-run` is for offline inspection only.
+
+In a second terminal, use `cargo run --release --locked -p veilshell-shell --bin veilctl -- status`
 to inspect the session. Replace `status` with any of the commands below, or
 run `veilctl` directly if it's on your `PATH`:
 
@@ -74,18 +77,23 @@ run `veilctl` directly if it's on your `PATH`:
 veilctl show home        # Open paged .desktop app launcher
 veilctl show recents     # Open the window deck (tap to focus, swipe up on a card to close)
 veilctl show shade       # Open Quick Settings shade
-veilctl show osk         # Open multi-layer Touch OSK (auto-opens on text focus in Tablet Mode)
+veilctl show osk         # Open the app keyboard manually
 veilctl show pill        # Dismiss overlays back to the bottom gesture pill
 veilctl mode toggle      # Toggle Laptop (hidden) <-> Tablet Mode
 veilctl reload-theme     # Hot-reload Aether colors.toml
 veilctl quit             # Stop the daemon cleanly
 ```
 
-In the on-screen keyboard, tap **TERM** for Escape, Tab and the arrow keys.
-Hold Backspace or an arrow to repeat.
+If VeilShell is running in the foreground, Ctrl+C also shuts it down cleanly.
 
-Swipe up from the bottom pill to pull Home into view, or swipe down from the
-top handle to pull in Quick Settings. Reverse a short pull to cancel. Swipe
+In the on-screen keyboard, tap **TERM** for Escape, Tab and the arrow keys.
+Hold Backspace or an arrow to repeat. In Tablet Mode, compatible text fields
+can open the keyboard automatically if no other input method owns the seat.
+
+Swipe up from near the bottom pill for Home, or down from near the top handle
+for Quick Settings. The handle brightens when grabbed and the panel follows
+your finger. Tap on the mark itself to open; the larger area around it is
+swipe-only. Pull back toward the edge before lifting to cancel. Swipe
 down on Home or up on Quick Settings to close. Swipe across Home to slide to
 another app page, or swipe up again from Home's bottom edge to open Recents.
 In Recents, swipe across to browse windows and swipe up on a card to close it.
@@ -103,6 +111,7 @@ requires a physical keyboard for password unlock.
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — Crate boundaries, `calloop` multi-surface runtime, and verification pyramid
 - [docs/ROADMAP.md](docs/ROADMAP.md) — `v0.1.0` overlay release gates, standalone goals, and development history
+- [docs/OVERLAY_VALIDATION.md](docs/OVERLAY_VALIDATION.md) — Overlay install and Surface Go 3 smoke-test checklist
 - [docs/DENIAL_COMPARISON.md](docs/DENIAL_COMPARISON.md) — Touch UX reference and feature inventory, not a release checklist
 - [docs/DENIAL_PARITY_SPEC.md](docs/DENIAL_PARITY_SPEC.md) — Pinned interaction and visual reference, and standalone acceptance gates
 - [docs/DENIAL_VALIDATION.md](docs/DENIAL_VALIDATION.md) — Test evidence and its limits

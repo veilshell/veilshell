@@ -24,7 +24,7 @@ fi
 
 mkdir -p "$OUT_DIR"
 echo "Building VeilShell..."
-cargo build --manifest-path "$REPO_ROOT/Cargo.toml" --bin veilshell --bin veilctl
+cargo build --locked --manifest-path "$REPO_ROOT/Cargo.toml" --bin veilshell --bin veilctl
 TARGET_DIR="$(cargo metadata --locked --no-deps --format-version 1 --manifest-path "$REPO_ROOT/Cargo.toml" | jq -er .target_directory)"
 BIN="$TARGET_DIR/debug"
 
@@ -126,6 +126,34 @@ configure_output() {
 }
 
 configure_output 960x640 1
+if env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u HYPRLAND_INSTANCE_SIGNATURE \
+    "$BIN/veilshell" --policy tablet >"$OUT_DIR/no-display.log" 2>&1; then
+    echo "Live overlay unexpectedly started outside Wayland." >&2
+    exit 1
+fi
+grep -Fq 'run inside an active Hyprland Wayland session' "$OUT_DIR/no-display.log"
+env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u HYPRLAND_INSTANCE_SIGNATURE \
+    "$BIN/veilshell" --dry-run --renderer software >"$OUT_DIR/dry-run.log" 2>&1
+grep -Fq ' (mock)' "$OUT_DIR/dry-run.log"
+
+if env -u HYPRLAND_INSTANCE_SIGNATURE "$BIN/veilshell" --no-watchers --policy tablet \
+    --exit-after-ms 100 >"$OUT_DIR/missing-backend.log" 2>&1; then
+    echo "Live overlay unexpectedly started without a Hyprland backend." >&2
+    exit 1
+fi
+grep -Fq 'Hyprland is required' "$OUT_DIR/missing-backend.log"
+[[ ! -e "$VEILSHELL_SOCKET" ]]
+
+mkdir "$XDG_RUNTIME_DIR/hypr/stale"
+touch "$XDG_RUNTIME_DIR/hypr/stale/.socket.sock"
+if HYPRLAND_INSTANCE_SIGNATURE=stale "$BIN/veilshell" --no-watchers --policy tablet \
+    --exit-after-ms 100 >"$OUT_DIR/stale-backend.log" 2>&1; then
+    echo "Live overlay unexpectedly started with unreachable Hyprland IPC." >&2
+    exit 1
+fi
+grep -Fq 'cannot query Hyprland' "$OUT_DIR/stale-backend.log"
+[[ ! -e "$VEILSHELL_SOCKET" ]]
+
 before="$(compositor_state)"
 if "$BIN/veilctl" mode tablet >"$OUT_DIR/mode-no-daemon.log" 2>&1; then
     echo "Mode command unexpectedly succeeded without a VeilShell daemon." >&2
@@ -137,20 +165,37 @@ TRACE="${VEILSHELL_TEST_WAYLAND_DEBUG:-0}"
 if [[ "$RENDERER" == software ]]; then
     TRACE=client
 fi
-WAYLAND_DEBUG="$TRACE" "$BIN/veilshell" --no-watchers --policy tablet \
-    --output "$OUTPUT" --renderer "$RENDERER" >"$OUT_DIR/veilshell.log" 2>&1 &
-DAEMON_PID=$!
-for _ in {1..50}; do
-    [[ -S "$VEILSHELL_SOCKET" ]] && break
-    kill -0 "$DAEMON_PID" 2>/dev/null || break
-    sleep 0.1
-done
-[[ -S "$VEILSHELL_SOCKET" ]] || { cat "$OUT_DIR/veilshell.log" >&2; exit 1; }
+start_daemon() {
+    local log="$1"
+    WAYLAND_DEBUG="$TRACE" "$BIN/veilshell" --no-watchers --policy laptop \
+        --output "$OUTPUT" --renderer "$RENDERER" >"$log" 2>&1 &
+    DAEMON_PID=$!
+    for _ in {1..50}; do
+        [[ -S "$VEILSHELL_SOCKET" ]] && return
+        kill -0 "$DAEMON_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    cat "$log" >&2
+    return 1
+}
+start_daemon "$OUT_DIR/veilshell.log"
 
 echo "Checking mode transitions don't change compositor settings..."
 before="$(compositor_state)"
+"$BIN/veilctl" status | grep -F 'visible: false'
+if [[ "$TRACE" == client ]] && grep -Fq '.get_input_method(' "$OUT_DIR/veilshell.log"; then
+    echo "Hidden overlay claimed the seat's input method." >&2
+    exit 1
+fi
+[[ $("$BIN/veilctl" mode tablet) == "Mode set to Tablet "* ]]
+"$BIN/veilctl" status | grep -F 'visible: true'
 [[ $("$BIN/veilctl" mode laptop) == "Mode set to Laptop "* ]]
 "$BIN/veilctl" status | grep -F 'visible: false'
+if [[ "$TRACE" == client ]] && grep -Fq '.get_input_method(' "$OUT_DIR/veilshell.log" &&
+    ! grep -Eq '\bzwp_input_method_v2[^ ]*\.destroy\(' "$OUT_DIR/veilshell.log"; then
+    echo "Hiding the overlay did not release its input method." >&2
+    exit 1
+fi
 [[ $("$BIN/veilctl" mode tablet) == "Mode set to Tablet "* ]]
 "$BIN/veilctl" status | grep -F 'visible: true'
 [[ $(compositor_state) == "$before" ]]
@@ -199,9 +244,25 @@ for orientation in landscape portrait; do
     done
 done
 
+echo "Checking Ctrl-C cleans up the socket and allows a restart..."
+kill -INT "$DAEMON_PID"
+for _ in {1..50}; do
+    kill -0 "$DAEMON_PID" 2>/dev/null || break
+    sleep 0.1
+done
+if kill -0 "$DAEMON_PID" 2>/dev/null; then
+    echo "VeilShell did not exit after SIGINT." >&2
+    exit 1
+fi
+wait "$DAEMON_PID"
+DAEMON_PID=""
+[[ ! -e "$VEILSHELL_SOCKET" ]]
+start_daemon "$OUT_DIR/veilshell-restart.log"
+"$BIN/veilctl" status | grep -F 'visible: false'
 "$BIN/veilctl" quit >/dev/null
 wait "$DAEMON_PID"
 DAEMON_PID=""
+[[ ! -e "$VEILSHELL_SOCKET" ]]
 if [[ "$RENDERER" == wgpu ]] && grep -E 'falling back|cannot present|using wl_shm' "$OUT_DIR/veilshell.log"; then
     echo "The requested wgpu swapchain fell back during testing." >&2
     exit 1

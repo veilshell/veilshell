@@ -9,10 +9,12 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime};
 
-use veilshell_compositor::{
-    CompositorBackend, CompositorError, HyprlandBackend, MockBackend, OutputInfo, WindowId,
-    WindowInfo,
+use signal_hook::{
+    consts::signal::{SIGINT, SIGTERM},
+    iterator::Signals,
 };
+
+use veilshell_compositor::{CompositorBackend, HyprlandBackend, MockBackend, WindowId};
 use veilshell_core::{
     ModeEvent, ModePolicy, ModeStateMachine, Orientation, RotationLock, ShellMode, ThemePalette,
 };
@@ -32,82 +34,8 @@ use veilshell_wayland::{
     run_shell_daemon, DaemonCommand, ShellAction, ShellActionHandler, WaylandRuntimeConfig,
 };
 
-enum ActiveCompositor {
-    Hyprland(HyprlandBackend),
-    Mock(MockBackend),
-}
-
-impl CompositorBackend for ActiveCompositor {
-    fn backend_name(&self) -> &'static str {
-        match self {
-            Self::Hyprland(b) => b.backend_name(),
-            Self::Mock(b) => b.backend_name(),
-        }
-    }
-
-    fn list_windows(&self) -> Result<Vec<WindowInfo>, CompositorError> {
-        match self {
-            Self::Hyprland(b) => b.list_windows(),
-            Self::Mock(b) => b.list_windows(),
-        }
-    }
-
-    fn focus_window(&mut self, id: &WindowId) -> Result<(), CompositorError> {
-        match self {
-            Self::Hyprland(b) => b.focus_window(id),
-            Self::Mock(b) => b.focus_window(id),
-        }
-    }
-
-    fn close_window(&mut self, id: &WindowId) -> Result<(), CompositorError> {
-        match self {
-            Self::Hyprland(b) => b.close_window(id),
-            Self::Mock(b) => b.close_window(id),
-        }
-    }
-
-    fn list_outputs(&self) -> Result<Vec<OutputInfo>, CompositorError> {
-        match self {
-            Self::Hyprland(b) => b.list_outputs(),
-            Self::Mock(b) => b.list_outputs(),
-        }
-    }
-
-    fn set_output_orientation(
-        &mut self,
-        output: &str,
-        orientation: Orientation,
-    ) -> Result<(), CompositorError> {
-        match self {
-            Self::Hyprland(b) => b.set_output_orientation(output, orientation),
-            Self::Mock(b) => b.set_output_orientation(output, orientation),
-        }
-    }
-
-    fn apply_shell_mode(&mut self, mode: ShellMode) -> Result<(), CompositorError> {
-        match self {
-            Self::Hyprland(b) => b.apply_shell_mode(mode),
-            Self::Mock(b) => b.apply_shell_mode(mode),
-        }
-    }
-
-    fn switch_workspace_relative(&mut self, delta: i32) -> Result<(), CompositorError> {
-        match self {
-            Self::Hyprland(b) => b.switch_workspace_relative(delta),
-            Self::Mock(b) => b.switch_workspace_relative(delta),
-        }
-    }
-
-    fn launch_command(&self, command: &str) -> Result<(), CompositorError> {
-        match self {
-            Self::Hyprland(b) => b.launch_command(command),
-            Self::Mock(b) => b.launch_command(command),
-        }
-    }
-}
-
-struct LiveActionHandler {
-    compositor: ActiveCompositor,
+struct LiveActionHandler<C> {
+    compositor: C,
     hw: LinuxHardware,
     session: ShellSession,
     mode_sm: ModeStateMachine,
@@ -117,7 +45,7 @@ struct LiveActionHandler {
     session_tx: Option<Sender<DaemonCommand>>,
 }
 
-impl LiveActionHandler {
+impl<C: CompositorBackend> LiveActionHandler<C> {
     fn apply_mode_layout(&mut self, mode: ShellMode) {
         if self.session.owns_compositor() {
             if let Err(err) = self.compositor.apply_shell_mode(mode) {
@@ -336,7 +264,7 @@ impl LiveActionHandler {
     }
 }
 
-impl ShellActionHandler for LiveActionHandler {
+impl<C: CompositorBackend> ShellActionHandler for LiveActionHandler<C> {
     fn on_action(&mut self, action: ShellAction, ctx: &mut SceneContext) {
         match action {
             ShellAction::RequestRefresh(scene) => self.refresh_context(scene, ctx),
@@ -466,6 +394,7 @@ fn spawn_hardware_watchers(
     cmd_tx: &Sender<DaemonCommand>,
     stop: Arc<AtomicBool>,
     hw: LinuxHardware,
+    initial_keyboard_attached: bool,
     session: ShellSession,
     watch_rotation: bool,
 ) -> (Option<SensorGuard>, Option<thread::JoinHandle<()>>) {
@@ -485,45 +414,43 @@ fn spawn_hardware_watchers(
     let handle = thread::Builder::new()
         .name("veilshell-watchers".into())
         .spawn(move || {
-            let mut last_kbd = hw.detect_keyboard_attached();
+            // Reconcile with the sample used by the mode state machine, not a new baseline.
+            let mut last_kbd = initial_keyboard_attached;
             let theme_path = session.desktop_theme_path();
             let mut last_theme_mtime = read_mtime(theme_path.as_ref());
             let mut last_bat = read_sysfs_battery().map(|(pct, _)| pct);
 
-            let mut ticks = 0_u8;
+            let mut ticks = 0;
             while !stop.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(250));
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                ticks = ticks.wrapping_add(1);
-                // Check every ~1.5s while waking every 250ms for instant clean shutdown.
-                if ticks % 6 != 0 {
-                    continue;
-                }
-
+                // Detect cover changes every wake; battery and theme can wait ~1.5s.
                 let cur_kbd = hw.detect_keyboard_attached();
-                let cur_bat = read_sysfs_battery().map(|(pct, _)| pct);
-                if cur_kbd != last_kbd {
+                let periodic = ticks == 6;
+                let cur_bat = if periodic {
+                    read_sysfs_battery().map(|(pct, _)| pct)
+                } else {
+                    last_bat
+                };
+                if cur_kbd != last_kbd || cur_bat != last_bat {
+                    let keyboard_attached = (cur_kbd != last_kbd).then_some(cur_kbd);
                     last_kbd = cur_kbd;
-                    let _ = poll_tx.send(DaemonCommand::HardwareUpdate {
-                        keyboard_attached: Some(cur_kbd),
-                        orientation: None,
-                    });
-                } else if cur_bat != last_bat {
                     last_bat = cur_bat;
                     let _ = poll_tx.send(DaemonCommand::HardwareUpdate {
-                        keyboard_attached: None,
+                        keyboard_attached,
                         orientation: None,
                     });
                 }
 
-                let cur_mtime = read_mtime(theme_path.as_ref());
-                if cur_mtime.is_some() && cur_mtime != last_theme_mtime {
-                    last_theme_mtime = cur_mtime;
-                    let palette = session.palette();
-                    let _ = poll_tx.send(DaemonCommand::UpdatePalette(palette));
+                if periodic {
+                    ticks = 0;
+                    let cur_mtime = read_mtime(theme_path.as_ref());
+                    if cur_mtime.is_some() && cur_mtime != last_theme_mtime {
+                        last_theme_mtime = cur_mtime;
+                        let palette = session.palette();
+                        let _ = poll_tx.send(DaemonCommand::UpdatePalette(palette));
+                    }
                 }
+                thread::sleep(Duration::from_millis(250));
+                ticks += 1;
             }
         })
         .ok();
@@ -644,11 +571,56 @@ fn parse_cli(args: &[String]) -> CliOutcome {
     })
 }
 
+fn live_backend() -> Result<HyprlandBackend, String> {
+    if ["WAYLAND_DISPLAY", "WAYLAND_SOCKET"]
+        .iter()
+        .all(|name| env::var_os(name).is_none_or(|value| value.is_empty()))
+    {
+        return Err("run inside an active Hyprland Wayland session or use --dry-run".into());
+    }
+    let backend = HyprlandBackend::from_env()
+        .ok_or("Hyprland is required; start from a terminal inside that session")?;
+    backend.list_outputs().map_err(|err| {
+        format!(
+            "cannot query Hyprland at {}: {err}",
+            backend.socket_path().display()
+        )
+    })?;
+    Ok(backend)
+}
+
+fn watch_shutdown_signals(cmd_tx: Sender<DaemonCommand>) -> std::io::Result<()> {
+    // Queue the same shutdown command as veilctl, even during Wayland startup.
+    let mut signals = Signals::new([SIGINT, SIGTERM])?;
+    thread::Builder::new()
+        .name("veilshell-shutdown".into())
+        .spawn(move || {
+            for _ in signals.forever() {
+                if cmd_tx.send(DaemonCommand::Quit).is_err() {
+                    break;
+                }
+            }
+        })?;
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let opts = match parse_cli(&args) {
         CliOutcome::Run(o) => o,
         CliOutcome::Exit(code) => return code,
+    };
+
+    let compositor = if opts.dry_run {
+        None
+    } else {
+        match live_backend() {
+            Ok(backend) => Some(backend),
+            Err(err) => {
+                eprintln!("veilshell: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
     };
 
     let session = ShellSession::current();
@@ -657,7 +629,8 @@ fn main() -> ExitCode {
     let hw = LinuxHardware::auto_detect();
     let preferred_scale = hw.profile().map_or(1.0, |p| p.preferred_scale);
     let watch_rotation = hw.profile().is_none_or(|p| p.auto_rotate_in_tablet_mode);
-    let mode_sm = ModeStateMachine::new(opts.policy, hw.detect_keyboard_attached());
+    let initial_keyboard_attached = hw.detect_keyboard_attached();
+    let mode_sm = ModeStateMachine::new(opts.policy, initial_keyboard_attached);
     let initial_visible =
         mode_sm.effective_mode() == ShellMode::Tablet || opts.scene != SceneKind::Pill;
 
@@ -670,12 +643,16 @@ fn main() -> ExitCode {
     };
     scene_ctx.shade.auto_rotate_available = false;
 
-    let compositor = match HyprlandBackend::from_env().filter(HyprlandBackend::is_available) {
-        Some(hypr) => ActiveCompositor::Hyprland(hypr),
-        None => ActiveCompositor::Mock(MockBackend::default()),
+    let Some(compositor) = compositor else {
+        print_dry_run(&opts, hw, palette, scene_ctx, initial_visible);
+        return ExitCode::SUCCESS;
     };
 
     let (cmd_tx, cmd_rx) = channel::channel();
+    if let Err(err) = watch_shutdown_signals(cmd_tx.clone()) {
+        eprintln!("veilshell: could not watch shutdown signals: {err}");
+        return ExitCode::FAILURE;
+    }
     let mut handler = LiveActionHandler {
         compositor,
         hw: hw.clone(),
@@ -687,12 +664,6 @@ fn main() -> ExitCode {
         session_tx: session.owns_compositor().then(|| cmd_tx.clone()),
     };
     handler.sync_hardware_snapshot(&mut scene_ctx);
-
-    if opts.dry_run || env::var_os("WAYLAND_DISPLAY").is_none() {
-        handler.refresh_context(SceneKind::Recents, &mut scene_ctx);
-        print_dry_run(&opts, hw, palette, scene_ctx, initial_visible);
-        return ExitCode::SUCCESS;
-    }
 
     if let Err(err) = spawn_ipc_listener(&opts.socket_path, cmd_tx.clone(), session) {
         eprintln!(
@@ -710,6 +681,7 @@ fn main() -> ExitCode {
             &cmd_tx,
             Arc::clone(&stop_watchers),
             hw,
+            initial_keyboard_attached,
             session,
             watch_rotation,
         )
@@ -752,7 +724,9 @@ fn print_dry_run(
     visible: bool,
 ) {
     let profile_id = hw.profile().map(|profile| profile.id.clone());
-    let state = ShellState::new(MockBackend::default(), hw, palette);
+    let mock = MockBackend::default();
+    let windows = mock.list_windows().map_or(0, |windows| windows.len());
+    let state = ShellState::new(mock, hw, palette);
     print!("{}", state.status_report());
     if let Some(id) = profile_id {
         println!("  profile    : {id}");
@@ -760,17 +734,14 @@ fn print_dry_run(
     println!("  scene      : {}", opts.scene.as_str());
     println!("  policy     : {:?}", opts.policy);
     println!("  visible    : {visible}");
-    let (apps, windows) = (ctx.home_apps.len(), ctx.recents_cards.len());
+    let apps = ctx.home_apps.len();
     match ActiveRenderer::new(opts.renderer, ctx) {
         Ok(active) => println!("  renderer   : {}", active.backend_label()),
         Err(err) => println!("  renderer   : unavailable ({err})"),
     }
     println!("  apps       : {apps}");
-    println!("  windows    : {windows}");
+    println!("  windows    : {windows} (mock)");
     println!("  socket     : {}", opts.socket_path.display());
-    if !opts.dry_run {
-        println!("  wayland    : WAYLAND_DISPLAY not set (use inside a Wayland session)");
-    }
 }
 
 fn parse_flag(args: &[String], flag: &str) -> Option<String> {
@@ -805,9 +776,43 @@ fn print_help() {
 mod tests {
     use super::*;
 
-    fn handler(session: ShellSession) -> LiveActionHandler {
+    #[test]
+    fn watcher_reports_a_keyboard_change_since_the_startup_sample() {
+        let (tx, rx) = channel::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (_, watcher) = spawn_hardware_watchers(
+            &tx,
+            Arc::clone(&stop),
+            LinuxHardware::new(None), // Always detects attached without a USB profile.
+            false,
+            ShellSession::Standalone,
+            false,
+        );
+        let watcher = watcher.expect("spawn watcher");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let reported = loop {
+            if matches!(
+                rx.try_recv(),
+                Ok(DaemonCommand::HardwareUpdate {
+                    keyboard_attached: Some(true),
+                    orientation: None,
+                })
+            ) {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        stop.store(true, Ordering::Relaxed);
+        watcher.join().expect("join watcher");
+        assert!(reported, "the startup attachment change was lost");
+    }
+
+    fn handler(session: ShellSession) -> LiveActionHandler<MockBackend> {
         LiveActionHandler {
-            compositor: ActiveCompositor::Mock(MockBackend::default()),
+            compositor: MockBackend::default(),
             hw: LinuxHardware::new(None),
             session,
             mode_sm: ModeStateMachine::new(ModePolicy::Auto, true),
@@ -836,9 +841,7 @@ mod tests {
             shell.on_custom_command("mode tablet", &mut ctx).1,
             Some(true)
         );
-        let ActiveCompositor::Mock(mock) = shell.compositor else {
-            unreachable!();
-        };
+        let mock = shell.compositor;
         assert_eq!(mock.applied_mode(), ShellMode::Laptop);
         assert_eq!(
             mock.list_outputs().unwrap()[0].orientation,
@@ -855,9 +858,7 @@ mod tests {
             Some(true)
         );
         assert!(ctx.shade.auto_rotate_available);
-        let ActiveCompositor::Mock(mock) = shell.compositor else {
-            unreachable!();
-        };
+        let mock = shell.compositor;
         assert_eq!(mock.applied_mode(), ShellMode::Tablet);
         assert_eq!(
             mock.list_outputs().unwrap()[0].orientation,

@@ -12,9 +12,9 @@ Hyprland is the only live backend. Surface Go 3 + Hyprland is the
 [`v0.1.0` validation target](ROADMAP.md#first-release);
 Omarchy is optional. [Recorded guest and nested tests](DENIAL_VALIDATION.md)
 are not certification for other distro, kernel, or hardware combinations.
-A session without a detected Hyprland backend currently falls back to
-`MockBackend`. A shell surface may still draw, but mock window data and actions
-do not count as support. Use `veilctl status` and `veilctl hw` for current
+The live daemon requires a reachable Hyprland backend and reports a startup
+error if it cannot query it. Mock window data is for tests and offline tools,
+not live window actions. Use `veilctl status` and `veilctl hw` for current
 diagnostics.
 
 ## Adapter boundaries
@@ -56,8 +56,8 @@ up consistently today.
 | GPU rendering | A usable GPU backend and Wayland presentation path | Use the software renderer in automatic mode. |
 
 Keep fixtures in tests and offline previews. The [roadmap](ROADMAP.md#portability-follow-up)
-tracks replacing the live mock fallback and adding a read-only
-`veilctl doctor` to report detected capabilities and missing requirements.
+tracks runtime capability fallbacks and a read-only `veilctl doctor` to
+report detected capabilities and missing requirements.
 
 ## Contributing a port
 

@@ -23,6 +23,7 @@ wgpu = ["veilshell-render/wgpu", "veilshell-wayland/wgpu"]
 [dependencies]
 png.workspace = true
 resvg = { version = "=0.50.0", default-features = false }
+signal-hook = "0.3.18"
 veilshell-compositor.workspace = true
 veilshell-core.workspace = true
 veilshell-hw.workspace = true
