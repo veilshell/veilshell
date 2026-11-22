@@ -47,5 +47,7 @@ then KILL to its own process group, not the launcher's group. `--check` never
 starts it.
 
 Run `python3 scripts/test-session-autostart.py` to test real child launches and
-teardown using fake display sockets and temporary XDG directories. A real
-SDDM login and actual compositor/application compatibility still need testing.
+teardown using fake display sockets and temporary XDG directories. An Arch/KVM
+SDDM smoke test also launched and reaped an explicitly allowlisted Foot
+window. Broader application compatibility and Omarchy coexistence remain
+separate checks.

@@ -69,7 +69,7 @@
 - [ ] Verify lock-before-suspend, resume and real power actions on hardware.
 - [x] Interim Hyprlock password locker and Hypridle configuration scoped to the preview session.
 - [x] SDDM guest login and touch logout smoke test with a guest-only software override.
-- [ ] Verify stock SDDM login with automatic renderer selection in the guest.
+- [x] Verify stock SDDM login and normal logout with automatic software fallback in the Virtio guest.
 - [ ] Native Denial-style lock face: wallpaper, clock/date, swipe-up touch authentication, password fallback, PIN and optional fingerprint. Require compositor-enforced locking.
 - [ ] Session-scoped desktop services: autostart, polkit prompts, file picker, and screen-sharing portals.
 - [ ] Arch Linux / AUR `PKGBUILD` (`packaging/arch/PKGBUILD`).

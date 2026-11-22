@@ -42,12 +42,16 @@ out of Git unless curated and license-checked. Never capture credentials.
 The signed Arch packages `denial 0.6.8-1` and
 `denial-flutter-engine 1:0.6.8-1` booted through SDDM in a separate Arch/KVM
 guest with Mesa software rendering and `DENIAL_SHELL_PROFILE=mobile`.
-Initial landscape captures (`1280×800`, scale 1) are grouped in
+Initial landscape (`1280×800`) and portrait (`800×1280`) captures at scale 1
+are grouped in
 `../veilshell-lab/denial-0.6.8-captures/` in the development lab. The stock
 Home shows a large date/clock widget integrated into the grid. A virtual
 touch swipe opens Quick Settings, with an empty notification panel on the
 left and controls on the right. The wallpaper and app catalog are still the
 guest defaults; these are reference captures, not matched VeilShell diffs.
+
+Denial reports the logical portrait dimensions after applying
+`transform=Virtual-1,90`; the raw QEMU scanout was rotated back for viewing.
 
 ## Verified VeilShell baseline
 
@@ -59,15 +63,25 @@ renderer override**. The stock renderer panicked in `wgpu-hal` GLES EGL
 left the compositor locked, but Virtio GPU errors left the screen black.
 This is **not** a wake pass or a stock SDDM pass.
 
+Commit `3a6667a` adds surface-aware GPU selection and automatic software
+fallback for Wayland GPU presentation failures. With this change, two stock
+SDDM logins in the same Virtio guest (no renderer override) reached Home with
+`renderer: sdf-software`; both normal exits returned to SDDM with VeilShell
+and Hypridle gone. This verifies the startup fix, not physical GPU or wake
+behavior. All 105 Rust workspace tests and strict Clippy passed.
+
 The isolated nested Hyprland harness separately exercised GPU and software
 rendering at 100%, 150%, and 200% in landscape and portrait. It does not
-replace SDDM or hardware tests. Touch unlock, portal/polkit/autostart
-isolation, notifications, and Wi-Fi/Bluetooth setup remain open.
+replace SDDM or hardware tests. Touch unlock, portal/polkit integration,
+notifications, and Wi-Fi/Bluetooth setup remain open.
 
 The [locker-local touch input component](TOUCH_LOCK.md) is not yet connected
 to Wayland or PAM. The launcher can use the
 [opt-in XDG autostart helper](../adapters/session/AUTOSTART.md) if installed
 and configured; this does not yet provide the rest of the desktop services.
+In a third stock SDDM login, an allowlisted Foot fixture opened on VeilShell's
+Wayland display and was gone on return to SDDM. The test fixture was removed
+afterward. Omarchy coexistence still needs its own login regression test.
 
 ## Integration gates
 

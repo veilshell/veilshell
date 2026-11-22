@@ -44,7 +44,7 @@ using the [parity spec](DENIAL_PARITY_SPEC.md). See the
 
 | Feature | Denial | VeilShell Status | Current VeilShell Implementation / Gap Notes |
 |---|---|---|---|
-| Standalone Wayland session entry (`SDDM` / `greetd` / `.desktop`) | Ships as a standalone Wayland compositor session | **Partial** | [SDDM preview adapter](../adapters/session/README.md) starts a dedicated Hyprland. Real guest login/logout passed with software rendering forced; stock auto renderer, portals, autostart and packaging remain. |
+| Standalone Wayland session entry (`SDDM` / `greetd` / `.desktop`) | Ships as a standalone Wayland compositor session | **Partial** | [SDDM preview adapter](../adapters/session/README.md) starts a dedicated Hyprland. Two stock guest login/logout cycles passed with automatic software fallback. Portals, permission prompts, packaging, and hardware validation remain. |
 | Touch Lock Screen (`ext-session-lock-v1`) | Native lock screen with password/PIN, fingerprint, `logind` lock/unlock, `--start-locked`, and hidden sensitive notifications | **Missing** | **Critical for standalone boot.** Currently relies on external lockers (`hyprlock`, etc.) that lack touch PIN/OSK ergonomics. Needs `ext-session-lock-v1` + PAM auth + `logind` `PrepareForSleep`/Lock signal listener. |
 | Power Menu (Lock, Sleep, Reboot, Shutdown, Logout) | Integrated session power actions + power-button handling | **Partial** | Touch Power menu in the standalone preview, including confirmation and a lock check before Suspend. Physical power-button behavior and hardware smoke tests remain. |
 | Idle Management & DPMS / Screen Blank | Integrated `logind` + DPMS + Always-On Display / wake handling | **Partial** | The preview provides Hypridle lock, display blank and wake defaults; no always-on display, touchscreen unlock, or hardware sleep verification yet. |
@@ -85,7 +85,7 @@ using the [parity spec](DENIAL_PARITY_SPEC.md). See the
 
 | Feature | Denial | VeilShell Status | Current VeilShell Implementation / Gap Notes |
 |---|---|---|---|
-| GPU Glassmorphic Renderer | Flutter Impeller GLES compositing | **Partial** | GPU Wayland presentation and software rendering work in nested tests; stock SDDM hit an EGL panic instead of falling back. Static wallpaper glass is not compositor refraction. |
+| GPU Glassmorphic Renderer | Flutter Impeller GLES compositing | **Partial** | GPU Wayland presentation and software rendering worked in baseline nested tests. Surface-aware automatic fallback was verified in the Virtio SDDM guest. Static wallpaper glass is not compositor refraction. |
 | TrueType / OpenType Typography | Native Skia text rendering | **Done** | `ab_glyph` system font atlas with automatic 5×7 HUD bitmap fallback. |
 | App Icons (PNG + SVG) | Full desktop icon rendering | **Done** | Freedesktop themes and installed PNG/SVG assets supply the launcher artwork. A letter badge is the fallback for a genuinely missing or unusable icon. |
 | Dynamic Theming & Wallpaper Accent Extraction | Light/dark themes + accent colors borrowed from wallpaper | **Partial** | Live Omarchy Aether `colors.toml` mtime watcher + WCAG AA dark fallback exist; missing automatic wallpaper-dominant-color accent extraction for non-Omarchy distros and a Light/Dark toggle. |
