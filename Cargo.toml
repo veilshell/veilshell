@@ -16,10 +16,7 @@ edition = "2021"
 rust-version = "1.86"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/veilshell/veilshell"
-homepage = "https://github.com/veilshell/veilshell"
 authors = ["VeilShell Contributors"]
-keywords = ["wayland", "tablet", "touch", "shell", "hyprland"]
-categories = ["gui", "os::linux-apis"]
 
 [workspace.dependencies]
 ab_glyph = "0.2"
@@ -36,7 +33,7 @@ raw-window-handle = "0.6"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 smithay-client-toolkit = { version = "0.21", default-features = false, features = ["calloop"] }
-wayland-client = { version = "0.31", features = ["system"] }
+wayland-client = { version = "0.31", features = ["system", "dlopen"] }
 wgpu = { version = "26", default-features = false, features = ["std", "parking_lot", "vulkan", "gles", "wgsl"] }
 
 [workspace.lints.rust]
