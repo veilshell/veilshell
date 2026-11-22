@@ -1,10 +1,36 @@
-# Secure touch unlock: first increment
+# Secure touch unlock
 
 This is groundwork for the [Denial parity security gate](DENIAL_PARITY_SPEC.md#sddm-acceptance-gates),
-not a new locker or an authentication option. The default session still runs
-Hyprlock. `veilshell-lock-input` is an isolated Rust library with no dependencies,
-no connection to the shell or compositor, and no ability to authenticate or
-unlock. Nothing in the shipping session calls it.
+not a new authentication option. The default session still runs Hyprlock.
+`veilshell-lock-input` is an isolated Rust library with no dependencies, no
+connection to the shell or compositor, and no ability to authenticate or unlock.
+Its attempt state serializes a future PAM worker, rejects stale or cancelled
+results, and imposes a two-second monotonic delay after a result. Nothing in
+the shipping session calls it.
+
+## Live protocol probe
+
+`cargo build -p veilshell-wayland --example session-lock-probe --no-default-features`
+builds an uninstalled test client. **Run it only in a disposable standalone
+VeilShell guest with an out-of-band way to end the session.** It requires
+`--disposable-guest-no-unlock` and verifies the standalone display handshake.
+It does not read credentials, handle input, or have any way to unlock. Ending
+the client is not a recovery method; end the guest session instead.
+
+In the Arch/KVM guest with Hyprland `0.57.2`, the compositor acknowledged the
+probe's lock and replaced Home with an opaque purple frame. After `SIGKILL`,
+the framebuffer showed Hyprland's crashed-locker recovery screen, **not**
+the desktop, and `hyprctl locked` still returned `true`. Ending the guest
+session returned to SDDM. The development guest saved the two scanout images
+as `native-lock-protected.png` and `native-lock-after-kill.png`.
+
+A separate run added and removed a `1920×1080` headless output at 2× scale
+while locked. The probe received a configure and committed a `960×540`
+logical lock surface. Hyprland remained locked; this does not verify physical
+hotplug visibility. Hyprland itself has compositor-level recovery controls;
+do not expose them through VeilShell IPC or call them on locker failure.
+The default launcher and idle hooks were not changed. PAM, the private
+password editor, and wake on hardware remain unverified.
 
 ## Which process should own touch entry?
 
@@ -96,10 +122,10 @@ are eligible.
    and test lock-before-sleep and no desktop flash on wake on hardware.
    No unauthenticated startup/autologin, PIN, or fingerprint in this increment.
 
-`cargo test -p veilshell-lock-input` exercises input only: printable coverage,
-release/frame semantics, gaps and drags, competing contacts, reconfiguration,
-cancellation, and undersized surfaces. No compositor, PAM, or sleep behavior
-is established by these unit tests.
+`cargo test -p veilshell-lock-input` exercises printable coverage, touch-frame
+semantics, gaps and drags, competing contacts, reconfiguration, undersized
+surfaces, serialized retries, and rejection of cancelled and replayed
+authentication results. These unit tests do not exercise PAM or sleep.
 
 [hyprlock]: https://github.com/hyprwm/hyprlock/blob/5e57c4b451d36db0d5a830b08c55891ab7c9c5ae/src/core/hyprlock.cpp
 [seat]: https://github.com/hyprwm/hyprlock/blob/5e57c4b451d36db0d5a830b08c55891ab7c9c5ae/src/core/Seat.cpp

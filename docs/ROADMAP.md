@@ -68,6 +68,7 @@
 - [x] Preview-only touch power menu with Lock, Suspend, Logout, Restart and Shut down. Confirm session-ending actions and refuse touch Suspend without compositor lock acknowledgment.
 - [ ] Verify lock-before-suspend, resume and real power actions on hardware.
 - [x] Interim Hyprlock password locker and Hypridle configuration scoped to the preview session.
+- [x] Verify native session-lock acknowledgement and locker-death behavior on the guest's visible output with an uninstalled protocol probe.
 - [x] SDDM guest login and touch logout smoke test with a guest-only software override.
 - [x] Verify stock SDDM login and normal logout with automatic software fallback in the Virtio guest.
 - [ ] Native Denial-style lock face: wallpaper, clock/date, swipe-up touch authentication, password fallback, PIN and optional fingerprint. Require compositor-enforced locking.

@@ -8,6 +8,8 @@
 
 use std::collections::BTreeSet;
 
+pub mod attempt;
+
 /// An intent for the locker's private password editor, not a keycode to inject.
 /// `Submit` asks to authenticate; `Cancel` asks to discard the input/attempt.
 #[derive(PartialEq, Eq)]

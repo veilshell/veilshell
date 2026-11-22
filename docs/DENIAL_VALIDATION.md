@@ -75,8 +75,10 @@ rendering at 100%, 150%, and 200% in landscape and portrait. It does not
 replace SDDM or hardware tests. Touch unlock, portal/polkit integration,
 notifications, and Wi-Fi/Bluetooth setup remain open.
 
-The [locker-local touch input component](TOUCH_LOCK.md) is not yet connected
-to Wayland or PAM. The launcher can use the
+The [locker prototype and validation record](TOUCH_LOCK.md) covers a separate
+Wayland probe that remained locked after client death in the guest. The
+locker-local input and attempt state are not yet connected to PAM or to the
+probe. The launcher can use the
 [opt-in XDG autostart helper](../adapters/session/AUTOSTART.md) if installed
 and configured; this does not yet provide the rest of the desktop services.
 In a third stock SDDM login, an allowlisted Foot fixture opened on VeilShell's

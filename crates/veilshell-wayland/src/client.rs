@@ -295,6 +295,13 @@ impl ManagedSurface {
         }
     }
 
+    #[cfg_attr(
+        not(feature = "wgpu"),
+        allow(
+            clippy::unnecessary_wraps,
+            reason = "keep the same presentation contract without GPU"
+        )
+    )]
     fn present_draw_list(
         &mut self,
         qh: &QueueHandle<LayerApp>,
