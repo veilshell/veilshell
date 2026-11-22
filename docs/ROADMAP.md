@@ -65,7 +65,8 @@
 #### Sprint 4A — Standalone SDDM session, lock and power
 
 - [x] [Preview SDDM entry](../adapters/session/README.md), dedicated Hyprland config, session-scoped daemon and launcher lifecycle tests. Keep the greeter, autologin, and existing desktop configuration unchanged.
-- [ ] Touch power menu with Lock, Suspend and Logout; confirm destructive actions and add Reboot and Shutdown. Verify lock-before-suspend and resume.
+- [x] Preview-only touch power menu with Lock, Suspend, Logout, Restart and Shut down. Confirm session-ending actions and refuse touch Suspend without compositor lock acknowledgment.
+- [ ] Verify lock-before-suspend, resume and real power actions on hardware.
 - [x] Interim Hyprlock password locker and Hypridle configuration scoped to the preview session.
 - [ ] Native Denial-style lock face: wallpaper, clock/date, swipe-up touch authentication, password fallback, PIN and optional fingerprint. Require compositor-enforced locking.
 - [ ] Arch Linux / AUR `PKGBUILD` (`packaging/arch/PKGBUILD`) and real SDDM login/logout smoke test.

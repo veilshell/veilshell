@@ -4,6 +4,7 @@
 pub mod font;
 #[cfg(feature = "wgpu")]
 pub mod gpu;
+pub mod power;
 pub mod primitives;
 pub mod scene;
 pub mod software;

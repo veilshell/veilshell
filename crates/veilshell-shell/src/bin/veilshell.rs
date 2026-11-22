@@ -3,7 +3,7 @@
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -18,6 +18,7 @@ use veilshell_core::{
 };
 use veilshell_hw::linux::{read_sysfs_backlight, read_sysfs_battery};
 use veilshell_hw::{HardwareBackend, HardwareController, LinuxHardware, SensorGuard};
+use veilshell_render::power::{PowerAction, PowerMenu};
 use veilshell_render::{
     ActiveRenderer, RecentsCard, RendererPreference, SceneContext, SceneKind, WallpaperImage,
 };
@@ -111,9 +112,22 @@ struct LiveActionHandler {
     rotation: RotationLock,
     target_output: Option<String>,
     auto_rotate: bool,
+    session_tx: Option<Sender<DaemonCommand>>,
 }
 
 impl LiveActionHandler {
+    fn request_power(&self, action: PowerAction, ctx: &mut SceneContext) {
+        if !self
+            .session_tx
+            .as_ref()
+            .is_some_and(|tx| spawn_power_action(tx.clone(), action))
+        {
+            if let Some(menu) = &mut ctx.power_menu {
+                menu.finish(action, false);
+            }
+        }
+    }
+
     fn sync_hardware_snapshot(&self, ctx: &mut SceneContext) {
         let snap = self.hw.snapshot();
         ctx.battery_pct = snap.battery_pct;
@@ -303,6 +317,7 @@ impl ShellActionHandler for LiveActionHandler {
             ShellAction::HomePageChanged(page) => {
                 ctx.home_page = page;
             }
+            ShellAction::RequestPower(action) => self.request_power(action, ctx),
         }
     }
 
@@ -375,6 +390,30 @@ impl ShellActionHandler for LiveActionHandler {
             Some(tablet),
         )
     }
+}
+
+fn spawn_power_action(tx: Sender<DaemonCommand>, action: PowerAction) -> bool {
+    let verb = match action {
+        PowerAction::Lock => "lock",
+        PowerAction::Suspend => "suspend",
+        PowerAction::Restart => "reboot",
+        PowerAction::Shutdown => "poweroff",
+        // Logout is the ordinary daemon exit supervised by the session launcher.
+        PowerAction::Logout => return false,
+    };
+    thread::Builder::new()
+        .name("veilshell-power".into())
+        .spawn(move || {
+            let result = Command::new("veilshell-session")
+                .args(["--power", verb])
+                .status();
+            let success = result.as_ref().is_ok_and(std::process::ExitStatus::success);
+            if !success {
+                eprintln!("veilshell: standalone {verb} failed: {result:?}");
+            }
+            let _ = tx.send(DaemonCommand::PowerFinished { action, success });
+        })
+        .is_ok()
 }
 
 fn spawn_hardware_watchers(
@@ -570,10 +609,13 @@ fn main() -> ExitCode {
     let initial_visible =
         mode_sm.effective_mode() == ShellMode::Tablet || opts.scene != SceneKind::Pill;
 
+    let standalone =
+        env::var_os("VEILSHELL_SESSION_DIR").is_some_and(|path| PathBuf::from(path).is_dir());
     let mut scene_ctx = SceneContext {
         clock_text: current_clock_hhmm(),
         tablet_mode: initial_visible,
         home_apps: apps_to_tiles(&discovered),
+        power_menu: standalone.then_some(PowerMenu::default()),
         ..SceneContext::default()
     };
 
@@ -582,6 +624,7 @@ fn main() -> ExitCode {
         None => ActiveCompositor::Mock(MockBackend::default()),
     };
 
+    let (cmd_tx, cmd_rx) = channel::channel();
     let handler = LiveActionHandler {
         compositor,
         hw: hw.clone(),
@@ -589,6 +632,7 @@ fn main() -> ExitCode {
         rotation: RotationLock::default(),
         target_output: opts.output_name.clone(),
         auto_rotate,
+        session_tx: standalone.then(|| cmd_tx.clone()),
     };
     handler.sync_hardware_snapshot(&mut scene_ctx);
     handler.refresh_context(SceneKind::Recents, &mut scene_ctx);
@@ -615,7 +659,6 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let (cmd_tx, cmd_rx) = channel::channel();
     if let Err(err) = spawn_ipc_listener(&opts.socket_path, cmd_tx.clone()) {
         eprintln!(
             "veilshell: warning — could not bind IPC socket {}: {err}",

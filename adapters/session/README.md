@@ -33,6 +33,11 @@ At the next SDDM login, select **VeilShell (Preview)**. `Super+H` opens Home,
 `Super+Shift+E` ends the preview session. A shell or idle-service failure also
 ends the session instead of leaving the original greeter stopped.
 
+The **Power** tile in Quick Settings opens Lock, Suspend, Log out, Restart, and
+Shut down. Only Lock acts without a confirmation tap. Touch Suspend checks for
+Hyprland's lock acknowledgment before requesting sleep. System power actions
+still depend on the distribution's logind/polkit permissions.
+
 `hypridle` requests the scoped `hyprlock` after five minutes of inactivity, turns
 the display off after another 30 seconds, and requests locking before system
 sleep. It requests a logind delay until Hyprland signals lock; logind's finite

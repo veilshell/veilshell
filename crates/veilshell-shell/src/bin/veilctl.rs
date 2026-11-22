@@ -347,11 +347,16 @@ fn cmd_mode(arg: Option<&str>) -> ExitCode {
 #[allow(clippy::too_many_lines)]
 fn cmd_snapshot(args: &[String]) -> ExitCode {
     let demo = args.iter().any(|a| a == "--demo");
+    let power_menu = args.iter().any(|a| a == "--power-menu");
     let scene_name = parse_flag(args, "--scene").unwrap_or_else(|| "home".to_owned());
     let Some(scene) = SceneKind::parse_name(&scene_name) else {
         eprintln!("invalid --scene '{scene_name}' (expected: pill, home, recents, shade, osk)");
         return ExitCode::FAILURE;
     };
+    if power_menu && (!demo || scene != SceneKind::Shade) {
+        eprintln!("--power-menu requires --demo --scene shade");
+        return ExitCode::FAILURE;
+    }
 
     let default_h = if scene == SceneKind::Pill {
         28_u32
@@ -420,6 +425,9 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
         load_best_available()
     };
     let mut ctx = SceneContext::default();
+    if power_menu {
+        ctx.power_menu = Some(veilshell_render::power::PowerMenu::Actions);
+    }
     if !demo {
         let snap = LinuxHardware::auto_detect().snapshot();
         ctx.clock_text = current_clock_hhmm();

@@ -290,6 +290,10 @@ pub enum HitTarget {
     ShadeToggle { id: &'static str },
     /// Tapping or dragging inside a Quick Settings slider updates `id`.
     ShadeSlider { id: &'static str, rect: HitRect },
+    /// Standalone session power menu input.
+    Power(crate::power::PowerInput),
+    /// Non-interactive region that consumes taps inside a power dialog.
+    PowerPanel,
     /// Tapping an OSK key emits the labeled key press.
     OskKey { label: &'static str },
     /// Bottom gesture pill region.

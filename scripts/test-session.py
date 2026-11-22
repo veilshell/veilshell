@@ -64,6 +64,16 @@ elif name in ("veilshell", "hypridle"):
 elif name == "hyprlock":
     assert "--grace" in sys.argv and sys.argv[sys.argv.index("--grace") + 1] == "0"
     log("hyprlock started")
+    if os.getenv("TEST_POWER"):
+        sys.exit(0)
+elif name == "hyprctl":
+    assert sys.argv[1:] == ["locked"]
+    print("true" if os.getenv("TEST_LOCKED") else "false")
+    sys.exit(0)
+elif name == "systemctl":
+    assert sys.argv[1:] == ["--no-ask-password", "suspend"]
+    log("suspended")
+    sys.exit(0)
 else:
     sys.exit(0)
 
@@ -84,7 +94,9 @@ class SessionTests(unittest.TestCase):
         mock = bindir / "mock"
         mock.write_text(MOCK)
         mock.chmod(0o755)
-        for name in ("Hyprland", "hyprctl", "hypridle", "hyprlock", "veilshell", "veilctl"):
+        for name in (
+            "Hyprland", "hyprctl", "hypridle", "hyprlock", "systemctl", "veilshell", "veilctl"
+        ):
             (bindir / name).symlink_to(mock)
         (bindir / COMMAND.name).symlink_to(COMMAND)
         self.log = self.root / "events"
@@ -163,6 +175,19 @@ class SessionTests(unittest.TestCase):
                 self.assertEqual(self.log.read_text().count("hyprlock started"), 1)
             finally:
                 locker.terminate()
+
+    def test_suspend_requires_compositor_lock(self):
+        self.env["WAYLAND_DISPLAY"] = "isolated"
+        self.env["VEILSHELL_SESSION_DIR"] = str(self.runtime)
+        self.env["TEST_POWER"] = "yes"
+        result = self.run_launcher("--power", "suspend")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("did not confirm", result.stderr)
+        self.assertNotIn("suspended", self.log.read_text())
+        self.env["TEST_LOCKED"] = "yes"
+        result = self.run_launcher("--power", "suspend")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("suspended", self.log.read_text())
 
 
 if __name__ == "__main__":

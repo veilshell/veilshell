@@ -11,6 +11,25 @@ fail() {
 
 config_dir=${VEILSHELL_SESSION_CONFIG_DIR:-/usr/share/veilshell/session}
 
+require_session() {
+    [[ -d ${VEILSHELL_SESSION_DIR:-} && -n ${WAYLAND_DISPLAY:-} &&
+        -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]] ||
+        fail "not running inside a standalone VeilShell session"
+}
+
+lock_and_wait() {
+    local deadline=$((SECONDS + 5)) locked
+    "$0" --lock &
+    while (( SECONDS < deadline )); do
+        locked=$(timeout 1 hyprctl locked) || locked=
+        if [[ $locked == true ]]; then
+            return
+        fi
+        sleep 0.1
+    done
+    fail "Hyprland did not confirm the session lock"
+}
+
 case ${1:-} in
     --publish-display)
         # Internal Hyprland startup hook. Publish inert data, not shell code.
@@ -22,12 +41,24 @@ case ${1:-} in
         exit 0
         ;;
     --lock)
-        [[ -d ${VEILSHELL_SESSION_DIR:-} && -n ${WAYLAND_DISPLAY:-} ]] ||
-            fail "not running inside a standalone VeilShell session"
+        require_session
         # Multiple lock requests must not queue a second locker after unlock.
         exec flock --exclusive --nonblock --conflict-exit-code 0 --no-fork \
             "$VEILSHELL_SESSION_DIR/locker.lock" \
             hyprlock --config "$config_dir/hyprlock.conf" --grace 0 --immediate-render
+        ;;
+    --power)
+        require_session
+        case ${2:-} in
+            lock) lock_and_wait ;;
+            suspend)
+                lock_and_wait
+                exec systemctl --no-ask-password suspend
+                ;;
+            reboot|poweroff) exec systemctl --no-ask-password "$2" ;;
+            *) fail "unsupported power action" ;;
+        esac
+        exit 0
         ;;
 esac
 
@@ -80,7 +111,7 @@ elif (( $# != 0 )); then
     fail "usage: veilshell-session [--check]"
 fi
 
-for binary in Hyprland hyprctl hypridle hyprlock flock veilshell veilctl veilshell-session; do
+for binary in Hyprland hyprctl hypridle hyprlock flock timeout systemctl veilshell veilctl veilshell-session; do
     command -v "$binary" >/dev/null || fail "missing command: $binary"
 done
 for config in hyprland.lua hypridle.conf hyprlock.conf; do

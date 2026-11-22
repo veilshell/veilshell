@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use veilshell_core::{OskState, Rgba, ShiftState, ThemePalette};
 
+use crate::power::{draw_power_menu, PowerInput, PowerMenu};
 use crate::primitives::{
     DrawList, HitRect, HitTarget, ImageQuad, RgbaImage, RoundedRect, SceneOutput, TextAlign,
 };
@@ -44,6 +45,8 @@ pub struct SceneContext {
     pub night_light: bool,
     pub brightness_pct: u8,
     pub volume_pct: u8,
+    /// Session controls are absent in the in-desktop overlay mode.
+    pub power_menu: Option<PowerMenu>,
     /// Horizontal drag indicator in logical pixels for live pill gesture feedback.
     pub pill_drag_x: f32,
     /// Vertical drag indicator in logical pixels (negative = upward pull).
@@ -75,6 +78,7 @@ impl Default for SceneContext {
             night_light: false,
             brightness_pct: 72,
             volume_pct: 55,
+            power_menu: None,
             pill_drag_x: 0.0,
             pill_drag_y: 0.0,
             top_drag_y: 0.0,
@@ -833,6 +837,10 @@ fn build_shade(
 ) {
     let progress = ctx.overlay_progress.clamp(0.0, 1.0);
     push_glass_backdrop(&mut out.draw_list, width, height, palette, progress);
+    if let Some(menu) = ctx.power_menu.filter(|menu| *menu != PowerMenu::Closed) {
+        draw_power_menu(out, palette, width, height, menu);
+        return;
+    }
     out.push_hit(
         HitRect::new(0.0, 0.0, width, height),
         HitTarget::DismissOverlay,
@@ -895,22 +903,25 @@ fn build_shade(
     let grid_y = panel_y + 84.0;
 
     for (idx, (id, label, active)) in tiles.iter().enumerate() {
+        let is_power = *id == "tablet_mode" && ctx.power_menu.is_some();
+        let active = *active && !is_power;
+        let label = if is_power { "Power" } else { *label };
         let col = idx % cols;
         let row = idx / cols;
         let tx = inner_x + col as f32 * (tile_w + gap);
         let ty = grid_y + row as f32 * (tile_h + gap);
 
-        let fill = if *active {
+        let fill = if active {
             palette.accent.with_alpha(0.88 * progress)
         } else {
             palette.background.with_alpha(0.68 * progress)
         };
-        let fg = if *active {
+        let fg = if active {
             palette.background.with_alpha(progress)
         } else {
             palette.foreground.with_alpha(progress)
         };
-        let border = if *active {
+        let border = if active {
             Rgba::from_rgb_u8(255, 255, 255).with_alpha(0.35 * progress)
         } else {
             palette.foreground.with_alpha(0.12 * progress)
@@ -924,7 +935,7 @@ fn build_shade(
         out.draw_list.push_text(
             tx + tile_w * 0.5,
             ty + 24.0,
-            *label,
+            label,
             2,
             fg,
             TextAlign::Center,
@@ -932,7 +943,13 @@ fn build_shade(
         out.draw_list.push_text(
             tx + tile_w * 0.5,
             ty + 48.0,
-            if *active { "On" } else { "Off" },
+            if is_power {
+                "Session"
+            } else if active {
+                "On"
+            } else {
+                "Off"
+            },
             2,
             fg.with_alpha(0.82 * progress),
             TextAlign::Center,
@@ -940,7 +957,11 @@ fn build_shade(
 
         out.push_hit(
             HitRect::new(tx, ty, tile_w, tile_h),
-            HitTarget::ShadeToggle { id },
+            if is_power {
+                HitTarget::Power(PowerInput::Open)
+            } else {
+                HitTarget::ShadeToggle { id }
+            },
         );
     }
 

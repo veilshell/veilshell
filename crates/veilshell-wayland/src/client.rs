@@ -32,6 +32,7 @@ use veilshell_core::{
     classify_bottom_pill, GestureAction, GestureSample, GestureThresholds, Orientation, OskEmit,
     Spring, SpringParams, ThemePalette,
 };
+use veilshell_render::power::{PowerAction, PowerInput, PowerMenu};
 use veilshell_render::{
     build_scene, build_scene_layout, build_top_strip_scene, ActiveRenderer, DrawList, HitTarget,
     SceneContext, SceneKind, SceneOutput, WallpaperImage,
@@ -84,6 +85,8 @@ pub enum DaemonCommand {
     UpdatePalette(ThemePalette),
     /// Upload and pre-blur a new static wallpaper on the GPU (or `None` to clear).
     SetWallpaper(Option<WallpaperImage>),
+    /// Deliver the result of a session action without blocking Wayland dispatch.
+    PowerFinished { action: PowerAction, success: bool },
     /// Query live daemon runtime status for `veilctl status`.
     QueryStatus(mpsc::Sender<RuntimeStatus>),
     /// Forward a domain command (such as `mode ...`) to [`ShellActionHandler::on_custom_command`].
@@ -125,6 +128,8 @@ pub enum ShellAction {
     SetSlider { id: &'static str, pct: u8 },
     /// Notify that the active Home grid page changed.
     HomePageChanged(usize),
+    /// Request an operation from the standalone session adapter.
+    RequestPower(PowerAction),
 }
 
 /// Callback interface handling UI interactions in `veilshell-shell`.
@@ -451,6 +456,13 @@ impl LayerApp {
     }
 
     pub(crate) fn show_scene(&mut self, scene: SceneKind, animate: bool) {
+        if scene != SceneKind::Shade {
+            if let Some(menu) = &mut self.renderer.context_mut().power_menu {
+                if !matches!(*menu, PowerMenu::Running(_)) {
+                    *menu = PowerMenu::Closed;
+                }
+            }
+        }
         if scene != SceneKind::Pill {
             self.visible = true;
             self.handler.on_action(
@@ -652,6 +664,14 @@ impl LayerApp {
                     eprintln!("veilshell: set_wallpaper failed: {err}");
                 }
                 self.draw_overlay();
+            }
+            DaemonCommand::PowerFinished { action, success } => {
+                if let Some(menu) = &mut self.renderer.context_mut().power_menu {
+                    menu.finish(action, success);
+                    if self.active_scene == SceneKind::Shade {
+                        self.draw_overlay();
+                    }
+                }
             }
             DaemonCommand::QueryStatus(reply) => {
                 let _ = reply.send(RuntimeStatus {
@@ -988,6 +1008,8 @@ impl LayerApp {
                 );
                 self.draw_overlay();
             }
+            HitTarget::Power(input) => self.handle_power_input(input),
+            HitTarget::PowerPanel => {}
             HitTarget::OskKey { label } => match self.renderer.context_mut().osk_state.press(label)
             {
                 OskEmit::Dismiss => {
@@ -1000,6 +1022,24 @@ impl LayerApp {
                 }
             },
         }
+    }
+
+    fn handle_power_input(&mut self, input: PowerInput) {
+        if self.active_scene != SceneKind::Shade {
+            return;
+        }
+        let Some(menu) = &mut self.renderer.context_mut().power_menu else {
+            return;
+        };
+        match menu.input(input) {
+            Some(PowerAction::Logout) => self.exit = true,
+            Some(action) => self.handler.on_action(
+                ShellAction::RequestPower(action),
+                self.renderer.context_mut(),
+            ),
+            None => {}
+        }
+        self.draw_overlay();
     }
 }
 
