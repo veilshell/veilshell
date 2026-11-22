@@ -1,12 +1,13 @@
 # Contributing to VeilShell
 
-Welcome! VeilShell is built so a new contributor can clone the repository, run
-`cargo test --workspace` in seconds, and contribute to a single focused crate
-without needing to master Wayland internals.
+Welcome! You can work on a single crate and run the workspace tests without
+needing a tablet. Improvements to the shared touch UI benefit both the overlay
+and standalone preview. Host-specific integration belongs in an adapter.
 
 ## Development Workflow
 
-All workspace crates enforce `#![forbid(unsafe_code)]` and `clippy::pedantic`:
+The workspace uses `clippy::pedantic` and forbids unsafe code outside the
+isolated Wayland GPU surface bridge:
 
 ```bash
 cargo fmt --all -- --check
@@ -42,9 +43,10 @@ compositor harnesses:
 
 - **Hardware profiles (`hardware-profiles/`):** Add a TOML quirk file for your
   tablet (see [docs/HARDWARE_PROFILES.md](docs/HARDWARE_PROFILES.md)).
-- **Compositor backends (`crates/veilshell-compositor/`):** Implement
-  `CompositorBackend` for Niri, Sway, River, or labwc (see
-  [docs/PORTING_A_COMPOSITOR.md](docs/PORTING_A_COMPOSITOR.md)).
+- **Compatibility and ports:** If your distro already ships Hyprland, start
+  with an install and smoke test. If it uses another compositor, start with
+  the [adapter contract and porting checklist](docs/PORTING_A_COMPOSITOR.md).
+  Report the tested setup, unavailable features, and untested workflows.
 - **Theme providers (`crates/veilshell-theme/`):** Add a `ThemeProvider` for
   XDG Desktop Portal, Pywal, Matugen, or Stylix.
 - **Quick Settings tiles & OSK layouts (`crates/veilshell-render/` & `crates/veilshell-shell/`):**

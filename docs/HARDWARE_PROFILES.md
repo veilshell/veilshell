@@ -2,13 +2,19 @@
 
 VeilShell stays device-agnostic in its core crates and loads per-tablet defaults from declarative TOML files under `hardware-profiles/` (embedded at build time and overridable at runtime).
 
+Profiles describe device quirks, not distributions. A profile match does not
+guarantee device or kernel support. See the
+[compatibility contract](PORTING_A_COMPOSITOR.md) for other integration layers.
+
 ## Runtime DMI Matching & Overrides
 
 On startup (`LinuxHardware::auto_detect()`), VeilShell reads `/sys/class/dmi/id/sys_vendor` and `/sys/class/dmi/id/product_name`:
 
 1. Scans user override files first in `$HOME/.config/veilshell/hardware-profiles/*.toml` (letting users tune a tablet without recompiling).
 2. Falls back to the built-in embedded profiles (`hardware-profiles/*.toml`).
-3. Applies the matched `[display]` scale, `[mode_switch]` detachable USB keyboard `(usb_vendor_id, usb_product_id)` polling, and `[sensors].auto_rotate_in_tablet_mode` behavior automatically.
+3. Uses matching USB IDs for detachable keyboard detection and the sensor
+   preference for standalone auto-rotation. The overlay follows the output
+   scale set by the host compositor; a profile does not change it.
 
 You can verify which profile and live hardware telemetry matched on your machine at any time:
 
@@ -16,7 +22,10 @@ You can verify which profile and live hardware telemetry matched on your machine
 veilctl hw
 ```
 
-## Schema
+## Example profile
+
+The example includes descriptive fields; their presence does not imply a
+runtime feature such as stylus handling or double-tap wake.
 
 ```toml
 [device]
@@ -36,7 +45,7 @@ stylus_name = "Optional stylus device name"
 double_tap_wake_dpms = false
 
 [mode_switch]
-# Supported strategies: "manual", "usb_keyboard_presence", "sw_tablet_mode"
+# Use "manual" or "usb_keyboard_presence"; hinge events are not implemented.
 strategy = "usb_keyboard_presence"
 usb_vendor_id = "045e"
 usb_product_id = "09b5"

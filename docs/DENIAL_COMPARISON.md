@@ -1,6 +1,10 @@
-# VeilShell vs. Denial — Feature Parity & Standalone Session Audit
+# VeilShell vs. Denial — Touch UX and feature inventory
 
-> **Context:** VeilShell is inspired by **[Denial](https://github.com/denialwm/denial)** (`denialwm/denial`) and is designed to run either as a zero-interference Laptop ↔ Tablet overlay inside an existing desktop session **or as a standalone bootable Wayland session** (via SDDM / `greetd` / display manager). When booting directly into VeilShell without a full desktop shell behind it, VeilShell must cover every day-to-day shell responsibility that Denial provides out of the box.
+VeilShell uses [Denial](https://github.com/denialwm/denial) as a reference for
+touch interactions, not as a feature or release checklist. A standalone
+VeilShell session needs to cover essential tablet workflows, but it can
+delegate services and make different choices for older hardware. The
+[roadmap](ROADMAP.md) defines what is required for the first overlay release.
 
 For pinned source references, distinguish Denial's mobile and desktop profiles
 using the [parity spec](DENIAL_PARITY_SPEC.md). See the
@@ -10,10 +14,10 @@ using the [parity spec](DENIAL_PARITY_SPEC.md). See the
 
 | Dimension | Denial (`denialwm/denial`) | VeilShell (`veilshell/veilshell`) |
 |---|---|---|
-| **Architecture** | Monolithic Wayland compositor (Rust + Smithay) embedding the **Flutter engine** directly in-process | Distro- & compositor-agnostic **pure-Rust `wlr-layer-shell` shell** (`smithay-client-toolkit` + `wgpu`) running over Hyprland (with Niri/Sway planned) |
+| **Architecture** | Wayland compositor (Rust + Smithay) embedding the **Flutter engine** in-process | Rust `wlr-layer-shell` client (`smithay-client-toolkit` + `wgpu`) with Hyprland as its first live backend |
 | **Rendering** | Flutter Impeller GLES scene graph with live DMA-BUF window textures | Single-pass instanced `wgpu` Vulkan/GLES WGSL SDF renderer + shelf-packed GPU atlas + blur-once wallpaper cache + zero-`unsafe` CPU SDF fallback |
-| **Target Footprint** | Modern ARM64 phones/tablets & desktops | Older fanless **5W / 4–8 GB RAM** x86 & ARM tablets (`< 40 MiB` RSS, `0%` idle CPU in Laptop Mode) |
-| **Desktop Coexistence** | Replaces your compositor completely | Zero-interference overlay in Laptop Mode **or** optional standalone SDDM/`greetd` tablet session |
+| **Target Footprint** | Modern ARM64 phones/tablets & desktops | Older fanless **5W / 4–8 GB RAM** x86 & ARM tablets; see the [performance targets](PERFORMANCE_BUDGET.md) |
+| **Desktop Coexistence** | Runs as its own compositor | Overlay leaves host layout and monitor rules untouched; optional SDDM preview uses a separate Hyprland session |
 | **License** | `GPL-3.0-or-later` | `GPL-3.0-or-later` |
 
 ---
@@ -22,7 +26,7 @@ using the [parity spec](DENIAL_PARITY_SPEC.md). See the
 
 - **Done** — Implemented, wired end-to-end, and covered by tests/verification.
 - **Partial** — Core feature works, but missing key UX details needed for full parity or standalone use.
-- **Missing** — Not yet implemented in VeilShell; required for Denial parity or standalone boot.
+- **Missing** — No VeilShell implementation; not necessarily a release requirement.
 - **Host / Ecosystem** — Intentionally delegated to the host Wayland compositor (Hyprland/Niri/Sway) or separate OS components rather than coupled into VeilShell.
 
 ---
@@ -37,15 +41,15 @@ using the [parity spec](DENIAL_PARITY_SPEC.md). See the
 | Home application launcher | Mobile paged Home with editable slots and a separate all-apps drawer | **Partial** | Responsive paged `.desktop` grid with freedesktop `PNG` icons and a badge fallback. No editable layout, folders, widgets, or separate drawer. |
 | App search / instant filter | Search in the desktop launcher | **Missing** | VeilShell requires browsing pages to find an app. A search surface should accept both physical keyboard and touch input. |
 | Live Recents / Window Overview | Live Wayland surfaces inside overview | **Partial** | Frameless, swipeable window previews with the app icon/name above each card, captured at higher resolution via `ext-foreign-toplevel-list-v1` + `ext-image-copy-capture-v1`. Tap to focus and swipe up to close; cached captures are limited to three nearby windows. |
-| Portrait / Landscape & Auto-Rotation | Responsive mobile/tablet layout + rotation | **Done** | `iio-sensor-proxy` (`monitor-sensor --accel`) + Rotation Lock + dynamic `wl_output`/configure resize handling across landscape & portrait layouts. |
+| Portrait / Landscape & Auto-Rotation | Responsive mobile/tablet layout + rotation | **Done** | Layout follows the compositor's output changes in both modes. Sensor-driven rotation and Rotation Lock are scoped to standalone. |
 | Split-screen / Side-by-side touch snapping | Native compositor tiling/stacking/scrolling layouts | **Partial** | Delegated to host compositor (`Hyprland`), but VeilShell does not yet expose a touch drag-to-split affordance from `Recents`. |
 
 ### 2. Standalone Boot & Session Lifecycle (Required for Standalone Display Manager / Boot Entry)
 
 | Feature | Denial | VeilShell Status | Current VeilShell Implementation / Gap Notes |
 |---|---|---|---|
-| Standalone Wayland session entry (`SDDM` / `greetd` / `.desktop`) | Ships as a standalone Wayland compositor session | **Partial** | [SDDM preview adapter](../adapters/session/README.md) starts a dedicated Hyprland. Two stock guest login/logout cycles passed with automatic software fallback. Portals, permission prompts, packaging, and hardware validation remain. |
-| Touch Lock Screen (`ext-session-lock-v1`) | Native lock screen with password/PIN, fingerprint, `logind` lock/unlock, `--start-locked`, and hidden sensitive notifications | **Missing** | **Critical for standalone boot.** Currently relies on external lockers (`hyprlock`, etc.) that lack touch PIN/OSK ergonomics. Needs `ext-session-lock-v1` + PAM auth + `logind` `PrepareForSleep`/Lock signal listener. |
+| Standalone Wayland session entry | Ships as a standalone Wayland compositor session | **Partial** | [SDDM preview adapter](../adapters/session/README.md) starts a dedicated Hyprland. Stock guest login/logout passed with automatic software fallback. Portals, permission prompts, packaging, and hardware validation remain. |
+| Touch Lock Screen (`ext-session-lock-v1`) | Native lock screen with password/PIN, fingerprint, and hidden sensitive notifications | **Missing** | Required for touch-only standalone use, not ordinary overlay use. The preview uses Hyprlock with a physical keyboard. See the [secure touch unlock plan](TOUCH_LOCK.md). |
 | Power Menu (Lock, Sleep, Reboot, Shutdown, Logout) | Integrated session power actions + power-button handling | **Partial** | Touch Power menu in the standalone preview, including confirmation and a lock check before Suspend. Physical power-button behavior and hardware smoke tests remain. |
 | Idle Management & DPMS / Screen Blank | Integrated `logind` + DPMS + Always-On Display / wake handling | **Partial** | The preview provides Hypridle lock, display blank and wake defaults; no always-on display, touchscreen unlock, or hardware sleep verification yet. |
 | Hardware Key OSDs (Volume ±, Brightness ±, Mute) | On-screen visual overlays for hardware button presses | **Missing** | Tablets have physical volume rockers and power buttons; standalone mode needs a lightweight auto-hiding glass OSD pill when volume/brightness changes. |
@@ -56,7 +60,7 @@ using the [parity spec](DENIAL_PARITY_SPEC.md). See the
 
 | Feature | Denial | VeilShell Status | Current VeilShell Implementation / Gap Notes |
 |---|---|---|---|
-| System Notifications (`org.freedesktop.Notifications`) | Native notification banners & history with lockscreen privacy | **Missing** | **Critical for standalone boot.** VeilShell does not yet claim or observe `org.freedesktop.Notifications` over D-Bus, render toast popups, or display a clearable notification list in `Shade`. |
+| System Notifications (`org.freedesktop.Notifications`) | Native notification banners & history with lockscreen privacy | **Missing** | Standalone needs actionable notifications with lock-screen privacy. In overlay mode, notification delivery remains with the host desktop. |
 | MPRIS Media Player Widget | Embedded MPRIS dashboard widget (track info, art, progress, Play/Pause/Prev/Next) | **Missing** | `Shade` currently renders quick toggles and brightness/volume sliders only; needs an MPRIS D-Bus card when media is active. |
 | Per-Application Audio Mixer | Per-window volume mixing in control center | **Missing** | `Shade` has a single master PipeWire (`wpctl`) volume slider; per-stream mixing is not yet implemented. |
 
@@ -70,7 +74,7 @@ using the [parity spec](DENIAL_PARITY_SPEC.md). See the
 | Power Profiles (`power-profiles-daemon`) | Power profile selector tile (Power Saver / Balanced / Performance) | **Done** | `powerprofilesctl` profile tile cycles Balanced / Power saver / Performance, shown only when the service answers. |
 | Do Not Disturb | Silent mode tile in control center | **Done** | Toggles mako's `do-not-disturb` mode when a `[mode=do-not-disturb]` rule is configured. |
 | Interactive Network & Bluetooth Picker Sheets | Visual settings UI to pick Wi-Fi networks & pair BT devices | **Missing** | **Important for standalone boot.** Today Wi-Fi/BT tiles toggle radios on/off, but picking a new SSID/password or pairing a Bluetooth device requires an external tool (`impala`/`bluetui`/`nm-connection-editor`). |
-| Detachable Keyboard / `SW_TABLET_MODE` Auto-Switch | Mobile/desktop convergence | **Done** | DMI-matched `hardware-profiles/*.toml` + USB Type Cover polling (`LinuxHardware`) with `0%` idle CPU in Laptop Mode. Can be extended with Linux `evdev` `SW_TABLET_MODE` for 2-in-1 hinges. |
+| Detachable Keyboard Auto-Switch | Mobile/desktop convergence | **Partial** | DMI-matched `hardware-profiles/*.toml` and USB Type Cover polling are implemented. Generic `SW_TABLET_MODE` hinge events are not supported yet. |
 | Touch Haptics / Vibration Feedback | Hardware haptic feedback via companion stack | **Missing** | Optional `ff-memless` / `evdev` force-feedback pulse on OSK key taps & gesture thresholds for hardware that has a vibration motor. |
 
 ### 5. Touch Input & On-Screen Keyboard (OSK)
@@ -98,29 +102,17 @@ These features exist in Denial because Denial **is** a full Wayland compositor a
 |---|---|
 | **Window tiling / stacking / scrolling engine** | Handled natively by the host Wayland compositor (**Hyprland**, and future **Niri** / **Sway** backends via `veilshell-compositor`). |
 | **XDG Desktop Portals & Screencast plumbing** | Provided by `xdg-desktop-portal-hyprland` / `xdg-desktop-portal-wlr` / compositor stack. |
-| **Live Dart / Flutter Hot-Reload Shell Editing** | VeilShell is intentionally pure Rust (`wgpu` + `sctk`) to stay `< 40 MiB` RSS and `< 200 ms` cold start on 5W tablets. |
+| **Live Dart / Flutter Hot-Reload Shell Editing** | VeilShell keeps its Rust renderer and offline snapshot workflow. |
 | **Android App Runtime (`Droidloom`)** | Separate container/runtime layer; Android apps launched via Waydroid or Droidloom appear as normal Wayland windows and `.desktop` entries inside VeilShell automatically. |
 | **Cellular Voice/SMS Stack (`Phonewave`)** | Separate telephony layer; VeilShell focuses on tablet WWAN data toggles (`nmcli` / ModemManager). |
 
 ---
 
-## Recommended Implementation Order for a Bootable Standalone VeilShell Session
+## Standalone priorities
 
-If the goal is to boot straight into VeilShell from SDDM / `greetd` with zero missing daily-driver shell features, tackle the remaining gaps in three focused milestones:
-
-### Milestone A — Standalone Boot Essentials (Must-Have Before Booting Directly Into VeilShell)
-1. **Touch Lock Screen (`ext-session-lock-v1`)** with PIN/password entry via the built-in OSK, `logind` lock/sleep hooks, and `--start-locked` flag.
-2. **Power Menu & Power Profiles** in `Shade` (Lock, Suspend, Reboot, Shutdown, Logout + `powerprofilesctl` profile cycle).
-3. **Notification Center & Toast Banners** (`org.freedesktop.Notifications` D-Bus listener, floating glass toasts, notification list + Clear All inside `Shade`, lockscreen redaction).
-4. **Standalone Session Entry & Packaging** (`/usr/share/wayland-sessions/veilshell.desktop`, session bootstrap script launching Hyprland + `veilshell --policy tablet`, `ext-idle-notify-v1` / idle lock defaults, Arch `PKGBUILD`).
-
-### Milestone B — Daily-Driver Tablet Polish (Full Denial Shell Parity)
-5. **Recents Carousel Scrolling + Swipe-Up-to-Close** (remove the 3-card cap so all open windows are accessible by touch).
-6. **MPRIS Media Player Card** inside `Shade` (Play/Pause, Next/Prev, track title/artist, progress bar).
-7. **Home App Search Bar**.
-8. **Hardware Button OSD Pill** (brief floating glass indicator for physical Volume ± and Brightness ± keys) + **Auto-Wallpaper Detection** for the GPU blur cache.
-
-### Milestone C — Power-User & Ecosystem Completeness
-9. **Inline Wi-Fi SSID & Bluetooth Device Picker Sheets** inside `Shade` (or one-tap launch into touch-sized overlay sheets).
-10. **OSK Ergonomics** (pressed-key feedback, hold-to-repeat Backspace/arrows, terminal utility row with `Esc`/`Tab`/arrows, long-press accents).
-11. **Per-App PipeWire Volume Mixer**, **Wallpaper-Derived Accent Fallback**, **Niri & Sway compositor backends**, and **CI frame-time / `< 40 MiB` RSS budget gates** for `v0.1.0`.
+To move beyond the preview, prioritize compositor-enforced touch unlock,
+reliable sleep and wake, essential touch workflows, and session-scoped
+services. The ordinary app keyboard is not used for lock credentials. Shared
+improvements to touch navigation and app input benefit both modes; fullscreen
+defaults and Desk Mode belong to the dedicated session. See the
+[standalone roadmap](ROADMAP.md#standalone-and-feature-follow-up) for progress.

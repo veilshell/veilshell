@@ -1,82 +1,84 @@
 # VeilShell
 
-**An ultra-lightweight, pure-Rust tablet & touch shell for Wayland.**
+**A lightweight, touch-first Wayland shell for Linux tablets.**
 
-VeilShell brings a fluid, touch-first tablet experience (bottom gesture pill,
-top quick-settings pull handle, paged `.desktop` home app grid, live recents
-window deck, swipe-down quick settings shade, and touch on-screen keyboard) to
-**any `wlr-layer-shell` Wayland compositor** without replacing your compositor,
-keybindings, or desktop workflow — engineered specifically for **older 5W /
-4–8 GB RAM x86 & ARM tablets** (starting with the Microsoft Surface Go 3).
+VeilShell adds gesture navigation, a paged app launcher, live Recents, Quick
+Settings, and an on-screen keyboard to a Linux desktop. It's built in Rust for
+older, fanless tablets, starting with the Microsoft Surface Go 3. The goal is
+one touch shell that works inside your existing desktop first and can later
+serve as the main interface in a dedicated tablet session.
 
-- **Distro-agnostic foundation:** Clean Rust trait boundaries keep core UI,
-  physics, rendering, and hardware adapters independent of any single Linux
-  distribution.
-- **Omarchy & Hyprland compatibility:** Laptop ↔ Tablet mode shows or hides
-  the overlay without rewriting the host compositor's monitor or layout
-  settings. Omarchy Aether `colors.toml` theme sync is read-only.
-- **Optional standalone login:** Select **VeilShell (Preview)** in SDDM to
-  start a separate Hyprland session, without replacing your usual desktop.
-- **Edge performance budget:** Event-driven `calloop` main loop (`0%` idle CPU
-  when dormant), single-pass `wgpu` Vulkan/GLES instanced WGSL SDF rendering
-  with zero-copy `Wayland` swapchains + blur-once GPU wallpaper glass cache,
-  lazy overlay surface allocation, and automatic zero-`unsafe` CPU SDF fallback.
-- **Automated visual & headless UX testing:** Built-in offscreen glassmorphic PNG
-  snapshots (`veilctl snapshot`) and a live Hyprland virtual-output + `grim`
-  visual harness so contributors and AI agents can visually verify UI changes
-  in seconds.
+## Two ways to run one shell
+
+- **Overlay — the `v0.1.0` goal.** Log into Hyprland as usual, with or without
+  Omarchy. VeilShell adds touch controls without taking over the compositor,
+  keybindings, or desktop services. Laptop Mode hides the shell without
+  rewriting host layout or monitor rules. No separate login is required.
+  Quick Settings actions you explicitly take still affect the device.
+- **Standalone — an opt-in preview.** A separate SDDM entry starts the same
+  VeilShell daemon in a dedicated Hyprland session. That session can own
+  policies like fullscreen apps on small screens and a keyboard-and-mouse Desk
+  Mode without changing the normal desktop. Those policies and touch-only
+  daily use are longer-term goals, not requirements for `v0.1.0`. The preview
+  still needs a physical keyboard for password unlock.
+
+**Compatibility today:** Hyprland is the only live compositor backend.
+Surface Go 3 + Hyprland is the first release validation target, not a claim of
+completed hardware testing. Omarchy integration is optional and reads the
+Aether theme without changing it. The overlay requires `wlr-layer-shell`, but
+that alone does not enable every feature. See the [adapter contract] for
+requirements, fallbacks, and how to add support for another environment.
+
+The [performance budget] sets targets for older 5W, 4–8 GB x86 and ARM
+tablets. VeilShell avoids redraws while hidden and has a software rendering
+fallback. Offscreen PNG snapshots and a nested Hyprland harness let
+contributors review UI changes without a tablet; real-device measurements
+are tracked separately.
+
+[adapter contract]: docs/PORTING_A_COMPOSITOR.md
+[performance budget]: docs/PERFORMANCE_BUDGET.md
 
 ## Workspace Layout
 
-| Crate | Purpose | Status |
-|---|---|---|
-| [`veilshell-core`](crates/veilshell-core) | Pure-Rust state machine, critically damped spring physics, gesture classifier, `.desktop` parser, orientation/rotation lock, WCAG theme primitives, multi-layer Touch OSK state & XKB keymap | Phase 3 (Done) |
-| [`veilshell-theme`](crates/veilshell-theme) | `ThemeProvider` trait + live Omarchy Aether `colors.toml` loader + WCAG AA dark fallback | Phase 0 (Done) |
-| [`veilshell-compositor`](crates/veilshell-compositor) | `CompositorBackend` trait + live Hyprland Unix-socket IPC (Lua `eval` + legacy `keyword` fallback, recency-sorted `j/clients` with `stableId`, `j/monitors`, workspace switch, app launch) + `MockBackend` | Phase 3 (Done) |
-| [`veilshell-render`](crates/veilshell-render) | Renderer-agnostic glassmorphic `DrawList` + `SceneOutput` hit-testing for all 5 scenes, `wgpu` Vulkan/GLES WGSL SDF backend with shelf-packed GPU glyph/icon/thumbnail atlas & blur-once wallpaper cache, CPU SDF fallback, `ab_glyph` TrueType typography (+ 5×7 HUD fallback), `ARGB8888` encoder, and `PNG` exporter | Phase 3 (Done) |
-| [`veilshell-wayland`](crates/veilshell-wayland) | Event-driven multi-surface `wlr-layer-shell` runtime, integer and fractional output scaling, zero-copy `wgpu::Surface` presentation + `wl_shm` fallback, Wayland OSK input and live Recents thumbnails, output pinning (`--output`), `wl_touch`/`wl_pointer` gestures | Phase 3 (Done) |
-| [`veilshell-hw`](crates/veilshell-hw) | `HardwareSnapshot`, `HardwareBackend` + `HardwareController` traits, pure zero-dep Linux `sysfs`/CLI telemetry (`LinuxHardware`, `SensorGuard`), DMI matcher, and declarative `hardware-profiles/*.toml` parser | Phase 2 (Done) |
-| [`veilshell-shell`](crates/veilshell-shell) | `ShellState` orchestration, XDG `.desktop` discovery and freedesktop PNG/SVG icons, `veilctl` Unix IPC socket, live hardware/theme watcher, `veilshell` daemon & `veilctl` CLI | Phase 3 (Done) |
+| Crate | Purpose |
+|---|---|
+| [`veilshell-core`](crates/veilshell-core) | Shell state, gestures, spring physics, `.desktop` parsing, and keyboard state |
+| [`veilshell-theme`](crates/veilshell-theme) | Theme adapter, Omarchy Aether reader, and built-in fallback |
+| [`veilshell-compositor`](crates/veilshell-compositor) | Compositor adapter trait, live Hyprland IPC, and test fixtures |
+| [`veilshell-render`](crates/veilshell-render) | Scene layout, hit-testing, GPU and software rendering, and PNG snapshots |
+| [`veilshell-wayland`](crates/veilshell-wayland) | Layer surfaces, scaling, Wayland input and keyboard, and Recents capture |
+| [`veilshell-hw`](crates/veilshell-hw) | Linux hardware telemetry, controls, and device profiles |
+| [`veilshell-shell`](crates/veilshell-shell) | Daemon, `veilctl` CLI and IPC, app discovery, and adapter wiring |
+| [`veilshell-lock-input`](crates/veilshell-lock-input) | Separate touch-lock input prototype; not used by the preview |
 
 Distro integration glue lives under [`adapters/`](adapters/omarchy/README.md),
 and device quirk profiles live under [`hardware-profiles/`](hardware-profiles/microsoft-surface-go-3.toml).
 
 ## Quick Start
 
-Requires Rust `1.86+` (`cargo`, `rustfmt`, `clippy`).
+Requires Rust `1.86+`. From a terminal in your existing Hyprland session:
 
 ```bash
-# Run Tier 1 unit tests & lints
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+# Show the gesture pill and top handle
+cargo run -p veilshell-shell --bin veilshell -- --policy tablet
+```
 
-# Inspect active theme (Omarchy Aether colors.toml when present), live hardware, compositor, & apps
-cargo run -p veilshell-shell --bin veilctl -- status
-cargo run -p veilshell-shell --bin veilctl -- hw
-cargo run -p veilshell-shell --bin veilctl -- theme
-cargo run -p veilshell-shell --bin veilctl -- apps
+On a device with a supported detachable keyboard, start with `--policy auto`
+instead to show the shell when the keyboard detaches and hide it on reattach.
 
-# Generate Tier 2 offscreen glassmorphic PNG snapshots (landscape + portrait)
-./scripts/test-snapshots.sh /tmp/veilshell-snapshots
+In a second terminal, use `cargo run -p veilshell-shell --bin veilctl -- status`
+to inspect the session. Replace `status` with any of the commands below, or
+run `veilctl` directly if it's on your `PATH`:
 
-# Launch the adaptive daemon (--policy auto hides in Laptop Mode & wakes on keyboard detach)
-cargo run -p veilshell-shell --bin veilshell -- --policy auto
-# Or force visible tablet UI for testing (--scene pill|home|recents|shade|osk)
-cargo run -p veilshell-shell --bin veilshell -- --policy tablet --scene pill
-
-# Control the running daemon via veilctl Unix socket IPC
+```bash
 veilctl show home        # Open paged .desktop app launcher
 veilctl show recents     # Open the window deck (tap to focus, swipe up on a card to close)
 veilctl show shade       # Open Quick Settings shade
 veilctl show osk         # Open multi-layer Touch OSK (auto-opens on text focus in Tablet Mode)
 veilctl show pill        # Dismiss overlays back to the bottom gesture pill
-veilctl mode toggle      # Toggle Laptop (hidden / 0% CPU) <-> Tablet Mode
+veilctl mode toggle      # Toggle Laptop (hidden) <-> Tablet Mode
 veilctl reload-theme     # Hot-reload Aether colors.toml
 veilctl quit             # Stop the daemon cleanly
-
-# Capture a private nested Hyprland at 100%, 150%, and 200% (requires a Wayland parent)
-./scripts/test-headless-hyprland.sh /tmp/veilshell-hypr-test
 ```
 
 In the on-screen keyboard, tap **TERM** for Escape, Tab and the arrow keys.
@@ -100,13 +102,14 @@ requires a physical keyboard for password unlock.
 ## Documentation
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — Crate boundaries, `calloop` multi-surface runtime, and verification pyramid
-- [docs/ROADMAP.md](docs/ROADMAP.md) — Full project plan, resolved architectural decisions, and phased milestones
-- [docs/DENIAL_COMPARISON.md](docs/DENIAL_COMPARISON.md) — Feature parity audit vs. Denial (`denialwm/denial`) & standalone boot-session checklist
-- [docs/DENIAL_PARITY_SPEC.md](docs/DENIAL_PARITY_SPEC.md) — Pinned upstream visual reference, implementation gaps, and SDDM acceptance gates
+- [docs/ROADMAP.md](docs/ROADMAP.md) — `v0.1.0` overlay release gates, standalone goals, and development history
+- [docs/DENIAL_COMPARISON.md](docs/DENIAL_COMPARISON.md) — Touch UX reference and feature inventory, not a release checklist
+- [docs/DENIAL_PARITY_SPEC.md](docs/DENIAL_PARITY_SPEC.md) — Pinned interaction and visual reference, and standalone acceptance gates
+- [docs/DENIAL_VALIDATION.md](docs/DENIAL_VALIDATION.md) — Test evidence and its limits
 - [docs/PERFORMANCE_BUDGET.md](docs/PERFORMANCE_BUDGET.md) — Hard CPU, RAM, and frame-time budgets on 5W tablets
 - [docs/HARDWARE_PROFILES.md](docs/HARDWARE_PROFILES.md) — Adding declarative TOML profiles for new tablets
-- [docs/PORTING_A_COMPOSITOR.md](docs/PORTING_A_COMPOSITOR.md) — Implementing `CompositorBackend` for Niri, Sway, River, etc.
-- [CONTRIBUTING.md](CONTRIBUTING.md) — Development workflow, visual verification, and good first issues
+- [docs/PORTING_A_COMPOSITOR.md](docs/PORTING_A_COMPOSITOR.md) — Compatibility contract and contributor guide for new environments
+- [CONTRIBUTING.md](CONTRIBUTING.md) — Tests, snapshot and nested compositor harnesses, and good first issues
 
 ## Acknowledgments & License
 

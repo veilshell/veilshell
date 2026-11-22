@@ -1,6 +1,9 @@
 # VeilShell Architecture
 
-VeilShell is organized as a modular Rust workspace with strict boundary separation so core shell logic stays portable across Linux distributions, Wayland compositors, and tablet hardware.
+VeilShell shares the same shell logic, scenes, and renderers between the
+desktop overlay and the standalone preview. Compositor, theme, hardware, and
+session integration stay outside the core so a port can change one layer
+without rewriting the touch UI.
 
 ```
                    +-----------------------+
@@ -22,19 +25,29 @@ VeilShell is organized as a modular Rust workspace with strict boundary separati
 - **`veilshell-theme`**: `ThemeProvider` trait. Reads Omarchy Aether `colors.toml` via `OmarchyAetherProvider` when present, falling back to a built-in WCAG AA dark palette on any other distro.
 - **`veilshell-hw`**: `HardwareBackend` and `HardwareController` traits, `HardwareSnapshot`, DMI auto-matching (`detect_dmi_device`, `load_matching_profile`) over user/built-in `hardware-profiles/*.toml`, pure Linux `sysfs` readers (filtering peripheral `scope=Device` stylus batteries from system batteries and matching USB Type Cover IDs), standard CLI backends (`nmcli`, `bluetoothctl`, `wpctl`, `brightnessctl`, the session's `hyprsunset`), and `SensorGuard` wrapping `monitor-sensor --accel` with clean child reaping on drop.
 - **`veilshell-render`**: Renderer-agnostic glassmorphic `DrawList` + interactive hit-test regions (`SceneOutput`) for all 5 scenes (`pill`, `home`, `recents`, `shade`, `osk`) and `TopStrip`, single-pass instanced `wgpu` Vulkan/GLES WGSL SDF backend (`WgpuRenderer`) with a shelf-packed GPU glyph/icon/thumbnail atlas and blur-once GPU static wallpaper frosted-glass cache, cached-backdrop CPU analytic SDF fallback (`SdfSoftwareRenderer`), `ActiveRenderer` (`auto`/`wgpu`/`software`), `ab_glyph` system TrueType typography (with built-in 5×7 HUD fallback), SDF-clipped `RgbaImage`/`ImageQuad` support, premultiplied `ARGB8888` encoder, and `PNG` snapshot export.
-- **`veilshell-wayland`**: Event-driven `calloop` + `WaylandSource` runtime wrapping `smithay-client-toolkit 0.21` (`wlr-layer-shell`). Manages `BottomPill`, `TopStrip`, `TouchOsk`, and reused full-screen `Overlay` surfaces (dropping the bottom pill cleanly when `TouchOsk` is active) with zero-copy `wgpu::Surface` Vulkan/GLES swapchains (isolated in a single `raw-window-handle` bridge with automatic `wl_shm` `SlotPool` fallback, supporting `initial_visible: false` sleep in Laptop Mode for `0%` idle CPU and syncing logical dimensions on `wl_output`/configure rotation), drives built-in Touch OSK text input & auto-show via `zwp_input_method_v2` + `zwp_virtual_keyboard_v1`, captures live Recents window thumbnails via `ext-foreign-toplevel-list-v1` + `ext-image-copy-capture-v1`, binds optionally to a named `wl_output` (`--output`), and routes `wl_touch`/`wl_pointer` gestures and hit-tests back via `ShellActionHandler`.
+- **`veilshell-wayland`**: Event-driven `calloop` + `WaylandSource` runtime using `smithay-client-toolkit` and layer-shell. Owns `BottomPill`, `TopStrip`, `TouchOsk`, and a reused fullscreen `Overlay`, with no surface redraws in Laptop Mode. Presents via `wgpu::Surface` with a `wl_shm` software fallback. Handles output scaling, touch and pointer input, and optional app-keyboard and Recents capture protocols.
 - **`veilshell-shell`**: Finds `.desktop` entries and freedesktop PNG/SVG icons in XDG data directories, runs the Unix control listener (`show`, `status`, `wallpaper`, `mode`, `reload-theme`, `quit`), polls USB Type Cover presence and `sysfs`, and ships the `veilshell` daemon and `veilctl` CLI.
+- **`veilshell-lock-input`**: Isolated [touch-lock input prototype](TOUCH_LOCK.md), not connected to the daemon or used by the preview locker.
 
 ## Session boundary
 
 The overlay follows the host output's scale without changing monitor rules.
-Scene layout and input use logical coordinates; the renderers use
-physical-pixel buffers. The standalone adapter publishes its own Wayland and
-Hyprland endpoints in a private runtime directory. Only a matching session may
-apply compositor layout and sensor-driven rotation or expose session power
-actions. The overlay reads Omarchy's theme; standalone uses the built-in
-palette. Explicit radio, brightness, and volume controls are still shared
-with the host system.
+Laptop Mode hides VeilShell rather than changing compositor policy. The host
+desktop keeps its bindings, layout, and services. The overlay can read
+Omarchy's theme; explicit radio, brightness, and volume controls still affect
+the device.
+
+The standalone adapter starts the same daemon and publishes separate Wayland
+and Hyprland endpoints in a private runtime directory. Only a matching
+standalone session may apply compositor layout and sensor-driven rotation or
+expose session power actions. The preview uses the built-in palette and
+delegates locking to Hyprlock. Future fullscreen defaults and a
+keyboard-and-mouse Desk Mode belong to this session, not to shared UI code.
+
+Scene layout and input use logical coordinates in both modes; the renderers
+use physical-pixel buffers. Use the [adapter contract](PORTING_A_COMPOSITOR.md)
+to add compositor and service support without making either mode depend on
+a distribution.
 
 ## Gesture transitions
 

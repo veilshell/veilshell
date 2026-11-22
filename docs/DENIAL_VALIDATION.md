@@ -87,6 +87,11 @@ afterward. Omarchy coexistence still needs its own login regression test.
 
 ## Integration gates
 
+Use the [first release checklist](ROADMAP.md#first-release) for overlay
+sign-off. The SDDM, lock, sleep, and fresh-session service checks below apply
+to standalone. Performance testing matters for both; record each mode
+separately.
+
 - Boot the unmodified optional SDDM entry and return to the greeter on logout
   or startup failure. Test with both accelerated and software-only graphics.
 - Keep the lock active through failed authentication, locker failure, and

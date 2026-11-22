@@ -1,22 +1,63 @@
 # VeilShell — Project Plan & Roadmap
 
-> **VeilShell** (`veilshell` / `veilctl`) is a distro-agnostic, ultra-lightweight, pure-Rust tablet & touch shell for Wayland — engineered for edge performance on older 4–8 GB / 5W x86 & ARM tablets while offering first-class, zero-interference compatibility with **Omarchy** and **Hyprland**.
+Build one touch-first shell for older Linux tablets. Ship it first as a
+dependable overlay, then reuse it as the main interface in a dedicated
+tablet session. VeilShell does not replace the Wayland compositor in either
+mode.
 
 ## Core Principles
 
-1. **Foundation First, Adapters Second:** Core crates have zero distro lock-in (Arch, Omarchy, Fedora, Debian, NixOS, postmarketOS). Distro-specific integration (`adapters/omarchy/`) and device quirks (`hardware-profiles/`) stay cleanly separated.
-2. **Zero Interference with Desktop Mode:** Runs as a live Laptop ↔ Tablet mode toggle (auto-switching on `SW_TABLET_MODE` or detachable keyboard unplug) *or* as an optional standalone SDDM session. In Laptop Mode, VeilShell hides all surfaces and sleeps cleanly on `calloop` (`0%` CPU / `0` active redraws).
-3. **Edge Performance on Older Hardware:** Reference test device is a fanless 5W dual-core tablet (**Microsoft Surface Go 3**, `i3-10100Y`, Intel UHD 615, `1920×1280@60Hz`, `7.7 GiB` RAM).
-4. **Contributor- & Agent-Verifiable from Day 1:** Every UI surface renders deterministically offscreen to PNG snapshots (`veilctl snapshot`) and runs on live `wlr-layer-shell` surfaces in Hyprland (`scripts/test-headless-hyprland.sh`) so both human contributors and AI agents can inspect visual changes without physical tablet hardware.
+1. **One shell, separate session policies.** Share gestures, Home, Recents,
+   Quick Settings, the app keyboard, and rendering. The overlay leaves host
+   layout, monitor rules, and services alone. A dedicated session can choose
+   its own window defaults and integrate its own services.
+2. **Portable core, capability-based adapters.** Adapt to the active
+   compositor, Wayland protocols, system services, and hardware, not to distro
+   names. Keep packaging and optional desktop integration separate. See the
+   [adapter contract](PORTING_A_COMPOSITOR.md).
+3. **Older hardware comes first.** The Surface Go 3 is the reference device,
+   not the minimum spec. Treat the [performance budget](PERFORMANCE_BUDGET.md)
+   as measurable targets, not claimed results.
+4. **Contributors can verify changes without a tablet.** Use unit tests,
+   offscreen snapshots, and a private nested compositor. Use real hardware
+   for touch latency, sensors, suspend/resume, and performance claims.
+5. **Use Denial as a touch UX reference.** Use its mobile flows for comparison,
+   adapting them to VeilShell's performance and session boundaries. Neither
+   visual parity nor feature parity defines a release.
+
+## First release
+
+`v0.1.0` will ship a dependable **Hyprland overlay**. The initial validation
+target is **Surface Go 3 + Hyprland**, with Omarchy as an optional
+integration. Don't infer support for other distro, kernel, or compositor
+versions from that target.
+
+- [ ] Verify touch navigation, app launch, Recents focus and close, Quick
+  Settings, and in-app text entry in portrait and landscape on the reference
+  tablet.
+- [ ] Verify Laptop ↔ Tablet transitions, including Type Cover attach/detach
+  on the reference tablet. Confirm hidden surfaces stop redrawing and mode
+  changes leave the host's monitor rules and layout unchanged.
+- [ ] Measure the [performance budget](PERFORMANCE_BUDGET.md) on the reference
+  tablet and record results, including hidden CPU/wakeups, active RSS, frame
+  times, startup, and mode switching.
+- [ ] Document an install and smoke-test path for the release environment,
+  record the tested distro, kernel, and compositor versions, and list known
+  limitations. Run the nested overlay harness and document the contributor
+  path for testing new environments.
+
+The SDDM preview may ship alongside the overlay. Touch-only unlock,
+standalone sleep/wake sign-off, Desk Mode, and additional compositor ports
+are not `v0.1.0` release gates.
 
 ## Resolved Architectural Decisions
 
 - **Organization & Repository:** Hosted under the dedicated **`github.com/veilshell`** organization (`https://github.com/veilshell/veilshell`) to welcome community maintainers and future companion repos.
-- **License & Clean-Room Policy:** **`GPL-3.0-or-later`** (matching `denialwm/denial`), written from scratch in pure Rust with `#![forbid(unsafe_code)]` across 6 of 7 workspace crates (and `unsafe_code = "deny"` in `veilshell-wayland` permitting only a single isolated `raw-window-handle` `wgpu::Surface` bridge) and explicit upstream attribution in [NOTICE.md](../NOTICE.md).
+- **License & Clean-Room Policy:** **`GPL-3.0-or-later`** (matching `denialwm/denial`), written from scratch in Rust with `#![forbid(unsafe_code)]` outside `veilshell-wayland`, which permits one isolated `raw-window-handle` `wgpu::Surface` bridge. Upstream inspirations are credited in [NOTICE.md](../NOTICE.md).
 - **Renderer Architecture:** Shared renderer-agnostic glassmorphic `DrawList` + hit-test `SceneOutput` (`veilshell-render`), backed by both a hardware-accelerated `wgpu` Vulkan/GLES WGSL instanced SDF renderer (`WgpuRenderer`, zero-copy `wgpu::Surface` Wayland presentation + blur-once GPU static wallpaper glass cache) and a zero-`unsafe` CPU analytic SDF fallback (`SdfSoftwareRenderer`), selectable via `--renderer auto|wgpu|software` with automated GPU-vs-CPU pixel-parity tests.
 - **Minimum Supported Rust Version:** `1.86+` (aligned with `smithay-client-toolkit 0.21`).
 
-## Phased Roadmap
+## Implementation history
 
 ### Phase 0 — Foundation & Dev Harness (Complete)
 - [x] Modular 7-crate Cargo workspace (`veilshell-core`, `veilshell-compositor`, `veilshell-hw`, `veilshell-theme`, `veilshell-wayland`, `veilshell-render`, `veilshell-shell`)
@@ -60,9 +101,16 @@
 - [x] System TrueType/OpenType fonts (with 5×7 HUD fallback) and freedesktop PNG/SVG app icons. Wayland surfaces render at the compositor's integer or fractional output scale without changing its settings.
 - [x] Live window thumbnails in the Recents Deck via `ext-foreign-toplevel-list-v1` + `ext-image-copy-capture-v1` (with `wl_shm` format conversion & premultiplied area-box downscaling)
 
-### Phase 4 — Packaging, Multi-Compositor Ports & `v0.1.0` Release
+## Standalone and feature follow-up
 
-#### Sprint 4A — Standalone SDDM session, lock and power
+The long-term standalone goal is a touch-only daily driver with its own
+session policy: fullscreen defaults for small screens, a keyboard-and-mouse
+Desk Mode, and touch access to essential desktop services. Reuse the overlay's
+UI and keep these policies behind the dedicated session boundary. Standalone
+Desk Mode is a layout choice inside that session, not the overlay's Laptop
+Mode, which simply hides VeilShell.
+
+### Standalone SDDM session, lock and power
 
 - [x] [Preview SDDM entry](../adapters/session/README.md), dedicated Hyprland config, session-scoped daemon and launcher lifecycle tests. Keep the greeter, autologin, and existing desktop configuration unchanged.
 - [x] Preview-only touch power menu with Lock, Suspend, Logout, Restart and Shut down. Confirm session-ending actions and refuse touch Suspend without compositor lock acknowledgment.
@@ -72,10 +120,11 @@
 - [x] SDDM guest login and touch logout smoke test with a guest-only software override.
 - [x] Verify stock SDDM login and normal logout with automatic software fallback in the Virtio guest.
 - [ ] Native Denial-style lock face: wallpaper, clock/date, swipe-up touch authentication, password fallback, PIN and optional fingerprint. Require compositor-enforced locking.
-- [ ] Session-scoped desktop services: autostart, polkit prompts, file picker, and screen-sharing portals.
-- [ ] Arch Linux / AUR `PKGBUILD` (`packaging/arch/PKGBUILD`).
+- [x] Optional session-scoped XDG autostart helper with an explicit allowlist.
+- [ ] Finish session-scoped desktop services, including polkit prompts, notifications, and file-picker and screen-sharing portals.
+- [ ] Define and test standalone window defaults and Desk Mode without changing the overlay or normal desktop.
 
-#### Sprint 4B — Day-to-day tablet parity
+### Shared tablet experience
 
 - [x] Finger-following Home and Quick Settings reveals with reversible drags and spring settling, plus interactive Home paging.
 - [x] Responsive control center: Connectivity, Display & Sound, and Device sections, compacting to the available controls and using both columns in landscape.
@@ -86,14 +135,20 @@
 - [ ] Keyboard long-press accents and optional local suggestions that are disabled for sensitive fields.
 - [ ] Editable Home: reorder icons, create folders, persist layout, share a dock across pages, and open a separate alphabetical app drawer. Desktop launcher adds search, recents and physical-keyboard navigation.
 
-#### Sprint 4C — External displays
+### External displays
 
 - [ ] Give the built-in touchscreen and external monitor separate mobile and desktop roles. Move windows between outputs from Recents; verify hotplug recovery.
 - [ ] Optional Input Deck: use the built-in touchscreen as a keyboard and relative touchpad while an external display is active.
 
-#### Release follow-up
+### Portability follow-up
 
-- See the [Denial parity reference](DENIAL_PARITY_SPEC.md) for upstream behavior and UI metrics and the [validation protocol](DENIAL_VALIDATION.md) for matched capture and release gates.
-- [ ] Additional compositor backends (`Niri`, `Sway`) & community `hardware-profiles/*.toml`
-- [ ] Tier 3 frame-time & RSS performance budget assertions in CI
-- [ ] First tagged **`v0.1.0`** release
+- [ ] Replace the live mock fallback with an explicit unavailable backend and expose capability-based fallbacks in the UI.
+- [ ] Add a read-only `veilctl doctor` to report protocol, compositor, and service capabilities and why features are unavailable.
+- [ ] Verify the adapter contract with a second live compositor (e.g. Niri or Sway) before considering a stable external plugin API.
+- [ ] Arch Linux / AUR `PKGBUILD` (`packaging/arch/PKGBUILD`).
+- [ ] Expand package smoke tests and community hardware profiles based on recorded test results.
+- [ ] Add frame-time and RSS assertions where the test environment supports repeatable measurements.
+
+See the [Denial reference](DENIAL_PARITY_SPEC.md) for upstream behavior and
+standalone acceptance criteria, and the [validation record](DENIAL_VALIDATION.md)
+for test evidence.

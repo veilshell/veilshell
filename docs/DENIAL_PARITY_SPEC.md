@@ -1,9 +1,10 @@
 # Denial parity reference
 
 Reference: [Denial at `01b588e`](https://github.com/denialwm/denial/tree/01b588ec50831bce9e57aed623901f49846ec791).
-This is a source-derived reference, not a claim of visual or functional parity.
-VeilShell reimplements the behavior in Rust and uses Hyprland for compositor
-responsibilities; it does not need Denial's binaries, Flutter engine, or artwork.
+This is a source-derived interaction and visual reference, not a claim of
+parity or a release checklist. VeilShell implements its touch UI in Rust and
+uses Hyprland for compositor responsibilities. It does not need Denial's
+binaries, Flutter engine, or artwork.
 
 ## Which Denial UI to match
 
@@ -57,6 +58,9 @@ specific surfaces; do not substitute application colors for the shell palette.
   exact fonts, shadows, and reversible gesture motion remain parity work.
 
 ## SDDM acceptance gates
+
+These criteria apply to moving the standalone session beyond preview, not
+to the [`v0.1.0` overlay release](ROADMAP.md#first-release).
 
 Denial [ships a Wayland session entry], not a greeter theme. Following its
 [startup contract], an authenticated SDDM login should launch VeilShell

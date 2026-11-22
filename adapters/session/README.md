@@ -2,8 +2,10 @@
 
 This adapter adds an optional **VeilShell (Preview)** entry to SDDM. SDDM
 authenticates the user; it is not a greeter theme and **does not support
-autologin**. The adapter uses a dedicated Hyprland Lua config and starts VeilShell
-in tablet mode. It does not load the user's normal Hyprland or Omarchy config,
+autologin**. The adapter uses a dedicated Hyprland Lua config and starts the
+same VeilShell daemon used by the overlay, in Tablet Mode. You do not need
+this entry to run the [overlay](../../README.md#two-ways-to-run-one-shell).
+The preview does not load the user's normal Hyprland or Omarchy config,
 start global user targets, or publish over another desktop's activation
 environment. The daemon uses its built-in palette rather than syncing
 Omarchy's theme, and it does not invoke Omarchy's Night Light or notification
@@ -45,8 +47,9 @@ still depend on the distribution's logind/polkit permissions.
 the display off after another 30 seconds, and requests locking before system
 sleep. It requests a logind delay until Hyprland signals lock; logind's finite
 delay is not a hard guarantee against resuming unlocked if startup fails. There
-is no automatic suspend timer. Native touch unlock, portal activation, a
-polkit agent, autostart, and a real SDDM login/wake hardware test are still
+is no automatic suspend timer. An [opt-in autostart helper](AUTOSTART.md) can
+launch explicitly allowed entries. Native touch unlock, portal activation, a
+polkit agent, and SDDM login and wake tests on real hardware are still
 required before calling this a daily-driver session.
 
 Test it by logging **out** of Omarchy and choosing **VeilShell (Preview)** at
