@@ -22,6 +22,9 @@ done
 "$VEILCTL" snapshot --demo --scene home --width 390 --height 518 --out "$OUT_DIR/home-compact.png"
 "$VEILCTL" snapshot --demo --scene shade --power-menu --width 390 --height 518 --out "$OUT_DIR/power-compact.png"
 "$VEILCTL" snapshot --demo --scene osk --terminal-osk --width 390 --height 172 --out "$OUT_DIR/osk-terminal-compact.png"
+"$VEILCTL" snapshot --demo --scene home --progress 0.55 --out "$OUT_DIR/home-pull.png"
+"$VEILCTL" snapshot --demo --scene home --home-position 0.5 --width 390 --height 518 --out "$OUT_DIR/home-page-drag.png"
+"$VEILCTL" snapshot --demo --scene shade --progress 0.55 --out "$OUT_DIR/shade-pull.png"
 
 echo "All Tier 2 snapshots generated in $OUT_DIR"
 ls -lh "$OUT_DIR"

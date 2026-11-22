@@ -430,6 +430,29 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
         load_best_available()
     };
     let mut ctx = SceneContext::default();
+    if let Some(raw) = parse_flag(args, "--progress") {
+        let Ok(progress) = raw.parse::<f32>() else {
+            eprintln!("invalid --progress '{raw}'");
+            return ExitCode::FAILURE;
+        };
+        if !(0.0..=1.0).contains(&progress) || !matches!(scene, SceneKind::Home | SceneKind::Shade)
+        {
+            eprintln!("--progress requires a value in 0..=1 and a Home or Shade snapshot");
+            return ExitCode::FAILURE;
+        }
+        ctx.overlay_progress = progress;
+    }
+    if let Some(raw) = parse_flag(args, "--home-position") {
+        let Ok(position) = raw.parse::<f32>() else {
+            eprintln!("invalid --home-position '{raw}'");
+            return ExitCode::FAILURE;
+        };
+        if !position.is_finite() || position < 0.0 || scene != SceneKind::Home {
+            eprintln!("--home-position requires a nonnegative page position and a Home snapshot");
+            return ExitCode::FAILURE;
+        }
+        ctx.home_position = Some(position);
+    }
     if power_menu {
         ctx.power_menu = Some(veilshell_render::power::PowerMenu::Actions);
     }
@@ -520,6 +543,8 @@ fn print_help() {
          \t  --scene <pill|home|recents|shade|osk> --renderer <auto|wgpu|software> [--wallpaper <PNG>]\n\
          \t  --width <PX> --height <PX> --out <PATH> [--demo]\n\
          \t  --power-menu | --terminal-osk    Preview a demo subview (shade or osk)\n\
+         \t  --progress <0..1>                Home or Shade reveal progress\n\
+         \t  --home-position <PAGE>           Fractional position in the Home pager\n\
          \thelp                              Print this help message",
         env!("CARGO_PKG_VERSION")
     );

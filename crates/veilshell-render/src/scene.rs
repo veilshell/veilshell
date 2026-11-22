@@ -59,6 +59,8 @@ pub struct SceneContext {
     pub home_apps: Vec<AppTile>,
     /// Active 0-based page index inside `Home`.
     pub home_page: usize,
+    /// Fractional page position while the pager is being dragged or settling.
+    pub home_position: Option<f32>,
     /// Open windows shown in the `Recents` deck.
     pub recents_cards: Vec<RecentsCard>,
     /// Multi-layer touch keyboard state and modifier latches.
@@ -85,6 +87,7 @@ impl Default for SceneContext {
             overlay_progress: 1.0,
             home_apps: default_demo_apps(),
             home_page: 0,
+            home_position: None,
             recents_cards: vec![
                 RecentsCard {
                     id: "0x1".into(),
@@ -148,6 +151,22 @@ pub fn default_demo_apps() -> Vec<AppTile> {
 #[must_use]
 pub fn home_page_count(apps: &[AppTile], width: f32, height: f32) -> usize {
     HomeGrid::new(width, height).page_count(apps.len())
+}
+
+/// Logical travel shared by the gesture and the Home layout.
+#[must_use]
+pub fn home_reveal_travel(height: f32) -> f32 {
+    (height * 0.42).clamp(120.0, 360.0)
+}
+
+fn shade_panel_height(height: f32) -> f32 {
+    (height * 0.62).clamp(440.0, 476.0)
+}
+
+/// Move the shade until its bottom edge is just outside the top of the output.
+#[must_use]
+pub fn shade_reveal_travel(height: f32) -> f32 {
+    shade_panel_height(height) + 32.0
 }
 
 const HOME_FOREGROUND: Rgba = Rgba::from_rgb_u8(247, 247, 248);
@@ -446,7 +465,7 @@ fn build_home(
     ctx: &SceneContext,
 ) {
     let progress = ctx.overlay_progress.clamp(0.0, 1.0);
-    let y_slide = (1.0 - progress) * 24.0;
+    let y_slide = (1.0 - progress) * home_reveal_travel(height);
     // A plain dark fallback also keeps the launcher legible over active windows.
     // The GPU backdrop may substitute the configured, cached wallpaper.
     let wallpaper_tint = HOME_BACKGROUND.with_alpha(progress);
@@ -462,14 +481,69 @@ fn build_home(
     let grid = HomeGrid::new(width, height);
     let total_pages = grid.page_count(apps.len());
     let page = ctx.home_page.min(total_pages - 1);
+    let position = ctx
+        .home_position
+        .unwrap_or(page as f32)
+        .clamp(-0.2, (total_pages - 1) as f32 + 0.2);
+    let first = position.floor() as usize;
+    let last = (position.ceil() as usize).min(total_pages - 1);
+    for visible_page in first..=last {
+        push_home_page(out, &grid, ctx, visible_page, width, position, y_slide);
+    }
+    if apps.is_empty() {
+        out.draw_list.push_text(
+            width * 0.5,
+            height * 0.5 + y_slide,
+            "No applications found",
+            1,
+            fg,
+            TextAlign::Center,
+        );
+    } else if total_pages > 1 {
+        push_home_pager(
+            out,
+            width,
+            grid.pager_y() + y_slide,
+            position,
+            total_pages,
+            progress,
+        );
+    }
+    push_bottom_pill_bar(&mut out.draw_list, width, height, palette, ctx);
+    if progress < 1.0 || ctx.home_position.is_some() {
+        out.hit_regions.clear();
+    }
+}
+
+fn push_home_page(
+    out: &mut SceneOutput,
+    grid: &HomeGrid,
+    ctx: &SceneContext,
+    page: usize,
+    width: f32,
+    position: f32,
+    y_slide: f32,
+) {
+    let progress = ctx.overlay_progress.clamp(0.0, 1.0);
+    let fg = HOME_FOREGROUND.with_alpha(progress);
+    let x_slide = (page as f32 - position) * width;
     let start = page * grid.capacity();
     let icon_box = 92.0_f32.min(grid.cell_w).min(grid.cell_h * 0.73);
     let icon_size = 85.0_f32.min(icon_box);
 
-    for (slot, app) in apps.iter().skip(start).take(grid.capacity()).enumerate() {
+    for (slot, app) in ctx
+        .home_apps
+        .iter()
+        .skip(start)
+        .take(grid.capacity())
+        .enumerate()
+    {
         let col = slot % grid.columns;
         let row = slot / grid.columns;
-        let x = grid.inset + col as f32 * (grid.cell_w + HOME_GRID_GAP);
+        let x = grid.inset + col as f32 * (grid.cell_w + HOME_GRID_GAP) + x_slide;
+        if x >= width || x + grid.cell_w <= 0.0 {
+            continue;
+        }
         let y = grid.row_y(row) + y_slide;
         let cx = x + grid.cell_w * 0.5;
         let cy = y + icon_box * 0.5;
@@ -528,19 +602,6 @@ fn build_home(
             },
         );
     }
-    if apps.is_empty() {
-        out.draw_list.push_text(
-            width * 0.5,
-            height * 0.5,
-            "No applications found",
-            1,
-            fg,
-            TextAlign::Center,
-        );
-    } else if total_pages > 1 {
-        push_home_pager(out, width, grid.pager_y(), page, total_pages, progress);
-    }
-    push_bottom_pill_bar(&mut out.draw_list, width, height, palette, ctx);
 }
 
 fn push_home_status(list: &mut DrawList, width: f32, height: f32, ctx: &SceneContext, fg: Rgba) {
@@ -562,16 +623,21 @@ fn push_home_pager(
     out: &mut SceneOutput,
     width: f32,
     cy: f32,
-    page: usize,
+    position: f32,
     total: usize,
     progress: f32,
 ) {
     // Keep the current page visible when the catalog outgrows the indicator.
     let dots = total.min(((width - 13.0) / 15.0) as usize).min(9);
-    let first = page.saturating_sub(dots / 2).min(total - dots);
+    let position = position.clamp(0.0, (total - 1) as f32);
+    let first = (position.round() as usize)
+        .saturating_sub(dots / 2)
+        .min(total - dots);
     let mut x = (width - (15.0 * dots as f32 + 13.0)) * 0.5;
     for p in first..first + dots {
-        let (w, alpha) = if p == page { (20.0, 0.87) } else { (7.0, 0.33) };
+        let weight = (1.0 - (position - p as f32).abs()).max(0.0);
+        let w = 7.0 + 13.0 * weight;
+        let alpha = 0.33 + 0.54 * weight;
         out.draw_list.push_rect(RoundedRect::filled(
             x + 4.0,
             cy - 3.5,
@@ -847,9 +913,9 @@ fn build_shade(
     );
 
     let panel_w = (width * 0.62).clamp(360.0, 680.0);
-    let panel_h = (height * 0.62).clamp(440.0, 476.0);
+    let panel_h = shade_panel_height(height);
     let panel_x = (width - panel_w) * 0.5;
-    let panel_y = 32.0 - (1.0 - progress) * (panel_h * 0.5);
+    let panel_y = 32.0 - (1.0 - progress) * shade_reveal_travel(height);
 
     out.draw_list.push_rect(
         RoundedRect::filled(
@@ -1000,6 +1066,9 @@ fn build_shade(
     ));
 
     push_bottom_pill_bar(&mut out.draw_list, width, height, palette, ctx);
+    if progress < 1.0 {
+        out.hit_regions.clear();
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

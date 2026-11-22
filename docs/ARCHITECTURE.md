@@ -25,6 +25,15 @@ VeilShell is organized as a modular Rust workspace with strict boundary separati
 - **`veilshell-wayland`**: Event-driven `calloop` + `WaylandSource` runtime wrapping `smithay-client-toolkit 0.21` (`wlr-layer-shell`). Manages `BottomPill`, `TopStrip`, `TouchOsk`, and reused full-screen `Overlay` surfaces (dropping the bottom pill cleanly when `TouchOsk` is active) with zero-copy `wgpu::Surface` Vulkan/GLES swapchains (isolated in a single `raw-window-handle` bridge with automatic `wl_shm` `SlotPool` fallback, supporting `initial_visible: false` sleep in Laptop Mode for `0%` idle CPU and syncing logical dimensions on `wl_output`/configure rotation), drives built-in Touch OSK text input & auto-show via `zwp_input_method_v2` + `zwp_virtual_keyboard_v1`, captures live Recents window thumbnails via `ext-foreign-toplevel-list-v1` + `ext-image-copy-capture-v1`, binds optionally to a named `wl_output` (`--output`), and routes `wl_touch`/`wl_pointer` gestures and hit-tests back via `ShellActionHandler`.
 - **`veilshell-shell`**: Discovers system/user `.desktop` applications and resolves freedesktop `PNG` app icons (`resolve_icon_path`, `load_app_icon`), runs the `$XDG_RUNTIME_DIR/veilshell.sock` Unix control listener (`show`, `status`, `wallpaper`, `mode`, `reload-theme`, `quit`), polls USB Type Cover presence, `sysfs` battery/backlight, and `colors.toml` mtime on a 1.5s lightweight watcher alongside `SensorGuard`, and ships `veilshell` (`--policy auto|laptop|tablet`, `--renderer auto|wgpu|software`, `--wallpaper`) + `veilctl` (`status`, `hw`, `show`, `mode`, `wallpaper`, `reload-theme`, `apps`, `theme`, `snapshot`).
 
+## Gesture transitions
+
+Home and Quick Settings share gesture travel distances between the Wayland
+runtime and scene layout. While a finger holds the overlay, motion updates its
+position directly. On release it springs from that position; during a Home
+page swipe only the adjacent pages are drawn. The runtime keeps the touch
+origin mapped through the pull and coalesces overlay updates with Wayland frame
+callbacks. Tiles and sliders are not actionable while their overlay is moving.
+
 ## Automated Verification Pyramid
 
 1. **Tier 1 (`cargo test --workspace`)**: Pure logic, `.desktop` parsing & icon path resolution, Touch OSK state & evdev keymap validation, Hyprland IPC JSON parsing (`stableId` + sorting), hit-testing precedence across all scenes & OSK layers, Linux hardware CLI/sysfs parser & profile matching tests, theme parsing, `ab_glyph` TrueType + `RgbaImage` SHM conversion/resize tests, `SdfSoftwareRenderer` PNG tests, and `wgpu` vs CPU pixel-parity (including icons, thumbnails & TrueType glyphs) + blur-once wallpaper tests (**52 passing tests**, verified with default `wgpu` and `--no-default-features`).

@@ -81,6 +81,12 @@ veilctl quit             # Stop the daemon cleanly
 In the on-screen keyboard, tap **TERM** for Escape, Tab and the arrow keys.
 Hold Backspace or an arrow to repeat.
 
+Swipe up from the bottom pill to pull Home into view, or swipe down from the
+top handle to pull in Quick Settings. Reverse a short pull to cancel. Swipe
+down on Home or up on Quick Settings to close. Swipe across Home to slide to
+another app page, or swipe up again from Home's bottom edge to open Recents.
+A horizontal swipe on the bottom pill still changes workspaces.
+
 For Omarchy users, optional instant theme-hook (`adapters/omarchy/hooks/30-veilshell-theme`)
 and `systemd --user` (`adapters/omarchy/systemd/veilshell.service`) integration guides live in [`adapters/omarchy/README.md`](adapters/omarchy/README.md).
 For SDDM, see the [standalone session preview](adapters/session/README.md).

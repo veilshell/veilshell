@@ -34,13 +34,15 @@ use veilshell_core::{
 };
 use veilshell_render::power::{PowerAction, PowerInput, PowerMenu};
 use veilshell_render::{
-    build_scene, build_scene_layout, build_top_strip_scene, ActiveRenderer, DrawList, HitTarget,
-    SceneContext, SceneKind, SceneOutput, WallpaperImage,
+    build_scene, build_scene_layout, build_top_strip_scene, home_page_count, home_reveal_travel,
+    shade_reveal_travel, ActiveRenderer, DrawList, HitTarget, SceneContext, SceneKind, SceneOutput,
+    WallpaperImage,
 };
 
 use crate::capture::ToplevelCaptureState;
 #[cfg(feature = "wgpu")]
 use crate::gpu::WgpuWaylandSurface;
+use crate::motion::{horizontal, vertical, DragMotion, DragVelocity};
 use crate::osk::{OskRepeat, OskWaylandState};
 use crate::{LayerRole, LayerSurfaceSpec, WaylandRuntimeConfig};
 
@@ -176,8 +178,11 @@ struct ActiveDrag {
     start_y: f32,
     last_x: f32,
     last_y: f32,
+    overlay_tap_allowed: bool,
     active_slider: Option<(&'static str, veilshell_render::HitRect)>,
     osk_repeat: Option<OskRepeat>,
+    motion: Option<DragMotion>,
+    velocity: DragVelocity,
     start_time: Instant,
 }
 
@@ -191,6 +196,8 @@ struct ManagedSurface {
     width: u32,
     height: u32,
     configured: bool,
+    frame_pending: bool,
+    redraw_pending: bool,
 }
 
 impl ManagedSurface {
@@ -276,6 +283,8 @@ impl ManagedSurface {
             width: spec.width,
             height: spec.height,
             configured: false,
+            frame_pending: false,
+            redraw_pending: false,
         })
     }
 
@@ -286,9 +295,9 @@ impl ManagedSurface {
         renderer: &mut ActiveRenderer,
         list: &DrawList,
         request_frame_callback: bool,
-    ) {
+    ) -> bool {
         if !self.configured || self.width == 0 || self.height == 0 {
-            return;
+            return false;
         }
 
         #[cfg(feature = "wgpu")]
@@ -304,7 +313,7 @@ impl ManagedSurface {
                 qh,
                 request_frame_callback,
             ) {
-                Ok(()) => return,
+                Ok(()) => return true,
                 Err(err) => {
                     eprintln!(
                         "veilshell: wgpu present failed ({err}); falling back to wl_shm for this surface"
@@ -316,7 +325,10 @@ impl ManagedSurface {
 
         match renderer.rasterize(self.width, self.height, list) {
             Ok(frame) => self.commit_shm_frame(qh, shm, &frame, request_frame_callback),
-            Err(err) => eprintln!("veilshell: rasterize failed: {err}"),
+            Err(err) => {
+                eprintln!("veilshell: rasterize failed: {err}");
+                false
+            }
         }
     }
 
@@ -326,9 +338,9 @@ impl ManagedSurface {
         shm: &Shm,
         frame: &veilshell_render::RenderFrame,
         request_frame_callback: bool,
-    ) {
+    ) -> bool {
         if !self.configured || self.width == 0 || self.height == 0 {
-            return;
+            return false;
         }
         if self.pool.is_none() {
             let initial_bytes = (self.width as usize) * (self.height as usize) * 4;
@@ -336,12 +348,12 @@ impl ManagedSurface {
                 Ok(pool) => self.pool = Some(pool),
                 Err(err) => {
                     eprintln!("veilshell: lazy shm slot pool failed: {err}");
-                    return;
+                    return false;
                 }
             }
         }
         let Some(pool) = self.pool.as_mut() else {
-            return;
+            return false;
         };
 
         let argb = frame.to_argb8888_premultiplied();
@@ -358,7 +370,7 @@ impl ManagedSurface {
                     "veilshell: shm create_buffer({}x{}) failed: {err}",
                     self.width, self.height
                 );
-                return;
+                return false;
             }
         };
 
@@ -372,13 +384,15 @@ impl ManagedSurface {
             i32::try_from(self.width).unwrap_or(1),
             i32::try_from(self.height).unwrap_or(1),
         );
+        if let Err(err) = buffer.attach_to(surface) {
+            eprintln!("veilshell: buffer.attach_to failed: {err}");
+            return false;
+        }
         if request_frame_callback {
             surface.frame(qh, FrameCallbackData(surface.clone()));
         }
-        match buffer.attach_to(surface) {
-            Ok(()) => surface.commit(),
-            Err(err) => eprintln!("veilshell: buffer.attach_to failed: {err}"),
-        }
+        surface.commit();
+        true
     }
 }
 
@@ -401,6 +415,8 @@ pub(crate) struct LayerApp {
     overlay: Option<ManagedSurface>,
     overlay_layout: Option<SceneOutput>,
     overlay_spring: Spring,
+    home_spring: Option<Spring>,
+    refresh_after_open: bool,
     last_anim_tick: Instant,
     palette: ThemePalette,
     pub(crate) renderer: ActiveRenderer,
@@ -445,7 +461,14 @@ impl LayerApp {
                 }
             }
         } else {
-            self.top_strip = None;
+            // Destroying the origin of the pull would cancel the Wayland grab.
+            if !self
+                .drag
+                .as_ref()
+                .is_some_and(|drag| drag.surface == SurfaceKind::TopStrip)
+            {
+                self.top_strip = None;
+            }
             if self.overlay.is_none() {
                 let role = LayerRole::from_scene(self.active_scene);
                 match ManagedSurface::create(self, role) {
@@ -457,6 +480,23 @@ impl LayerApp {
     }
 
     pub(crate) fn show_scene(&mut self, scene: SceneKind, animate: bool) {
+        self.drag = None;
+        if animate && scene == SceneKind::Pill && self.has_gesture_overlay() {
+            self.overlay_spring.set_target(0.0);
+            self.overlay_spring.velocity = 0.0;
+            self.last_anim_tick = Instant::now();
+            self.update_overlay_after_motion();
+            return;
+        }
+        let progress = if scene == SceneKind::Pill { 0.0 } else { 1.0 };
+        let mut spring = Spring::new(progress, SpringParams::snappy());
+        if animate && scene != SceneKind::Pill && scene != self.active_scene {
+            spring.value = 0.0;
+        }
+        self.show_scene_at(scene, spring, true);
+    }
+
+    fn show_scene_at(&mut self, scene: SceneKind, spring: Spring, refresh: bool) {
         if scene != self.active_scene {
             self.cancel_osk_drag();
         }
@@ -469,10 +509,12 @@ impl LayerApp {
         }
         if scene != SceneKind::Pill {
             self.visible = true;
-            self.handler.on_action(
-                ShellAction::RequestRefresh(scene),
-                self.renderer.context_mut(),
-            );
+            if refresh {
+                self.handler.on_action(
+                    ShellAction::RequestRefresh(scene),
+                    self.renderer.context_mut(),
+                );
+            }
             if scene == SceneKind::Recents {
                 self.capture.apply_cached_and_capture(
                     &mut self.renderer.context_mut().recents_cards,
@@ -489,20 +531,10 @@ impl LayerApp {
         self.renderer.context_mut().pill_drag_y = 0.0;
         self.renderer.context_mut().top_drag_y = 0.0;
 
-        if scene == SceneKind::Pill {
-            self.overlay_spring = Spring::new(0.0, SpringParams::snappy());
-            self.renderer.context_mut().overlay_progress = 0.0;
-        } else if animate && changed {
-            self.overlay_spring = Spring::new(0.25, SpringParams::snappy());
-            self.overlay_spring.set_target(1.0);
-            self.last_anim_tick = Instant::now();
-            self.renderer.context_mut().overlay_progress = 0.25;
-        } else {
-            let mut settled = Spring::new(1.0, SpringParams::snappy());
-            settled.set_target(1.0);
-            self.overlay_spring = settled;
-            self.renderer.context_mut().overlay_progress = 1.0;
-        }
+        self.overlay_spring = spring;
+        self.home_spring = None;
+        self.last_anim_tick = Instant::now();
+        self.refresh_after_open = !refresh;
 
         // Only recreate the overlay LayerSurface when geometry role changes (TouchOsk vs full-screen).
         if changed && scene != SceneKind::Pill {
@@ -513,6 +545,10 @@ impl LayerApp {
         }
 
         self.sync_surfaces();
+        if scene != SceneKind::Pill && self.overlay.is_none() {
+            self.show_scene(SceneKind::Pill, false);
+            return;
+        }
         self.draw_pill();
         self.draw_top_strip();
         self.draw_overlay();
@@ -521,7 +557,9 @@ impl LayerApp {
     fn set_visible(&mut self, visible: bool) {
         self.visible = visible;
         if !visible {
-            self.cancel_osk_drag();
+            self.drag = None;
+            self.home_spring = None;
+            self.refresh_after_open = false;
             self.active_scene = SceneKind::Pill;
         }
         self.sync_surfaces();
@@ -571,20 +609,18 @@ impl LayerApp {
         if !surf.configured || surf.width == 0 || surf.height == 0 {
             return;
         }
+        if surf.frame_pending {
+            surf.redraw_pending = true;
+            return;
+        }
         if self.active_scene == SceneKind::Home {
             let ctx = self.renderer.context_mut();
-            let total = veilshell_render::home_page_count(
-                &ctx.home_apps,
-                surf.width as f32,
-                surf.height as f32,
-            );
+            let total = home_page_count(&ctx.home_apps, surf.width as f32, surf.height as f32);
             ctx.home_page = ctx.home_page.min(total - 1);
         }
-        self.renderer.context_mut().overlay_progress = if self.overlay_spring.is_settled() {
-            1.0
-        } else {
-            self.overlay_spring.value.clamp(0.0, 1.0)
-        };
+        let ctx = self.renderer.context_mut();
+        ctx.overlay_progress = self.overlay_spring.value.clamp(0.0, 1.0);
+        ctx.home_position = self.home_spring.map(|spring| spring.value);
         let layout = build_scene_layout(
             self.active_scene,
             surf.width as f32,
@@ -592,15 +628,19 @@ impl LayerApp {
             &self.palette,
             self.renderer.context(),
         );
-        let animating = !self.overlay_spring.is_settled();
-        surf.present_draw_list(
+        let animating = !self.overlay_spring.is_settled()
+            || self.home_spring.is_some()
+            || self.drag.as_ref().is_some_and(|drag| drag.motion.is_some());
+        if surf.present_draw_list(
             &self.qh,
             &self.shm,
             &mut self.renderer,
             &layout.draw_list,
             animating,
-        );
-        self.overlay_layout = Some(layout);
+        ) {
+            surf.frame_pending = animating;
+            self.overlay_layout = Some(layout);
+        }
     }
 
     fn surface_kind(&self, surface: &wl_surface::WlSurface) -> Option<SurfaceKind> {
@@ -705,8 +745,9 @@ impl LayerApp {
     }
 
     fn begin_drag(&mut self, touch_id: Option<i32>, kind: SurfaceKind, x: f32, y: f32) {
+        let overlay_tap_allowed = kind == SurfaceKind::Overlay && self.overlay_input_ready();
         let mut active_slider = None;
-        if kind == SurfaceKind::Overlay && self.active_scene == SceneKind::Shade {
+        if overlay_tap_allowed && self.active_scene == SceneKind::Shade {
             if let Some(layout) = &self.overlay_layout {
                 if let Some(HitTarget::ShadeSlider { id, rect }) = layout.hit_test(x, y) {
                     active_slider = Some((*id, *rect));
@@ -746,10 +787,216 @@ impl LayerApp {
             start_y: y,
             last_x: x,
             last_y: y,
+            overlay_tap_allowed,
             active_slider,
             osk_repeat,
+            motion: None,
+            velocity: DragVelocity::new(now, x, y),
             start_time: now,
         });
+    }
+
+    fn overlay_size(&self) -> (f32, f32) {
+        self.overlay
+            .as_ref()
+            .map_or((self.viewport_w as f32, self.viewport_h as f32), |surf| {
+                (surf.width as f32, surf.height as f32)
+            })
+    }
+
+    fn home_pages(&self) -> usize {
+        let (w, h) = self.overlay_size();
+        home_page_count(&self.renderer.context().home_apps, w, h)
+    }
+
+    fn has_gesture_overlay(&self) -> bool {
+        self.active_scene == SceneKind::Home
+            || (self.active_scene == SceneKind::Shade
+                && self
+                    .renderer
+                    .context()
+                    .power_menu
+                    .is_none_or(|state| state == PowerMenu::Closed))
+    }
+
+    fn overlay_input_ready(&self) -> bool {
+        self.overlay_spring.is_settled()
+            && self.overlay_spring.target >= 1.0
+            && self.home_spring.is_none()
+    }
+
+    fn start_interactive_motion(
+        &self,
+        surface: SurfaceKind,
+        start_y: f32,
+        dx: f32,
+        dy: f32,
+    ) -> Option<(DragMotion, Option<SceneKind>)> {
+        let (w, h) = self.overlay_size();
+        if vertical(dx, dy) {
+            match (surface, self.active_scene) {
+                (SurfaceKind::Pill, SceneKind::Pill) if dy < 0.0 => {
+                    return Some((
+                        DragMotion::reveal(0.0, home_reveal_travel(h), -1.0, true),
+                        Some(SceneKind::Home),
+                    ))
+                }
+                (SurfaceKind::TopStrip, SceneKind::Pill) if dy > 0.0 => {
+                    return Some((
+                        DragMotion::reveal(0.0, shade_reveal_travel(h), 1.0, true),
+                        Some(SceneKind::Shade),
+                    ))
+                }
+                _ => {}
+            }
+        }
+        // Keep bottom-edge workspace/Recents gestures separate from content drags.
+        if surface != SurfaceKind::Overlay || start_y >= h - 52.0 || !self.has_gesture_overlay() {
+            return None;
+        }
+        let progress = self.overlay_spring.value.clamp(0.0, 1.0);
+        let closing = self.overlay_spring.target <= 0.0;
+        if vertical(dx, dy) && self.home_spring.is_none() {
+            let (travel, sign) = if self.active_scene == SceneKind::Home {
+                (home_reveal_travel(h), -1.0)
+            } else {
+                (shade_reveal_travel(h), 1.0)
+            };
+            if dy * sign < 0.0 || !self.overlay_spring.is_settled() {
+                return Some((DragMotion::reveal(progress, travel, sign, closing), None));
+            }
+        }
+        if self.active_scene == SceneKind::Home
+            && self.overlay_spring.is_settled()
+            && progress >= 1.0
+            && horizontal(dx, dy)
+            && self.home_pages() > 1
+        {
+            let from = self
+                .home_spring
+                .map_or(self.renderer.context().home_page as f32, |s| s.value);
+            return Some((
+                DragMotion::HomePage {
+                    from,
+                    width: w.max(1.0),
+                },
+                None,
+            ));
+        }
+        None
+    }
+
+    fn update_interactive_drag(&mut self, dx: f32, dy: f32) -> bool {
+        let Some(drag) = &self.drag else {
+            return false;
+        };
+        if drag.active_slider.is_some() {
+            return false;
+        }
+        let Some((motion, opening)) = drag
+            .motion
+            .map(|m| (m, None))
+            .or_else(|| self.start_interactive_motion(drag.surface, drag.start_y, dx, dy))
+        else {
+            return false;
+        };
+        if let Some(drag) = &mut self.drag {
+            drag.motion = Some(motion);
+        }
+        let position = motion.position(dx, dy, self.home_pages());
+        let ctx = self.renderer.context_mut();
+        ctx.pill_drag_x = 0.0;
+        ctx.pill_drag_y = 0.0;
+        ctx.top_drag_y = 0.0;
+        match motion {
+            DragMotion::Reveal { .. } => {
+                let spring = Spring::new(position, SpringParams::snappy());
+                if let Some(scene) = opening {
+                    self.show_scene_at(scene, spring, false);
+                    return true;
+                }
+                self.overlay_spring = spring;
+            }
+            DragMotion::HomePage { .. } => {
+                self.home_spring = Some(Spring::new(position, SpringParams::gentle()));
+            }
+        }
+        self.draw_overlay();
+        true
+    }
+
+    fn settle_interactive_drag(&mut self, motion: DragMotion, velocity: Option<(f32, f32)>) {
+        let value = match motion {
+            DragMotion::Reveal { .. } => self.overlay_spring.value,
+            DragMotion::HomePage { from, .. } => {
+                self.home_spring.map_or(from, |spring| spring.value)
+            }
+        };
+        let pages = self.home_pages();
+        let spring = velocity.map_or_else(
+            || motion.cancel(value, pages),
+            |speed| motion.release(value, speed, pages),
+        );
+        match motion {
+            DragMotion::Reveal { .. } => self.overlay_spring = spring,
+            DragMotion::HomePage { .. } => {
+                self.home_spring = Some(spring);
+                let page = spring.target as usize;
+                if self.renderer.context().home_page != page {
+                    self.renderer.context_mut().home_page = page;
+                    self.handler.on_action(
+                        ShellAction::HomePageChanged(page),
+                        self.renderer.context_mut(),
+                    );
+                }
+            }
+        }
+        self.last_anim_tick = Instant::now();
+        self.update_overlay_after_motion();
+    }
+
+    fn update_overlay_after_motion(&mut self) {
+        if self.drag.as_ref().is_none_or(|drag| drag.motion.is_none()) {
+            if self.home_spring.is_some_and(|spring| spring.is_settled()) {
+                self.home_spring = None;
+            }
+            if self.overlay_spring.is_settled() {
+                if self.overlay_spring.target <= 0.0 && self.active_scene != SceneKind::Pill {
+                    self.show_scene(SceneKind::Pill, false);
+                    return;
+                }
+                if std::mem::take(&mut self.refresh_after_open) {
+                    self.handler.on_action(
+                        ShellAction::RequestRefresh(self.active_scene),
+                        self.renderer.context_mut(),
+                    );
+                }
+                if self.active_scene != SceneKind::Pill
+                    && !self
+                        .drag
+                        .as_ref()
+                        .is_some_and(|drag| drag.surface == SurfaceKind::TopStrip)
+                {
+                    self.top_strip = None;
+                }
+            }
+        }
+        self.draw_overlay();
+    }
+
+    fn abort_drag(&mut self) {
+        let motion = self.drag.take().and_then(|drag| drag.motion);
+        let ctx = self.renderer.context_mut();
+        ctx.pill_drag_x = 0.0;
+        ctx.pill_drag_y = 0.0;
+        ctx.top_drag_y = 0.0;
+        self.draw_pill();
+        self.draw_top_strip();
+        if let Some(motion) = motion {
+            self.settle_interactive_drag(motion, None);
+        } else {
+            self.draw_overlay();
+        }
     }
 
     fn update_drag(&mut self, touch_id: Option<i32>, x: f32, y: f32) {
@@ -761,9 +1008,17 @@ impl LayerApp {
         }
         drag.last_x = x;
         drag.last_y = y;
+        drag.velocity.push(Instant::now(), x, y);
         if let Some(repeat) = &mut drag.osk_repeat {
             repeat.position(x, y);
         }
+        let (dx, dy) = (x - drag.start_x, y - drag.start_y);
+        if self.update_interactive_drag(dx, dy) {
+            return;
+        }
+        let Some(drag) = &self.drag else {
+            return;
+        };
 
         match drag.surface {
             SurfaceKind::Pill => {
@@ -805,6 +1060,10 @@ impl LayerApp {
         self.renderer.context_mut().pill_drag_x = 0.0;
         self.renderer.context_mut().pill_drag_y = 0.0;
         self.renderer.context_mut().top_drag_y = 0.0;
+        if let Some(motion) = drag.motion {
+            self.settle_interactive_drag(motion, Some(drag.velocity.at_release(Instant::now())));
+            return;
+        }
 
         let elapsed = drag.start_time.elapsed().as_secs_f32().max(0.016);
         let dx = drag.last_x - drag.start_x;
@@ -815,6 +1074,10 @@ impl LayerApp {
 
         match drag.surface {
             SurfaceKind::Pill => {
+                if self.active_scene == SceneKind::Pill && vertical(dx, dy) {
+                    self.draw_pill();
+                    return;
+                }
                 let sample = GestureSample {
                     dx,
                     dy,
@@ -825,12 +1088,7 @@ impl LayerApp {
                 };
                 match classify_bottom_pill(sample, GestureThresholds::default()) {
                     GestureAction::Home => {
-                        let target = if self.active_scene == SceneKind::Home {
-                            SceneKind::Pill
-                        } else {
-                            SceneKind::Home
-                        };
-                        self.show_scene(target, true);
+                        self.show_scene(SceneKind::Home, true);
                     }
                     GestureAction::Recents => self.show_scene(SceneKind::Recents, true),
                     GestureAction::SwitchNext => {
@@ -862,7 +1120,7 @@ impl LayerApp {
                 }
             }
             SurfaceKind::TopStrip => {
-                if dy >= 20.0 || vy >= 250.0 || dist < 16.0 {
+                if dist < 10.0 {
                     self.show_scene(SceneKind::Shade, true);
                 } else {
                     self.draw_top_strip();
@@ -880,7 +1138,10 @@ impl LayerApp {
                         self.show_scene(SceneKind::Pill, false);
                         return;
                     }
-                    if dist < 24.0 && !drag.osk_repeat.is_some_and(|repeat| repeat.fired) {
+                    if drag.overlay_tap_allowed
+                        && dist < 24.0
+                        && !drag.osk_repeat.is_some_and(|repeat| repeat.fired)
+                    {
                         self.handle_overlay_tap(drag.last_x, drag.last_y);
                     } else {
                         self.draw_overlay();
@@ -900,7 +1161,10 @@ impl LayerApp {
                     };
                     match classify_bottom_pill(sample, GestureThresholds::default()) {
                         GestureAction::Home | GestureAction::Recents => {
-                            let next = if dy < -70.0 && vy < -450.0 {
+                            let next = if self.active_scene != SceneKind::Home
+                                && dy < -70.0
+                                && vy < -450.0
+                            {
                                 SceneKind::Pill
                             } else {
                                 SceneKind::Recents
@@ -928,38 +1192,14 @@ impl LayerApp {
                     }
                 }
 
-                // Horizontal swipe on Home flips pages
-                if self.active_scene == SceneKind::Home && dx.abs() >= 72.0 && dx.abs() > dy.abs() {
-                    let Some(surf) = &self.overlay else {
-                        return;
-                    };
-                    let total = veilshell_render::home_page_count(
-                        &self.renderer.context().home_apps,
-                        surf.width as f32,
-                        surf.height as f32,
-                    );
-                    if dx < 0.0 && self.renderer.context().home_page + 1 < total {
-                        self.renderer.context_mut().home_page += 1;
-                    } else if dx > 0.0 && self.renderer.context().home_page > 0 {
-                        self.renderer.context_mut().home_page -= 1;
-                    }
-                    let page = self.renderer.context().home_page;
-                    self.handler.on_action(
-                        ShellAction::HomePageChanged(page),
-                        self.renderer.context_mut(),
-                    );
-                    self.draw_overlay();
-                    return;
-                }
-
                 // Upward flick closes open overlay back to the active app
-                if dy <= -72.0 && vy <= -350.0 {
+                if !self.has_gesture_overlay() && dy <= -72.0 && vy <= -350.0 {
                     self.show_scene(SceneKind::Pill, false);
                     return;
                 }
 
                 // Short tap -> hit-test UI targets
-                if dist < 18.0 {
+                if drag.overlay_tap_allowed && dist < 18.0 {
                     self.handle_overlay_tap(drag.last_x, drag.last_y);
                 } else {
                     self.draw_overlay();
@@ -969,6 +1209,9 @@ impl LayerApp {
     }
 
     fn handle_overlay_tap(&mut self, x: f32, y: f32) {
+        if !self.overlay_input_ready() {
+            return;
+        }
         let target = self
             .overlay_layout
             .as_ref()
@@ -982,7 +1225,7 @@ impl LayerApp {
 
         match hit {
             HitTarget::DismissOverlay | HitTarget::BottomPill => {
-                self.show_scene(SceneKind::Pill, false);
+                self.show_scene(SceneKind::Pill, true);
             }
             HitTarget::LaunchApp { index } => {
                 if let Some(app) = self.renderer.context().home_apps.get(index) {
@@ -1201,6 +1444,8 @@ pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
         overlay: None,
         overlay_layout: None,
         overlay_spring: settled_spring,
+        home_spring: None,
+        refresh_after_open: false,
         last_anim_tick: Instant::now(),
         palette,
         renderer,
@@ -1334,17 +1579,27 @@ impl CompositorHandler for LayerApp {
         surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
-        if self.surface_kind(surface) == Some(SurfaceKind::Overlay)
-            && !self.overlay_spring.is_settled()
-        {
-            let dt = self
-                .last_anim_tick
-                .elapsed()
-                .as_secs_f32()
-                .clamp(0.001, 0.16);
-            self.last_anim_tick = Instant::now();
+        if self.surface_kind(surface) != Some(SurfaceKind::Overlay) {
+            return;
+        }
+        let Some(surf) = &mut self.overlay else {
+            return;
+        };
+        surf.frame_pending = false;
+        let dirty = std::mem::take(&mut surf.redraw_pending);
+        let held = self.drag.as_ref().is_some_and(|drag| drag.motion.is_some());
+        let settling = !held && (!self.overlay_spring.is_settled() || self.home_spring.is_some());
+        if settling {
+            let now = Instant::now();
+            let dt = now.duration_since(self.last_anim_tick).as_secs_f32();
+            self.last_anim_tick = now;
             self.overlay_spring.step(dt);
-            self.draw_overlay();
+            if let Some(spring) = &mut self.home_spring {
+                spring.step(dt);
+            }
+        }
+        if settling || dirty {
+            self.update_overlay_after_motion();
         }
     }
 
@@ -1440,12 +1695,15 @@ impl LayerShellHandler for LayerApp {
         };
         let mut new_w = None;
         let mut new_h = None;
+        let mut resized = false;
         if let Some(target) = surf {
             if configure.new_size.0 > 0 {
+                resized |= target.configured && target.width != configure.new_size.0;
                 target.width = configure.new_size.0;
                 new_w = Some(target.width);
             }
             if configure.new_size.1 > 0 {
+                resized |= target.configured && target.height != configure.new_size.1;
                 target.height = configure.new_size.1;
                 new_h = Some(target.height);
             }
@@ -1469,7 +1727,11 @@ impl LayerShellHandler for LayerApp {
                         self.viewport_h = h;
                     }
                 }
-                self.draw_overlay();
+                if resized && self.drag.as_ref().is_some_and(|drag| drag.motion.is_some()) {
+                    self.abort_drag();
+                } else {
+                    self.draw_overlay();
+                }
             }
         }
     }
@@ -1516,7 +1778,7 @@ impl SeatHandler for LayerApp {
                 .as_ref()
                 .is_some_and(|drag| drag.touch_id.is_none())
             {
-                self.cancel_osk_drag();
+                self.abort_drag();
             }
             if let Some(pointer) = self.pointer.take() {
                 pointer.release();
@@ -1528,7 +1790,7 @@ impl SeatHandler for LayerApp {
                 .as_ref()
                 .is_some_and(|drag| drag.touch_id.is_some())
             {
-                self.cancel_osk_drag();
+                self.abort_drag();
             }
             if let Some(touch) = self.touch.take() {
                 touch.release();
@@ -1563,9 +1825,17 @@ impl PointerHandler for LayerApp {
                     if self
                         .drag
                         .as_ref()
-                        .is_some_and(|drag| drag.touch_id.is_none()) =>
+                        .is_some_and(|drag| drag.touch_id.is_none() && drag.surface == kind) =>
                 {
-                    self.cancel_osk_drag();
+                    // The compositor may offer focus to our new overlay, but the
+                    // grab that started on the handle ends only at release.
+                    if !self
+                        .drag
+                        .as_ref()
+                        .is_some_and(|drag| drag.motion.is_some() && kind != SurfaceKind::Overlay)
+                    {
+                        self.abort_drag();
+                    }
                 }
                 _ => {}
             }
@@ -1638,13 +1908,7 @@ impl TouchHandler for LayerApp {
     }
 
     fn cancel(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _touch: &wl_touch::WlTouch) {
-        self.drag = None;
-        self.renderer.context_mut().pill_drag_x = 0.0;
-        self.renderer.context_mut().pill_drag_y = 0.0;
-        self.renderer.context_mut().top_drag_y = 0.0;
-        self.draw_pill();
-        self.draw_top_strip();
-        self.draw_overlay();
+        self.abort_drag();
     }
 }
 

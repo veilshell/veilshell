@@ -4,6 +4,7 @@ mod capture;
 pub mod client;
 #[cfg(feature = "wgpu")]
 mod gpu;
+mod motion;
 mod osk;
 
 pub use client::{

@@ -24,7 +24,7 @@ pub use primitives::{
 };
 pub use scene::{
     build_scene, build_scene_layout, build_top_strip_scene, default_demo_apps, home_page_count,
-    AppTile, RecentsCard, SceneContext,
+    home_reveal_travel, shade_reveal_travel, AppTile, RecentsCard, SceneContext,
 };
 pub use software::SdfSoftwareRenderer;
 
@@ -721,6 +721,69 @@ mod tests {
         assert!(scene.draw_list.commands.iter().any(
             |command| matches!(command, DrawCommand::Text(label) if label.text == "No applications found")
         ));
+    }
+
+    #[test]
+    fn home_swipe_draws_adjacent_pages_and_moves_icons_without_exposing_actions() {
+        let mut ctx = SceneContext::default();
+        let theme = ThemePalette::default_dark();
+        let build =
+            |ctx: &SceneContext| build_scene_layout(SceneKind::Home, 390.0, 518.0, &theme, ctx);
+        let labels = |scene: &SceneOutput, name: &str| {
+            scene.draw_list.commands.iter().find_map(|cmd| match cmd {
+                DrawCommand::Text(label) if label.text == name => Some((label.x, label.y)),
+                _ => None,
+            })
+        };
+        let starting = build(&ctx);
+        let browser = labels(&starting, "Browser").unwrap();
+        ctx.home_position = Some(0.1);
+        let moving = build(&ctx);
+        assert!((labels(&moving, "Browser").unwrap().0 - (browser.0 - 39.0)).abs() < 0.01);
+        assert_eq!(moving.hit_regions, []);
+
+        ctx.home_position = Some(0.5);
+        let middle = build(&ctx);
+        assert!(
+            labels(&middle, "Files").is_some(),
+            "outgoing page still visible"
+        );
+        assert!(
+            labels(&middle, "Photos").is_some(),
+            "incoming page slides into view"
+        );
+
+        ctx.home_position = None;
+        ctx.overlay_progress = 0.5;
+        let reveal = build(&ctx);
+        let y = labels(&reveal, "Browser").unwrap().1;
+        assert!((y - browser.1 - home_reveal_travel(518.0) * 0.5).abs() < 0.01);
+        assert_eq!(reveal.hit_regions, []);
+    }
+
+    #[test]
+    fn shade_panel_bottom_follows_the_pull() {
+        let theme = ThemePalette::default_dark();
+        let height = 853.0;
+        let travel = shade_reveal_travel(height);
+        for distance in [50.0, 120.0, 230.0] {
+            let ctx = SceneContext {
+                overlay_progress: distance / travel,
+                ..SceneContext::default()
+            };
+            let shade = build_scene_layout(SceneKind::Shade, 1280.0, height, &theme, &ctx);
+            let panel = shade
+                .draw_list
+                .commands
+                .iter()
+                .find_map(|cmd| match cmd {
+                    DrawCommand::Rect(rect) => Some(rect),
+                    _ => None,
+                })
+                .unwrap();
+            assert!((panel.y + panel.h - distance).abs() < 0.01);
+            assert_eq!(shade.hit_regions, []);
+        }
     }
 
     #[test]

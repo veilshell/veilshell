@@ -32,7 +32,7 @@ using the [parity spec](DENIAL_PARITY_SPEC.md).
 
 | Feature | Denial | VeilShell Status | Current VeilShell Implementation / Gap Notes |
 |---|---|---|---|
-| Bottom gesture pill & swipe navigation | Built-in touch/trackpad gestures & spring animations | **Done** | Critically damped springs (`veilshell-core::spring`), bottom pill flick/swipe gestures (`Home`, `Recents`, adjacent workspace), top pull handle for `Shade`. |
+| Bottom gesture pill & swipe navigation | Built-in touch/trackpad gestures & spring animations | **Partial** | Home and Shade follow the pull and spring to either endpoint. Home pages track horizontal drags; bottom-edge swipes still reach Recents and adjacent workspaces. Denial's liquid pill deformation and shared window motion remain open. |
 | Home application launcher | Mobile paged Home with editable slots and a separate all-apps drawer | **Partial** | Responsive paged `.desktop` grid with freedesktop `PNG` icons and a badge fallback. No editable layout, folders, widgets, or separate drawer. |
 | App search / instant filter | Search in the desktop launcher | **Missing** | VeilShell requires browsing pages to find an app. A search surface should accept both physical keyboard and touch input. |
 | Live Recents / Window Overview | Live Wayland surfaces inside overview | **Partial** | Captures live thumbnails via `ext-foreign-toplevel-list-v1` + `ext-image-copy-capture-v1` with tap-to-focus & `X`-to-close, **but** currently caps visible cards at `3` (`scene.rs`) without horizontal carousel scrolling or swipe-up-to-close gesture. |

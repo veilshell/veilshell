@@ -73,6 +73,7 @@
 
 #### Sprint 4B — Day-to-day tablet parity
 
+- [x] Finger-following Home and Quick Settings reveals with reversible drags and spring settling, plus interactive Home paging.
 - [ ] Fullscreen split shade: edge of pull selects page; horizontal swipe switches Notifications and Quick Settings. Add actionable notification banners, history, dismissal, Do Not Disturb, and lock-screen privacy.
 - [x] Keyboard hold-to-repeat for Backspace and arrows, and a terminal utility row with Escape, Tab and all four arrows.
 - [ ] Keyboard long-press accents and optional local suggestions that are disabled for sensitive fields.
