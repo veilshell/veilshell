@@ -131,12 +131,7 @@ impl WgpuRenderer {
     /// Returns [`RenderError::Gpu`] if no compatible GPU adapter or device can be created.
     #[allow(clippy::too_many_lines)]
     pub fn with_context(context: SceneContext) -> Result<Self, RenderError> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
-            ..Default::default()
-        });
-
-        let adapter = request_best_adapter(&instance)?;
+        let (instance, adapter) = create_instance_and_adapter()?;
         let info = adapter.get_info();
         let adapter_summary = format!("{} ({:?}, {:?})", info.name, info.backend, info.device_type);
 
@@ -886,6 +881,45 @@ impl RendererBackend for WgpuRenderer {
         }
         let list = build_scene(spec.scene, w as f32, h as f32, palette, &self.context);
         self.rasterize(w, h, &list)
+    }
+}
+
+fn create_instance_and_adapter() -> Result<(wgpu::Instance, wgpu::Adapter), RenderError> {
+    if let Some(env_backends) = wgpu::Backends::from_env().filter(|b| !b.is_empty()) {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: env_backends,
+            ..Default::default()
+        });
+        let adapter = request_best_adapter(&instance)?;
+        return Ok((instance, adapter));
+    }
+
+    // Initialize Vulkan first without touching GL: initializing `wgpu::Backends::GL` eagerly
+    // on Wayland sessions with lazy XWayland (`DISPLAY=:0`) calls `XOpenDisplay(NULL)` inside
+    // `wgpu-hal` and deadlocks waiting for an unstarted XWayland server.
+    let vk_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::VULKAN,
+        ..Default::default()
+    });
+    match request_best_adapter(&vk_instance) {
+        Ok(adapter) => Ok((vk_instance, adapter)),
+        Err(vk_err) => {
+            if std::env::var_os("WAYLAND_DISPLAY").is_some()
+                && std::env::var_os("DISPLAY").is_some()
+            {
+                return Err(vk_err);
+            }
+            let gl_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::GL,
+                ..Default::default()
+            });
+            match request_best_adapter(&gl_instance) {
+                Ok(adapter) => Ok((gl_instance, adapter)),
+                Err(gl_err) => Err(RenderError::Gpu(format!(
+                    "{vk_err}; GLES fallback also failed: {gl_err}"
+                ))),
+            }
+        }
     }
 }
 
