@@ -18,10 +18,11 @@ use smithay_client_toolkit::reexports::protocols_misc::zwp_input_method_v2::clie
 use smithay_client_toolkit::reexports::protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
 use smithay_client_toolkit::reexports::protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
 
-use veilshell_core::{OskEmit, OskLayer, US_QWERTY_XKB_KEYMAP};
+use veilshell_core::{OskEmit, OskLayer, OskState, US_QWERTY_XKB_KEYMAP};
 use veilshell_render::{HitRect, SceneKind};
 
 use crate::client::LayerApp;
+use crate::OskPolicy;
 
 pub(crate) struct InputMethodManagerData;
 pub(crate) struct InputMethodData;
@@ -83,12 +84,12 @@ impl Dispatch2<ZwpInputMethodV2, LayerApp> for InputMethodData {
                 // Activation resets the content purpose, even when no
                 // ContentType event follows.
                 state.osk.pending_layout = Some((OskLayer::Letters, false));
-                state.osk.im_pending_active = true;
+                state.osk.editor.pending = Some(EditorChange::Activated);
             }
             zwp_input_method_v2::Event::Deactivate => {
                 state.cancel_osk_drag();
                 state.osk.pending_layout = None;
-                state.osk.im_pending_active = false;
+                state.osk.editor.pending = Some(EditorChange::Deactivated);
             }
             zwp_input_method_v2::Event::ContentType { purpose, .. } => {
                 let layer = match purpose {
@@ -102,75 +103,98 @@ impl Dispatch2<ZwpInputMethodV2, LayerApp> for InputMethodData {
             }
             zwp_input_method_v2::Event::Done => {
                 state.osk.im_serial = state.osk.im_serial.wrapping_add(1);
-                let was_active = state.osk.im_active;
-                let now_active = state.osk.im_pending_active;
-                state.osk.im_active = now_active;
-                let layout_dirty =
-                    state
-                        .osk
-                        .pending_layout
-                        .take()
-                        .is_some_and(|(layer, terminal)| {
-                            let osk = &mut state.renderer.context_mut().osk_state;
-                            let changed = osk.layer != layer || osk.terminal != terminal;
-                            osk.layer = layer;
-                            osk.terminal = terminal;
-                            if changed {
-                                state.cancel_osk_drag();
-                            }
-                            changed
-                        });
-                if now_active
-                    && !was_active
-                    && state.visible
-                    && state.active_scene == SceneKind::Pill
-                {
-                    state.osk.auto_opened = true;
-                    state.show_scene(SceneKind::Osk, false);
-                } else if !now_active
-                    && was_active
-                    && state.active_scene == SceneKind::Osk
-                    && state.osk.auto_opened
-                {
-                    state.osk.auto_opened = false;
-                    state.show_scene(SceneKind::Pill, false);
-                } else if layout_dirty && state.active_scene == SceneKind::Osk {
-                    state.draw_overlay();
+                let was_available = state.osk.can_open_manually();
+                let change = state.osk.editor.done();
+                let osk = &mut state.renderer.context_mut().osk_state;
+                let previous = *osk;
+                if change.is_some() {
+                    *osk = OskState::default();
+                }
+                if let Some((layer, terminal)) = state.osk.pending_layout.take() {
+                    osk.layer = layer;
+                    osk.terminal = terminal;
+                }
+                let layout_dirty = *osk != previous;
+                if layout_dirty {
+                    state.invalidate_osk_layout();
+                }
+                match change {
+                    // Ordinary Done events (e.g. cursor or surrounding-text updates)
+                    // never reopen a keyboard the user just dismissed. A deactivate
+                    // and activate in the same batch still means a new editor.
+                    Some(EditorChange::Activated)
+                        if state.visible && state.active_scene == SceneKind::Pill =>
+                    {
+                        state.osk.auto_opened = true;
+                        state.show_scene(SceneKind::Osk, false);
+                    }
+                    Some(EditorChange::Deactivated) => state.on_osk_editor_lost(),
+                    _ if layout_dirty && state.active_scene == SceneKind::Osk => {
+                        state.draw_overlay();
+                    }
+                    _ if was_available != state.osk.can_open_manually() => state.draw_pill(),
+                    _ => {}
                 }
             }
             zwp_input_method_v2::Event::Unavailable => {
-                let auto_opened = state.osk.auto_opened;
                 // Another IME can own this seat. Leave the virtual keyboard
                 // fallback available for manual OSK use, without retrying here.
                 state.osk.release_input_method();
-                state.on_osk_input_lost(auto_opened);
+                state.on_osk_editor_lost();
             }
             _ => {}
         }
     }
 }
 
-pub(crate) struct OskRepeat {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EditorChange {
+    Activated,
+    Deactivated,
+}
+
+#[derive(Default)]
+struct EditorFocus {
+    active: bool,
+    pending: Option<EditorChange>,
+}
+
+impl EditorFocus {
+    fn done(&mut self) -> Option<EditorChange> {
+        let change = self.pending.take()?;
+        self.active = change == EditorChange::Activated;
+        Some(change)
+    }
+}
+
+pub(crate) struct OskContact {
     label: &'static str,
     key: HitRect,
     deadline: Option<Instant>,
-    pub(crate) fired: bool,
+    left_key: bool,
+    repeated: bool,
 }
 
-impl OskRepeat {
+impl OskContact {
     pub(crate) fn new(now: Instant, label: &'static str, key: HitRect) -> Self {
         Self {
             label,
             key,
-            deadline: Some(now + Duration::from_millis(400)),
-            fired: false,
+            deadline: OskState::can_repeat(label).then(|| now + Duration::from_millis(400)),
+            left_key: false,
+            repeated: false,
         }
     }
 
     pub(crate) fn position(&mut self, x: f32, y: f32) {
         if !self.key.contains(x, y) {
+            self.left_key = true;
             self.deadline = None;
         }
+    }
+
+    pub(crate) fn tap(self) -> Option<&'static str> {
+        (!self.left_key && !self.repeated).then_some(self.label)
     }
 
     pub(crate) fn deadline(&self) -> Option<Instant> {
@@ -181,7 +205,7 @@ impl OskRepeat {
         if now < self.deadline? {
             return None;
         }
-        self.fired = true;
+        self.repeated = true;
         // Do not catch up a burst if the compositor or renderer was busy.
         self.deadline = Some(now + Duration::from_millis(55));
         Some(self.label)
@@ -195,8 +219,7 @@ pub(crate) struct OskWaylandState {
     seat: Option<WlSeat>,
     input_method: Option<ZwpInputMethodV2>,
     virtual_keyboard: Option<ZwpVirtualKeyboardV1>,
-    im_pending_active: bool,
-    im_active: bool,
+    editor: EditorFocus,
     im_serial: u32,
     pub(crate) auto_opened: bool,
     pending_layout: Option<(OskLayer, bool)>,
@@ -205,10 +228,15 @@ pub(crate) struct OskWaylandState {
 
 impl OskWaylandState {
     /// Optionally bind `zwp_input_method_manager_v2` and `zwp_virtual_keyboard_manager_v1`.
-    pub(crate) fn bind_globals(globals: &GlobalList, qh: &QueueHandle<LayerApp>) -> Self {
-        let im_manager = globals
-            .bind::<ZwpInputMethodManagerV2, LayerApp, _>(qh, 1..=1, InputMethodManagerData)
-            .ok();
+    pub(crate) fn bind_globals(
+        globals: &GlobalList,
+        qh: &QueueHandle<LayerApp>,
+        policy: OskPolicy,
+    ) -> Self {
+        let im_manager = match policy {
+            OskPolicy::Auto => globals.bind(qh, 1..=1, InputMethodManagerData).ok(),
+            OskPolicy::Manual => None,
+        };
         let vk_manager = globals
             .bind::<ZwpVirtualKeyboardManagerV1, LayerApp, _>(qh, 1..=1, VirtualKeyboardManagerData)
             .ok();
@@ -218,8 +246,7 @@ impl OskWaylandState {
             seat: None,
             input_method: None,
             virtual_keyboard: None,
-            im_pending_active: false,
-            im_active: false,
+            editor: EditorFocus::default(),
             im_serial: 0,
             auto_opened: false,
             pending_layout: None,
@@ -248,7 +275,23 @@ impl OskWaylandState {
         true
     }
 
-    fn ensure_virtual_keyboard(&mut self, qh: &QueueHandle<LayerApp>) {
+    pub(crate) fn seat(&self) -> Option<&WlSeat> {
+        self.seat.as_ref()
+    }
+
+    pub(crate) fn has_virtual_keyboard(&self) -> bool {
+        self.vk_manager.is_some()
+    }
+
+    pub(crate) fn can_open_manually(&self) -> bool {
+        self.seat.is_some() && (self.has_virtual_keyboard() || self.editor.active)
+    }
+
+    pub(crate) fn editor_changing(&self) -> bool {
+        self.editor.pending.is_some()
+    }
+
+    pub(crate) fn ensure_virtual_keyboard(&mut self, qh: &QueueHandle<LayerApp>) {
         if self.virtual_keyboard.is_some() {
             return;
         }
@@ -265,6 +308,9 @@ impl OskWaylandState {
 
     /// Emit text or virtual keystrokes to the active client/compositor.
     pub(crate) fn emit(&mut self, action: OskEmit, qh: &QueueHandle<LayerApp>) {
+        if self.editor_changing() {
+            return;
+        }
         match action {
             OskEmit::None | OskEmit::Dismiss => {}
             OskEmit::Text {
@@ -273,7 +319,7 @@ impl OskWaylandState {
                 shift,
                 ctrl,
             } => {
-                if !ctrl && self.im_active {
+                if !ctrl && self.editor.active {
                     if let Some(im) = &self.input_method {
                         im.commit_string(text);
                         im.commit(self.im_serial);
@@ -295,20 +341,23 @@ impl OskWaylandState {
     /// Release compositor-bound IME and virtual keyboard objects cleanly.
     pub(crate) fn destroy(&mut self) {
         self.release_input_method();
+        self.release_virtual_keyboard();
+        self.auto_opened = false;
+        self.seat = None;
+    }
+
+    pub(crate) fn release_virtual_keyboard(&mut self) {
         if let Some(vk) = self.virtual_keyboard.take() {
             vk.destroy();
         }
-        self.seat = None;
     }
 
     fn release_input_method(&mut self) {
         if let Some(im) = self.input_method.take() {
             im.destroy();
         }
-        self.im_active = false;
-        self.im_pending_active = false;
+        self.editor = EditorFocus::default();
         self.im_serial = 0;
-        self.auto_opened = false;
         self.pending_layout = None;
     }
 
@@ -358,29 +407,59 @@ fn upload_xkb_keymap(vk: &ZwpVirtualKeyboardV1) -> Option<()> {
 }
 
 #[cfg(test)]
-mod repeat_tests {
+mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_fresh_activation_can_auto_open_after_dismissal() {
+        let mut editor = EditorFocus {
+            pending: Some(EditorChange::Activated),
+            ..EditorFocus::default()
+        };
+        assert!(!editor.active);
+        assert_eq!(editor.done(), Some(EditorChange::Activated));
+        assert!(editor.active);
+        // Text updates in the same editor are not new activations.
+        assert_eq!(editor.done(), None);
+        // Switching editors can send both events before the next Done.
+        editor.pending = Some(EditorChange::Deactivated);
+        editor.pending = Some(EditorChange::Activated);
+        assert_eq!(editor.done(), Some(EditorChange::Activated));
+        editor.pending = Some(EditorChange::Deactivated);
+        assert_eq!(editor.done(), Some(EditorChange::Deactivated));
+        assert!(!editor.active);
+    }
 
     #[test]
     fn hold_delays_its_first_stroke_and_does_not_catch_up() {
         let now = Instant::now();
-        let mut repeat = OskRepeat::new(now, "del", HitRect::new(0.0, 0.0, 50.0, 50.0));
+        let mut repeat = OskContact::new(now, "del", HitRect::new(0.0, 0.0, 50.0, 50.0));
         assert_eq!(repeat.tick(now + Duration::from_millis(399)), None);
-        assert!(!repeat.fired);
         assert_eq!(repeat.tick(now + Duration::from_millis(400)), Some("del"));
         assert_eq!(repeat.tick(now + Duration::from_secs(3)), Some("del"));
         assert_eq!(repeat.tick(now + Duration::from_secs(3)), None);
-        assert!(repeat.fired);
+        assert_eq!(repeat.tap(), None);
     }
 
     #[test]
     fn leaving_the_key_cancels_repeat_even_if_the_finger_returns() {
         let now = Instant::now();
-        let mut repeat = OskRepeat::new(now, "left", HitRect::new(0.0, 0.0, 50.0, 50.0));
+        let mut repeat = OskContact::new(now, "left", HitRect::new(0.0, 0.0, 50.0, 50.0));
         repeat.position(60.0, 20.0);
         repeat.position(20.0, 20.0);
         assert_eq!(repeat.deadline(), None);
         assert_eq!(repeat.tick(now + Duration::from_secs(1)), None);
-        assert!(!repeat.fired);
+        assert_eq!(repeat.tap(), None);
+    }
+
+    #[test]
+    fn ordinary_keys_only_emit_on_a_tap_that_stays_on_the_key() {
+        let now = Instant::now();
+        let key = HitRect::new(0.0, 0.0, 50.0, 50.0);
+        assert_eq!(OskContact::new(now, "a", key).tap(), Some("a"));
+        let mut contact = OskContact::new(now, "a", key);
+        assert_eq!(contact.deadline(), None);
+        contact.position(51.0, 25.0);
+        assert_eq!(contact.tap(), None);
     }
 }

@@ -140,7 +140,7 @@ impl LayerSurfaceSpec {
                 keyboard_interactivity: false,
             },
             LayerRole::TouchOsk => {
-                let height = viewport_h / 3;
+                let height = (viewport_h / 3).max(1);
                 Self {
                     role,
                     anchor: Anchor::bottom_bar(),
@@ -181,6 +181,15 @@ pub struct TouchEvent {
     pub timestamp_ms: u32,
 }
 
+/// Whether to claim the seat's input method for automatic keyboard display.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OskPolicy {
+    #[default]
+    Auto,
+    /// Leave the input method alone and type only through the virtual keyboard.
+    Manual,
+}
+
 /// Runtime options for connecting to a `Wayland` display server.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WaylandRuntimeConfig {
@@ -191,6 +200,7 @@ pub struct WaylandRuntimeConfig {
     pub preferred_scale: f32,
     pub exit_after_ms: Option<u64>,
     pub initial_visible: bool,
+    pub osk_policy: OskPolicy,
     pub renderer: veilshell_render::RendererPreference,
     pub wallpaper: Option<veilshell_render::WallpaperImage>,
 }
@@ -203,6 +213,7 @@ impl Default for WaylandRuntimeConfig {
             preferred_scale: 1.0,
             exit_after_ms: None,
             initial_visible: true,
+            osk_policy: OskPolicy::Auto,
             renderer: veilshell_render::RendererPreference::Auto,
             wallpaper: None,
         }
@@ -239,5 +250,16 @@ mod tests {
         assert_eq!(spec.width, 1280);
         assert_eq!(spec.height, 853);
         assert!(spec.keyboard_interactivity);
+    }
+
+    #[test]
+    fn osk_reserves_its_logical_height_without_claiming_keyboard_focus() {
+        for (w, h, panel_h) in [(960, 640, 213), (640, 960, 320), (640, 1, 1)] {
+            let spec = LayerSurfaceSpec::for_role(LayerRole::TouchOsk, w, h);
+            assert_eq!(spec.anchor, Anchor::bottom_bar());
+            assert_eq!((spec.width, spec.height), (w, panel_h));
+            assert_eq!(spec.exclusive_zone, i32::try_from(panel_h).unwrap());
+            assert!(!spec.keyboard_interactivity);
+        }
     }
 }

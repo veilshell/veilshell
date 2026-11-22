@@ -86,7 +86,8 @@ record that blocker rather than substituting a screenshot.
 | Recents list and focus | Open two distinguishable disposable windows with no unsaved work. Open Home, then swipe up from its bottom edge into Recents. Swipe sideways to browse and tap one card. The deck closes and the selected window, not its neighbor, has focus. Record live thumbnails separately from listing and focus: missing capture protocols are not proof that focus is broken, and a drawn card isn't proof that its preview is live. |
 | Recents close | Reopen Recents and swipe up on one disposable card. The matching real window closes and disappears from Recents; the other window stays open. Do not swipe away a window with valuable work. |
 | Quick Settings gesture | Pull down from the top handle; reverse a short pull to cancel, then fully open the shade. Check the controls fit and can be reached. Swipe up to dismiss. Compare a real control and its restored value using the procedure below. |
-| App keyboard (OSK) | Open a native Wayland app with working text-input support (e.g. a GTK text editor running natively, not under XWayland). Tap a blank editable field; the keyboard should open without `veilctl show osk`. Type a scratch string using letters, Shift, a digit and a symbol, then Backspace and an arrow. Check the **app's** text and caret, not just highlighted keys. Swipe down on the keyboard to dismiss and check it stops covering the app. Tap an editable field again (change focus away and back if needed) and verify input again. Check a compatible terminal's **TERM** row separately if available, using harmless input and no submitted command. |
+| App keyboard (OSK) | Open a native Wayland app with working text-input support (e.g. a GTK text editor running natively, not under XWayland). Tap a blank editable field; the keyboard should open. Type a scratch string using letters, Shift, a digit and a symbol, then Backspace and an arrow. Check the **app's** text and caret, not just highlighted keys. Tap **HIDE** or swipe down, check that the work area is restored and that ordinary updates to the same editor don't reopen it. Tap the keyboard icon beside the bottom pill to reopen without losing app focus. Also check that a fresh editor activation can reopen it automatically. |
+| Manual keyboard and live reflow | Start a separate run with `--osk manual`. Focus a terminal, then tap the keyboard icon; this mode must not take the seat's input-method slot. Change the host orientation while the OSK is open and verify key positions, usable text entry, and the size of the new reservation. Check the **TERM** row using harmless input. In Auto posture mode, repeat with the Type Cover and reattach while the OSK is open: it should hide and give the space back without changing the host's monitor rules. |
 
 As a diagnostic only, `veilctl show` with `home`, `recents`, `shade`, `osk`,
 or `pill` can separate surface visibility problems from gesture or text-focus
@@ -96,7 +97,9 @@ competing input method. `wayland-info`, if installed, can help check
 guarantee access or working app text input. A manually shown keyboard is not
 a pass for automatic activation or text entry. If another input method
 already owns the seat, VeilShell cannot auto-open its own keyboard; the
-manual keyboard can still work via the virtual-keyboard protocol.
+manual keyboard can still work via the virtual-keyboard protocol. Without a
+virtual keyboard or active input method, the keyboard button is hidden and
+`veilctl show osk` reports that it is unavailable.
 
 For both edge handles, start a pull slightly inside the display, next to
 the visible mark. The mark should brighten and grow as soon as it's touched;
@@ -210,6 +213,11 @@ cargo test --locked --workspace
 With `foot` installed, `./scripts/test-hyprland-actions.sh` also drives the
 overlay with a virtual pointer and checks the real windows it opens, focuses,
 and closes in a private Hyprland instance.
+
+Run `VEILSHELL_TEST_KEYBOARD=1 ./scripts/test-hyprland-actions.sh` to exercise app
+typing, focus, live output rotation, and keyboard dismissal in both session
+policies. It uses a disposable terminal and checks the actual bytes delivered
+to it; it does not validate physical touch, Type Cover events, or SDDM.
 
 The harness uses its own compositor config, IPC and virtual output. It checks
 that startup rejects missing or stale Hyprland IPC, that mode changes leave

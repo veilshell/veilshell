@@ -104,8 +104,21 @@ fn handle_client(
                 let _ = writeln!(stream, "err unknown scene '{scene_str}'");
                 return false;
             };
-            let _ = cmd_tx.send(DaemonCommand::ShowScene(scene));
-            let _ = writeln!(stream, "ok scene {}", scene.as_str());
+            if scene == SceneKind::Osk {
+                let (reply, result) = mpsc::channel();
+                if cmd_tx.send(DaemonCommand::ShowKeyboard(reply)).is_err() {
+                    let _ = writeln!(stream, "err daemon not running");
+                } else {
+                    let _ = match result.recv_timeout(Duration::from_secs(1)) {
+                        Ok(Ok(())) => writeln!(stream, "ok scene osk"),
+                        Ok(Err(reason)) => writeln!(stream, "err cannot show osk: {reason}"),
+                        Err(_) => writeln!(stream, "err show timed out"),
+                    };
+                }
+            } else {
+                let _ = cmd_tx.send(DaemonCommand::ShowScene(scene));
+                let _ = writeln!(stream, "ok scene {}", scene.as_str());
+            }
         }
         "reload-theme" => {
             let palette = session.palette();

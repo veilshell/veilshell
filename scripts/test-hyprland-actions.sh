@@ -161,6 +161,13 @@ in_scene() {
 wait_for "960x640 smoke output" json_matches monitors \
     'any(.[]; .name == "veil-smoke" and .width == 960 and .height == 640 and .scale == 1)'
 
+if [[ ${VEILSHELL_TEST_KEYBOARD:-0} == 1 ]]; then
+    # shellcheck source=scripts/test-hyprland-keyboard.inc.sh
+    source "$REPO_ROOT/scripts/test-hyprland-keyboard.inc.sh"
+    test_keyboard_workflow
+    exit 0
+fi
+
 cat >"$XDG_DATA_HOME/applications/veil-home.desktop" <<'EOF'
 [Desktop Entry]
 Type=Application

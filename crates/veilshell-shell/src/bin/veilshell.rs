@@ -32,7 +32,8 @@ use veilshell_shell::shade;
 use veilshell_shell::ShellState;
 use veilshell_wayland::channel::{self, Sender};
 use veilshell_wayland::{
-    run_shell_daemon, DaemonCommand, ShellAction, ShellActionHandler, WaylandRuntimeConfig,
+    run_shell_daemon, DaemonCommand, OskPolicy, ShellAction, ShellActionHandler,
+    WaylandRuntimeConfig,
 };
 
 struct LiveActionHandler<C> {
@@ -492,6 +493,7 @@ struct CliOptions {
     no_watchers: bool,
     scene: SceneKind,
     policy: ModePolicy,
+    osk_policy: OskPolicy,
     renderer: RendererPreference,
     wallpaper: Option<WallpaperImage>,
     output_name: Option<String>,
@@ -540,6 +542,19 @@ fn parse_cli(args: &[String]) -> CliOutcome {
         None => ModePolicy::Auto,
     };
 
+    let osk_policy = if args.iter().any(|arg| arg == "--osk") {
+        match parse_flag(args, "--osk").as_deref() {
+            Some("auto") => OskPolicy::Auto,
+            Some("manual") => OskPolicy::Manual,
+            _ => {
+                eprintln!("--osk expects auto or manual");
+                return CliOutcome::Exit(ExitCode::FAILURE);
+            }
+        }
+    } else {
+        OskPolicy::Auto
+    };
+
     let renderer = match parse_flag(args, "--renderer") {
         Some(raw) => {
             let Some(parsed) = RendererPreference::parse_name(&raw) else {
@@ -579,6 +594,7 @@ fn parse_cli(args: &[String]) -> CliOutcome {
         no_watchers,
         scene,
         policy,
+        osk_policy,
         renderer,
         wallpaper,
         output_name,
@@ -712,6 +728,7 @@ fn main() -> ExitCode {
         preferred_scale,
         exit_after_ms: opts.exit_after_ms,
         initial_visible,
+        osk_policy: opts.osk_policy,
         renderer: opts.renderer,
         wallpaper: opts.wallpaper,
     };
@@ -720,9 +737,7 @@ fn main() -> ExitCode {
 
     stop_watchers.store(true, Ordering::Relaxed);
     drop(sensor_guard);
-    if let Some(handle) = watcher_handle {
-        let _ = handle.join();
-    }
+    let _ = watcher_handle.map(thread::JoinHandle::join);
     let _ = fs::remove_file(&opts.socket_path);
 
     match result {
@@ -751,6 +766,7 @@ fn print_dry_run(
     }
     println!("  scene      : {}", opts.scene.as_str());
     println!("  policy     : {:?}", opts.policy);
+    println!("  app OSK    : {:?}", opts.osk_policy);
     println!("  visible    : {visible}");
     let apps = ctx.home_apps.len();
     match ActiveRenderer::new(opts.renderer, ctx) {
@@ -776,6 +792,7 @@ fn print_help() {
          \tveilshell [OPTIONS]\n\n\
          OPTIONS:\n\
          \t--policy <auto|laptop|tablet>          Initial Laptop/Tablet mode policy (default: auto)\n\
+         \t--osk <auto|manual>                    Manual never claims the input method (default: auto)\n\
          \t--scene <pill|home|recents|shade|osk>  Initial surface scene (default: pill)\n\
          \t--renderer <auto|wgpu|software>        Rendering backend (default: auto)\n\
          \t--wallpaper <PNG_PATH>                 Static PNG wallpaper for pre-blurred GPU glass\n\
@@ -793,6 +810,27 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_osk_is_an_independent_opt_in() {
+        let CliOutcome::Run(options) = parse_cli(&[]) else {
+            panic!("expected default options");
+        };
+        assert_eq!(options.osk_policy, OskPolicy::Auto);
+        let args = ["--policy", "tablet", "--osk", "manual"].map(str::to_owned);
+        let CliOutcome::Run(options) = parse_cli(&args) else {
+            panic!("expected manual OSK options");
+        };
+        assert_eq!(options.osk_policy, OskPolicy::Manual);
+        assert_eq!(options.policy, ModePolicy::ForceTablet);
+        for args in [vec!["--osk"], vec!["--osk", "unknown"]] {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(matches!(
+                parse_cli(&args),
+                CliOutcome::Exit(ExitCode::FAILURE)
+            ));
+        }
+    }
 
     #[test]
     fn watcher_reports_a_keyboard_change_since_the_startup_sample() {

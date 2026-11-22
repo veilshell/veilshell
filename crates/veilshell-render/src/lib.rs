@@ -28,7 +28,8 @@ pub use primitives::{
 pub use recents::{recents_preview_pixels, recents_stride};
 pub use scene::{
     bottom_pill_bounds, build_scene, build_scene_layout, build_top_strip_scene, default_demo_apps,
-    home_page_count, home_reveal_travel, top_handle_bounds, AppTile, RecentsCard, SceneContext,
+    home_page_count, home_reveal_travel, keyboard_button_bounds, top_handle_bounds, AppTile,
+    RecentsCard, SceneContext,
 };
 pub use shade::{
     shade_reveal_travel, ShadeAction, ShadeChoice, ShadeExtras, ShadePage, ShadeStatus,
@@ -566,7 +567,10 @@ mod tests {
         }
 
         let palette = ThemePalette::default_dark();
-        let mut ctx = SceneContext::default();
+        let mut ctx = SceneContext {
+            keyboard_button: false,
+            ..SceneContext::default()
+        };
         let bottom = rect(&build_scene(SceneKind::Pill, 960.0, 48.0, &palette, &ctx));
         ctx.pill_pressed = true;
         let pressed = rect(&build_scene(SceneKind::Pill, 960.0, 48.0, &palette, &ctx));
@@ -576,6 +580,30 @@ mod tests {
         let pressed = rect(&build_top_strip_scene(220.0, 48.0, &palette, 0.0, true));
         assert!(pressed.w > top.w && pressed.h > top.h);
         assert!(top.fill.a < 0.5 && pressed.fill.a > 0.9);
+    }
+
+    #[test]
+    fn keyboard_button_is_separate_from_the_pill_and_has_a_matching_hit_target() {
+        let palette = ThemePalette::default_dark();
+        let mut ctx = SceneContext::default();
+        for width in [360.0, 640.0, 853.0, 1280.0] {
+            let pill = bottom_pill_bounds(width, 48.0);
+            let button = keyboard_button_bounds(width, 48.0).unwrap();
+            assert!(button.x > pill.x + pill.w + 24.0);
+            assert!(button.x + button.w <= width - 8.0);
+            let x = button.x + 22.0;
+            ctx.keyboard_button = true;
+            let layout = build_scene_layout(SceneKind::Pill, width, 48.0, &palette, &ctx);
+            assert_eq!(layout.hit_test(x, 24.0), Some(&HitTarget::OpenKeyboard));
+            assert_eq!(
+                layout.hit_test(width * 0.5, 36.0),
+                Some(&HitTarget::BottomPill)
+            );
+            ctx.keyboard_button = false;
+            let layout = build_scene_layout(SceneKind::Pill, width, 48.0, &palette, &ctx);
+            assert_ne!(layout.hit_test(x, 24.0), Some(&HitTarget::OpenKeyboard));
+        }
+        assert!(keyboard_button_bounds(240.0, 48.0).is_none());
     }
 
     #[test]

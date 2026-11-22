@@ -10,6 +10,7 @@ use crate::primitives::{
 };
 use crate::recents::build_recents;
 use crate::shade::{build_shade, ShadeStatus};
+use crate::shade_glyphs::{self, Glyph};
 use crate::SceneKind;
 
 /// Visual application tile shown in the paged `Home` app grid.
@@ -76,6 +77,8 @@ pub struct SceneContext {
     pub recents_throw: Option<(String, f32)>,
     /// Multi-layer touch keyboard state and modifier latches.
     pub osk_state: OskState,
+    /// Whether to expose the app keyboard next to the resting navigation pill.
+    pub keyboard_button: bool,
 }
 
 impl Default for SceneContext {
@@ -132,6 +135,7 @@ impl Default for SceneContext {
             recents_position: None,
             recents_throw: None,
             osk_state: OskState::default(),
+            keyboard_button: true,
         }
     }
 }
@@ -320,6 +324,17 @@ pub fn bottom_pill_bounds(width: f32, height: f32) -> HitRect {
     HitRect::new((width - w) * 0.5, height - 16.0, w, 8.0)
 }
 
+/// Surface-local hit target for the keyboard button. Leave a gap after
+/// the pill's swipe padding and keep the screen corner available to apps.
+#[must_use]
+pub fn keyboard_button_bounds(width: f32, height: f32) -> Option<HitRect> {
+    const TARGET: f32 = 44.0;
+    let pill = bottom_pill_bounds(width, height);
+    let x = (pill.x + pill.w + 32.0).ceil();
+    (height >= TARGET && x + TARGET <= width - 8.0)
+        .then(|| HitRect::new(x, (height - TARGET - 2.0).floor().max(0.0), TARGET, TARGET))
+}
+
 /// Build the top-center pull handle strip for opening Quick Settings in Tablet Mode.
 #[must_use]
 pub fn build_top_strip_scene(
@@ -409,6 +424,28 @@ fn build_pill(
 ) {
     push_bottom_pill_bar(&mut out.draw_list, width, height, palette, ctx);
     out.push_hit(HitRect::new(0.0, 0.0, width, height), HitTarget::BottomPill);
+    if let Some(button) = keyboard_button_bounds(width, height).filter(|_| ctx.keyboard_button) {
+        out.draw_list.push_rect(
+            RoundedRect::filled(
+                button.x + 1.0,
+                button.y + 6.0,
+                button.w - 2.0,
+                button.h - 12.0,
+                10.0,
+                palette.surface.with_alpha(0.92),
+            )
+            .with_glass_border(palette.foreground.with_alpha(0.22), 1.0, 0.10),
+        );
+        shade_glyphs::draw(
+            &mut out.draw_list,
+            Glyph::Keyboard,
+            button.x + button.w * 0.5,
+            button.y + button.h * 0.5,
+            24.0,
+            palette.foreground,
+        );
+        out.push_hit(button, HitTarget::OpenKeyboard);
+    }
 }
 
 fn build_home(

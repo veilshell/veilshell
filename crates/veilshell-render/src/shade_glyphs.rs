@@ -17,6 +17,7 @@ pub(crate) enum Glyph {
     Rotate,
     Moon,
     Desktop,
+    Keyboard,
     Power,
     Battery,
     Bell,
@@ -94,6 +95,16 @@ const SUN_RAYS: [(f32, f32, f32, f32); 4] = [
     (NEAR_DIAGONAL, -NEAR_DIAGONAL, FAR_DIAGONAL, -FAR_DIAGONAL),
 ];
 
+fn keyboard(x: f32, y: f32) -> bool {
+    let in_row = |top, bottom| (top..=bottom).contains(&y);
+    (2.0..=22.0).contains(&x)
+        && in_row(5.0, 19.0)
+        && (!(4.0..=20.0).contains(&x)
+            || !in_row(7.0, 17.0)
+            || (in_row(9.0, 11.4) && [7.0_f32, 12.0, 17.0].iter().any(|cx| (x - cx).abs() <= 1.2))
+            || (in_row(13.5, 15.4) && (7.0..=17.0).contains(&x)))
+}
+
 fn contains(glyph: Glyph, x: f32, y: f32) -> bool {
     const STROKE: f32 = 1.05;
     let distance_sq = |cx: f32, cy: f32| (x - cx) * (x - cx) + (y - cy) * (y - cy);
@@ -166,6 +177,7 @@ fn contains(glyph: Glyph, x: f32, y: f32) -> bool {
                 || line(12.0, 16.0, 12.0, 20.0)
                 || line(8.0, 20.0, 16.0, 20.0)
         }
+        Glyph::Keyboard => keyboard(x, y),
         Glyph::Power => {
             (ring(12.0, 13.0, 7.7) && y >= 7.1)
                 || circle(7.0, 7.1, STROKE)

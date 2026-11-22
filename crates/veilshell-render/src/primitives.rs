@@ -375,6 +375,8 @@ pub enum HitTarget {
     PowerPanel,
     /// Tapping an OSK key emits the labeled key press.
     OskKey { label: &'static str },
+    /// Open the app keyboard without focusing a shell surface.
+    OpenKeyboard,
     /// Bottom gesture pill region.
     BottomPill,
 }

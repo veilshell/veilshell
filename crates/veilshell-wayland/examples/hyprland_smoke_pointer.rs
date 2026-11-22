@@ -64,6 +64,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let x: u32 = x.parse()?;
     let y: u32 = y.parse()?;
     let end_y: Option<u32> = rest.first().map(|arg| arg.parse()).transpose()?;
+    let extent =
+        std::env::var("VEILSHELL_TEST_POINTER_EXTENT").unwrap_or_else(|_| "960x640".into());
+    let (width, height) = extent.split_once('x').ok_or("expected WIDTHxHEIGHT")?;
+    let (width, height) = (width.parse::<u32>()?, height.parse::<u32>()?);
+    if x >= width || y >= height || end_y.is_some_and(|end| end >= height) {
+        return Err("pointer coordinates outside the supplied extent".into());
+    }
     let connection = Connection::from_socket(UnixStream::connect(socket)?)?;
     let (globals, mut queue) = registry_queue_init::<State>(&connection)?;
     let qh = queue.handle();
@@ -96,7 +103,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let start = Instant::now();
     let timestamp = || start.elapsed().as_millis() as u32;
     let move_to = |x, y| {
-        pointer.motion_absolute(timestamp(), x, y, 960, 640);
+        pointer.motion_absolute(timestamp(), x, y, width, height);
         pointer.frame();
     };
     move_to(x.saturating_sub(1), y);

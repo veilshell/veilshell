@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use smithay_client_toolkit::compositor::{
     CompositorHandler, CompositorState, FrameCallbackData, Region,
 };
-use smithay_client_toolkit::output::{OutputHandler, OutputState};
+use smithay_client_toolkit::output::{OutputHandler, OutputInfo, OutputState};
 use smithay_client_toolkit::reexports::calloop::channel::{self, Channel, Event as ChannelEvent};
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay_client_toolkit::reexports::calloop::{EventLoop, LoopHandle};
@@ -18,8 +18,10 @@ use smithay_client_toolkit::reexports::client::protocol::{
 };
 use smithay_client_toolkit::reexports::client::{Connection, Proxy, QueueHandle};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
-use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
-use smithay_client_toolkit::seat::touch::TouchHandler;
+use smithay_client_toolkit::seat::pointer::{
+    PointerData, PointerEvent, PointerEventKind, PointerHandler,
+};
+use smithay_client_toolkit::seat::touch::{TouchData, TouchHandler};
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shell::wlr_layer::{
     Anchor as WlrAnchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
@@ -32,14 +34,14 @@ use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_han
 
 use veilshell_core::{
     classify_bottom_pill, GestureAction, GestureSample, GestureThresholds, Orientation, OskEmit,
-    OskState, Spring, SpringParams, ThemePalette,
+    OskState, ShiftState, Spring, SpringParams, ThemePalette,
 };
 use veilshell_render::power::{PowerAction, PowerInput, PowerMenu};
 use veilshell_render::{
     bottom_pill_bounds, build_scene, build_scene_layout, build_top_strip_scene, home_page_count,
-    home_reveal_travel, recents_stride, shade_reveal_travel, top_handle_bounds, ActiveRenderer,
-    DrawList, HitRect, HitTarget, SceneContext, SceneKind, SceneOutput, ShadeAction, ShadeChoice,
-    ShadeExtras, ShadePage, WallpaperImage,
+    home_reveal_travel, keyboard_button_bounds, recents_stride, shade_reveal_travel,
+    top_handle_bounds, ActiveRenderer, DrawList, HitRect, HitTarget, SceneContext, SceneKind,
+    SceneOutput, ShadeAction, ShadeChoice, ShadeExtras, ShadePage, WallpaperImage,
 };
 
 use crate::capture::ToplevelCaptureState;
@@ -48,7 +50,7 @@ use crate::gpu::{gpu_attempt, init_renderer, WgpuWaylandSurface};
 use crate::motion::{
     edge_vertical, horizontal, slider_pct_for_y, vertical, DragMotion, DragVelocity, SliderDrag,
 };
-use crate::osk::{OskRepeat, OskWaylandState};
+use crate::osk::{OskContact, OskWaylandState};
 use crate::scale::{FractionalScaleGlobals, SurfaceFrame, SurfaceScaling};
 use crate::{LayerRole, LayerSurfaceSpec, WaylandRuntimeConfig};
 
@@ -80,6 +82,8 @@ impl std::error::Error for WaylandError {}
 pub enum DaemonCommand {
     /// Switch the presented shell scene (`Pill` dismisses full-screen overlays).
     ShowScene(SceneKind),
+    /// Request the app keyboard and report when there is no usable input path.
+    ShowKeyboard(mpsc::Sender<Result<(), &'static str>>),
     /// Show (`true`, Tablet Mode) or completely hide (`false`, Laptop Mode) all surfaces.
     SetVisible(bool),
     /// Replace the dynamic scene context (apps, windows, hardware state, clock).
@@ -205,10 +209,11 @@ struct ActiveDrag {
     last_y: f32,
     max_travel: f32,
     handle_tap_allowed: bool,
+    keyboard_button: Option<RegionRect>,
     overlay_tap_allowed: bool,
     recent_card: Option<String>,
     active_slider: Option<SliderDrag>,
-    osk_repeat: Option<OskRepeat>,
+    osk_contact: Option<OskContact>,
     motion: Option<DragMotion>,
     velocity: DragVelocity,
     start_time: Instant,
@@ -217,6 +222,16 @@ struct ActiveDrag {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RegionRect(i32, i32, i32, i32);
 
+impl RegionRect {
+    fn contains(self, x: f32, y: f32) -> bool {
+        let Self(left, top, width, height) = self;
+        x >= left as f32
+            && x < (left + width) as f32
+            && y >= top as f32
+            && y < (top + height) as f32
+    }
+}
+
 #[derive(Clone, Copy)]
 enum EdgeHandle {
     Bottom,
@@ -224,6 +239,16 @@ enum EdgeHandle {
 }
 
 impl EdgeHandle {
+    fn input_rects(self, size: (u32, u32), show_keyboard: bool) -> [Option<RegionRect>; 2] {
+        let keyboard = if show_keyboard && matches!(self, Self::Bottom) {
+            keyboard_button_bounds(size.0 as f32, size.1 as f32)
+                .map(|b| RegionRect(b.x as i32, b.y as i32, b.w as i32, b.h as i32))
+        } else {
+            None
+        };
+        [self.input_rect(size), keyboard]
+    }
+
     fn bounds(self, width: f32, height: f32) -> HitRect {
         match self {
             Self::Bottom => bottom_pill_bounds(width, height),
@@ -257,7 +282,7 @@ fn handle_tap(allowed: bool, max_travel: f32) -> bool {
 struct HandleInputRegion {
     handle: EdgeHandle,
     region: Region,
-    rect: Option<RegionRect>,
+    rects: [Option<RegionRect>; 2],
 }
 
 impl HandleInputRegion {
@@ -272,24 +297,24 @@ impl HandleInputRegion {
         Self {
             handle,
             region,
-            rect: None,
+            rects: [None; 2],
         }
     }
 
-    fn update(&mut self, surface: &wl_surface::WlSurface, size: (u32, u32)) {
-        let rect = self.handle.input_rect(size);
-        if rect == self.rect {
+    fn update(&mut self, surface: &wl_surface::WlSurface, size: (u32, u32), show_keyboard: bool) {
+        let rects = self.handle.input_rects(size, show_keyboard);
+        if rects == self.rects {
             return;
         }
-        if let Some(RegionRect(x, y, w, h)) = self.rect {
+        for RegionRect(x, y, w, h) in self.rects.into_iter().flatten() {
             self.region.subtract(x, y, w, h);
         }
-        if let Some(RegionRect(x, y, w, h)) = rect {
+        for RegionRect(x, y, w, h) in rects.into_iter().flatten() {
             self.region.add(x, y, w, h);
         }
         // This gates new contacts only; an implicit grab can leave the region.
         surface.set_input_region(Some(self.region.wl_region()));
-        self.rect = rect;
+        self.rects = rects;
     }
 }
 
@@ -463,6 +488,8 @@ impl ManagedSurface {
         };
 
         #[cfg(feature = "wgpu")]
+        let show_keyboard = renderer.context().keyboard_button;
+        #[cfg(feature = "wgpu")]
         if let Some(gpu_renderer) = renderer.as_wgpu_mut() {
             let surface = self.layer.wl_surface();
             let gpu_surface = match &mut self.gpu_surface {
@@ -480,7 +507,7 @@ impl ManagedSurface {
                 gpu_surface.present_draw_list(gpu_renderer, frame.target, list, || {
                     scaling.apply(surface, frame);
                     if let Some(input) = handle_input {
-                        input.update(surface, size);
+                        input.update(surface, size, show_keyboard);
                     }
                     if request_frame_callback {
                         *callback_queued =
@@ -558,7 +585,11 @@ impl ManagedSurface {
         }
         self.scaling.apply(surface, frame);
         if let Some(input) = &mut self.handle_input {
-            input.update(surface, (self.width, self.height));
+            input.update(
+                surface,
+                (self.width, self.height),
+                renderer.context().keyboard_button,
+            );
         }
         if surface.version() >= 4 {
             surface.damage_buffer(0, 0, width, height);
@@ -594,6 +625,25 @@ fn shm_buffer_geometry(width: u32, height: u32) -> Option<(i32, i32, i32, usize)
     Some((width, height, stride, pool_bytes as usize))
 }
 
+fn output_logical_size(info: &OutputInfo) -> Option<(u32, u32)> {
+    // xdg-output accounts for fractional scaling; older compositors can fall
+    // back to wl_output's current mode, transform, and integer scale.
+    let (w, h) = if let Some(size) = info.logical_size {
+        size
+    } else {
+        let (w, h) = info.modes.iter().find(|mode| mode.current)?.dimensions;
+        let scale = info.scale_factor.max(1);
+        match info.transform {
+            wl_output::Transform::_90
+            | wl_output::Transform::_270
+            | wl_output::Transform::Flipped90
+            | wl_output::Transform::Flipped270 => (h / scale, w / scale),
+            _ => (w / scale, h / scale),
+        }
+    };
+    (w > 0 && h > 0).then_some((w as u32, h as u32))
+}
+
 pub(crate) struct LayerApp {
     qh: QueueHandle<Self>,
     registry_state: RegistryState,
@@ -607,6 +657,7 @@ pub(crate) struct LayerApp {
     output_name: Option<String>,
     viewport_w: u32,
     viewport_h: u32,
+    output_transform: wl_output::Transform,
     pub(crate) visible: bool,
     pub(crate) active_scene: SceneKind,
     pill: Option<ManagedSurface>,
@@ -637,7 +688,6 @@ pub(crate) struct LayerApp {
 
 impl LayerApp {
     fn sync_surfaces(&mut self) {
-        self.sync_osk_visibility();
         if !self.visible {
             self.overlay = None;
             self.overlay_layout = None;
@@ -647,6 +697,17 @@ impl LayerApp {
         }
 
         if self.active_scene == SceneKind::Osk {
+            // A keyboardless seat may not be advertising wl_keyboard yet.
+            // Give the focused client time to subscribe before the first tap,
+            // rather than creating the keyboard and typing in the same batch.
+            if self
+                .osk
+                .seat()
+                .and_then(|seat| self.seat_state.info(seat))
+                .is_some_and(|info| !info.has_keyboard)
+            {
+                self.osk.ensure_virtual_keyboard(&self.qh);
+            }
             self.pill = None;
         } else if self.pill.is_none() {
             self.pill = Some(ManagedSurface::create(self, LayerRole::BottomPill));
@@ -674,6 +735,20 @@ impl LayerApp {
         }
     }
 
+    fn show_keyboard(&mut self) -> Result<(), &'static str> {
+        let available = if self.visible {
+            self.osk.can_open_manually()
+        } else {
+            self.osk.has_virtual_keyboard() && self.seat_state.seats().next().is_some()
+        };
+        if !available {
+            return Err("no virtual keyboard or active input method for this seat");
+        }
+        self.osk.auto_opened = false;
+        self.show_scene(SceneKind::Osk, false);
+        Ok(())
+    }
+
     pub(crate) fn show_scene(&mut self, scene: SceneKind, animate: bool) {
         self.drag = None;
         self.reset_handle_motion();
@@ -698,6 +773,10 @@ impl LayerApp {
             self.cancel_osk_drag();
             if self.active_scene == SceneKind::Osk {
                 self.osk.auto_opened = false;
+                self.osk.release_virtual_keyboard();
+                let osk = &mut self.renderer.context_mut().osk_state;
+                osk.ctrl = false;
+                osk.shift = ShiftState::Off;
             }
             if self.active_scene == SceneKind::Recents {
                 self.capture.invalidate();
@@ -712,7 +791,10 @@ impl LayerApp {
             }
         }
         if scene != SceneKind::Pill {
-            self.visible = true;
+            if !self.visible {
+                self.visible = true;
+                self.sync_osk_visibility();
+            }
             if refresh {
                 self.handler.on_action(
                     ShellAction::RequestRefresh(scene),
@@ -754,6 +836,7 @@ impl LayerApp {
 
     fn set_visible(&mut self, visible: bool) {
         self.visible = visible;
+        self.sync_osk_visibility();
         if !visible {
             self.reset_shade_page();
             if self.active_scene == SceneKind::Recents {
@@ -763,6 +846,7 @@ impl LayerApp {
             self.reset_handle_motion();
             self.home_spring = None;
             self.renderer.context_mut().recents_throw = None;
+            self.renderer.context_mut().osk_state = OskState::default();
             self.refresh_after_open = false;
             self.active_scene = SceneKind::Pill;
         }
@@ -783,24 +867,31 @@ impl LayerApp {
         }
     }
 
-    pub(crate) fn on_osk_input_lost(&mut self, auto_opened: bool) {
-        self.cancel_osk_drag();
-        if auto_opened && self.visible && self.active_scene == SceneKind::Osk {
-            self.show_scene(SceneKind::Pill, false);
+    pub(crate) fn on_osk_editor_lost(&mut self) {
+        if self.active_scene == SceneKind::Osk {
+            self.invalidate_osk_layout();
+            if self.osk.auto_opened || !self.osk.can_open_manually() {
+                self.show_scene(SceneKind::Pill, false);
+            } else {
+                self.draw_overlay();
+            }
+        } else {
+            self.draw_pill();
         }
     }
 
-    fn draw_pill(&mut self) {
+    pub(crate) fn draw_pill(&mut self) {
         let Some(surf) = &mut self.pill else {
             return;
         };
         if !surf.configured || surf.width == 0 || surf.height == 0 {
             return;
         }
-        self.renderer.context_mut().pill_pressed = self
-            .drag
-            .as_ref()
-            .is_some_and(|drag| drag.surface == SurfaceKind::Pill);
+        let ctx = self.renderer.context_mut();
+        ctx.pill_pressed = self.drag.as_ref().is_some_and(|drag| {
+            drag.surface == SurfaceKind::Pill && drag.keyboard_button.is_none()
+        });
+        ctx.keyboard_button = self.active_scene == SceneKind::Pill && self.osk.can_open_manually();
         let list = build_scene(
             SceneKind::Pill,
             surf.width as f32,
@@ -1054,6 +1145,9 @@ impl LayerApp {
     fn handle_daemon_command(&mut self, cmd: DaemonCommand) {
         match cmd {
             DaemonCommand::ShowScene(scene) => self.show_scene(scene, false),
+            DaemonCommand::ShowKeyboard(reply) => {
+                let _ = reply.send(self.show_keyboard());
+            }
             DaemonCommand::SetVisible(vis) => self.set_visible(vis),
             DaemonCommand::UpdateContext(ctx) => {
                 *self.renderer.context_mut() = *ctx;
@@ -1132,7 +1226,26 @@ impl LayerApp {
         }
     }
 
-    fn begin_drag(&mut self, touch_id: Option<i32>, kind: SurfaceKind, x: f32, y: f32) {
+    fn begin_drag(
+        &mut self,
+        seat: Option<&wl_seat::WlSeat>,
+        touch_id: Option<i32>,
+        kind: SurfaceKind,
+        x: f32,
+        y: f32,
+    ) {
+        let is_osk = kind == SurfaceKind::Overlay && self.active_scene == SceneKind::Osk;
+        let keyboard_button = (kind == SurfaceKind::Pill && self.active_scene == SceneKind::Pill)
+            .then(|| self.keyboard_button_at(x, y))
+            .flatten();
+        if (is_osk || keyboard_button.is_some())
+            && (seat.is_none() || seat != self.osk.seat() || self.osk.editor_changing())
+        {
+            return;
+        }
+        if is_osk && self.overlay_layout.is_none() {
+            return;
+        }
         let handle = match kind {
             SurfaceKind::Pill => self.pill.as_ref().map(|s| (EdgeHandle::Bottom, s)),
             SurfaceKind::TopStrip => self.top_strip.as_ref().map(|s| (EdgeHandle::Top, s)),
@@ -1167,17 +1280,15 @@ impl LayerApp {
         }
 
         let now = Instant::now();
-        let osk_repeat = if kind == SurfaceKind::Overlay && self.active_scene == SceneKind::Osk {
+        let osk_contact = if is_osk {
             self.overlay_layout.as_ref().and_then(|layout| {
                 layout
                     .hit_regions
                     .iter()
                     .rev()
                     .find_map(|hit| match hit.target {
-                        HitTarget::OskKey { label }
-                            if hit.rect.contains(x, y) && OskState::can_repeat(label) =>
-                        {
-                            Some(OskRepeat::new(now, label, hit.rect))
+                        HitTarget::OskKey { label } if hit.rect.contains(x, y) => {
+                            Some(OskContact::new(now, label, hit.rect))
                         }
                         _ => None,
                     })
@@ -1194,17 +1305,22 @@ impl LayerApp {
             last_y: y,
             max_travel: 0.0,
             handle_tap_allowed,
+            keyboard_button,
             overlay_tap_allowed,
             recent_card,
             active_slider,
-            osk_repeat,
+            osk_contact,
             motion: None,
             velocity: DragVelocity::new(now, x, y),
             start_time: now,
         });
-        if kind != SurfaceKind::Overlay {
+        if kind != SurfaceKind::Overlay && keyboard_button.is_none() {
             self.draw_surface(kind);
         }
+    }
+
+    fn keyboard_button_at(&self, x: f32, y: f32) -> Option<RegionRect> {
+        self.pill.as_ref()?.handle_input.as_ref()?.rects[1].filter(|rect| rect.contains(x, y))
     }
 
     fn overlay_size(&self) -> (f32, f32) {
@@ -1444,11 +1560,14 @@ impl LayerApp {
         drag.last_x = x;
         drag.last_y = y;
         drag.velocity.push(Instant::now(), x, y);
-        if let Some(repeat) = &mut drag.osk_repeat {
-            repeat.position(x, y);
+        if let Some(contact) = &mut drag.osk_contact {
+            contact.position(x, y);
         }
         let (dx, dy) = (x - drag.start_x, y - drag.start_y);
         drag.max_travel = drag.max_travel.max(dx.hypot(dy));
+        if drag.keyboard_button.is_some() {
+            return;
+        }
         if let Some(id) = drag.recent_card.as_ref().filter(|_| drag.motion.is_none()) {
             let ctx = self.renderer.context_mut();
             if ctx.recents_throw.is_some() || (dy < 0.0 && vertical(dx, dy)) {
@@ -1522,6 +1641,15 @@ impl LayerApp {
         }
 
         self.reset_handle_motion();
+        if let Some(button) = drag.keyboard_button {
+            if self.active_scene == SceneKind::Pill
+                && handle_tap(true, drag.max_travel)
+                && self.keyboard_button_at(drag.last_x, drag.last_y) == Some(button)
+            {
+                let _ = self.show_keyboard();
+            }
+            return;
+        }
         if let Some((id, offset)) = self.renderer.context_mut().recents_throw.take() {
             let (_, vy) = drag.velocity.at_release(Instant::now());
             if offset <= -96.0 || (offset <= -32.0 && vy <= -650.0) {
@@ -1611,18 +1739,12 @@ impl LayerApp {
                 }
 
                 if self.active_scene == SceneKind::Osk {
-                    if dy >= 60.0 && vy >= 220.0 {
-                        self.osk.auto_opened = false;
+                    if dy >= 60.0 && vy >= 220.0 && vertical(dx, dy) {
                         self.show_scene(SceneKind::Pill, false);
-                        return;
-                    }
-                    if drag.overlay_tap_allowed
-                        && dist < 24.0
-                        && !drag.osk_repeat.is_some_and(|repeat| repeat.fired)
-                    {
-                        self.handle_overlay_tap(drag.last_x, drag.last_y);
-                    } else {
-                        self.draw_overlay();
+                    } else if drag.max_travel < 24.0 {
+                        if let Some(label) = drag.osk_contact.and_then(OskContact::tap) {
+                            self.press_osk_key(label);
+                        }
                     }
                     return;
                 }
@@ -1745,8 +1867,7 @@ impl LayerApp {
                 self.draw_overlay();
             }
             HitTarget::Power(input) => self.handle_power_input(input),
-            HitTarget::PowerPanel => {}
-            HitTarget::OskKey { label } => self.press_osk_key(label),
+            HitTarget::PowerPanel | HitTarget::OpenKeyboard | HitTarget::OskKey { .. } => {}
         }
     }
 
@@ -1825,7 +1946,6 @@ impl LayerApp {
         let action = state.press(label);
         let changed = *state != previous;
         if action == OskEmit::Dismiss {
-            self.osk.auto_opened = false;
             self.show_scene(SceneKind::Pill, false);
         } else {
             self.osk.emit(action, &self.qh);
@@ -1841,13 +1961,36 @@ impl LayerApp {
         }
     }
 
+    pub(crate) fn invalidate_osk_layout(&mut self) {
+        if self.active_scene == SceneKind::Osk {
+            self.cancel_osk_drag();
+            self.overlay_layout = None;
+        }
+    }
+
+    fn reflow_osk(&mut self) {
+        self.invalidate_osk_layout();
+        let spec =
+            LayerSurfaceSpec::for_role(LayerRole::TouchOsk, self.viewport_w, self.viewport_h);
+        if let Some(surface) = &mut self.overlay {
+            if surface.height != spec.height {
+                // Commit the new work-area reservation with the new buffer.
+                // Keep the OSK surface and seat binding rather than closing it.
+                surface.layer.set_size(0, spec.height);
+                surface.layer.set_exclusive_zone(spec.exclusive_zone);
+                surface.height = spec.height;
+            }
+        }
+        self.draw_overlay();
+    }
+
     fn osk_repeat_timeout(&self) -> Option<Duration> {
         if self.active_scene != SceneKind::Osk {
             return None;
         }
         self.drag
             .as_ref()?
-            .osk_repeat
+            .osk_contact
             .as_ref()?
             .deadline()
             .map(|deadline| deadline.saturating_duration_since(Instant::now()))
@@ -1860,7 +2003,7 @@ impl LayerApp {
         if let Some(key) = self
             .drag
             .as_mut()
-            .and_then(|drag| drag.osk_repeat.as_mut())
+            .and_then(|drag| drag.osk_contact.as_mut())
             .and_then(|repeat| repeat.tick(Instant::now()))
         {
             self.press_osk_key(key);
@@ -1970,6 +2113,7 @@ pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
         output_name: config.output_name.clone(),
         viewport_w: 1280,
         viewport_h: 853,
+        output_transform: wl_output::Transform::Normal,
         visible: config.initial_visible,
         active_scene: initial_scene,
         pill: None,
@@ -1988,7 +2132,7 @@ pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
         pointer: None,
         touch: None,
         drag: None,
-        osk: OskWaylandState::bind_globals(&globals, &qh),
+        osk: OskWaylandState::bind_globals(&globals, &qh, config.osk_policy),
         capture: ToplevelCaptureState::bind_globals(&globals, &qh),
         handler: Box::new(handler),
         exit: false,
@@ -2015,12 +2159,10 @@ pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
     });
 
     if let Some((out, info)) = matched {
-        if let Some((w, h)) = info.logical_size {
-            if w > 0 && h > 0 {
-                app.viewport_w = w as u32;
-                app.viewport_h = h as u32;
-            }
+        if let Some((w, h)) = output_logical_size(&info) {
+            (app.viewport_w, app.viewport_h) = (w, h);
         }
+        app.output_transform = info.transform;
         if app.output_name.is_none() {
             app.output_name = info.name;
         }
@@ -2032,7 +2174,15 @@ pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
     }
 
     if config.initial_visible {
-        app.show_scene(initial_scene, false);
+        app.sync_osk_visibility();
+        if initial_scene == SceneKind::Osk {
+            if let Err(reason) = app.show_keyboard() {
+                eprintln!("veilshell: cannot show OSK: {reason}");
+                app.show_scene(SceneKind::Pill, false);
+            }
+        } else {
+            app.show_scene(initial_scene, false);
+        }
     }
 
     let mut event_loop: EventLoop<LayerApp> =
@@ -2186,17 +2336,27 @@ impl OutputHandler for LayerApp {
         _qh: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
-        if self.target_output.as_ref() == Some(&output) {
-            if let Some(info) = self.output_state.info(&output) {
-                if let Some((w, h)) = info.logical_size {
-                    if let (Ok(uw), Ok(uh)) = (u32::try_from(w), u32::try_from(h)) {
-                        if uw > 0 && uh > 0 {
-                            self.viewport_w = uw;
-                            self.viewport_h = uh;
-                        }
-                    }
-                }
-            }
+        if self.target_output.as_ref() != Some(&output) {
+            return;
+        }
+        let Some(info) = self.output_state.info(&output) else {
+            return;
+        };
+        let new_size = output_logical_size(&info).unwrap_or((self.viewport_w, self.viewport_h));
+        if new_size == (self.viewport_w, self.viewport_h) && info.transform == self.output_transform
+        {
+            return;
+        }
+        (self.viewport_w, self.viewport_h) = new_size;
+        self.output_transform = info.transform;
+        if self.active_scene == SceneKind::Osk {
+            self.reflow_osk();
+        } else if self
+            .drag
+            .as_ref()
+            .is_some_and(|drag| drag.keyboard_button.is_some())
+        {
+            self.abort_drag();
         }
     }
 
@@ -2229,42 +2389,55 @@ impl LayerShellHandler for LayerApp {
         let Some(kind) = self.surface_kind(layer.wl_surface()) else {
             return;
         };
-        if kind == SurfaceKind::Overlay {
-            self.cancel_osk_drag();
-        }
-
-        let mut new_w = None;
-        let mut new_h = None;
+        let is_osk = kind == SurfaceKind::Overlay && self.active_scene == SceneKind::Osk;
+        let (w_hint, h_hint) = configure.new_size;
+        let known_width = self.viewport_w;
         let mut resized = false;
         if let Some(target) = self.managed_surface_mut(kind) {
-            if configure.new_size.0 > 0 {
-                resized |= target.configured && target.width != configure.new_size.0;
-                target.width = configure.new_size.0;
-                new_w = Some(target.width);
-            }
-            if configure.new_size.1 > 0 {
-                resized |= target.configured && target.height != configure.new_size.1;
-                target.height = configure.new_size.1;
-                new_h = Some(target.height);
-            }
+            let width = if w_hint > 0 {
+                w_hint
+            } else if is_osk {
+                known_width
+            } else {
+                target.width
+            };
+            // A bottom-anchored OSK chooses its own height; a configure queued
+            // before reflow must not restore the old height or reservation.
+            let height = if !is_osk && h_hint > 0 {
+                h_hint
+            } else {
+                target.height
+            };
+            resized = target.configured && (target.width, target.height) != (width, height);
+            target.width = width;
+            target.height = height;
             target.configured = true;
+        }
+        if resized && is_osk {
+            self.invalidate_osk_layout();
         }
 
         match kind {
             SurfaceKind::Pill => {
-                if let Some(w) = new_w {
-                    self.viewport_w = w;
+                if resized
+                    && self
+                        .drag
+                        .as_ref()
+                        .is_some_and(|drag| drag.keyboard_button.is_some())
+                {
+                    self.abort_drag();
+                } else {
+                    self.draw_pill();
                 }
-                self.draw_pill();
             }
             SurfaceKind::TopStrip => self.draw_top_strip(),
             SurfaceKind::Overlay => {
-                if let Some(w) = new_w {
-                    self.viewport_w = w;
-                }
-                if let Some(h) = new_h {
-                    if self.active_scene != SceneKind::Osk {
-                        self.viewport_h = h;
+                if self.target_output.is_none() && !is_osk {
+                    if w_hint > 0 {
+                        self.viewport_w = w_hint;
+                    }
+                    if h_hint > 0 {
+                        self.viewport_h = h_hint;
                     }
                 }
                 if resized && self.drag.as_ref().is_some_and(|drag| drag.motion.is_some()) {
@@ -2285,6 +2458,7 @@ impl SeatHandler for LayerApp {
     fn new_seat(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
         if self.visible {
             self.osk.attach_seat(&seat, qh);
+            self.draw_pill();
         }
     }
 
@@ -2310,10 +2484,16 @@ impl SeatHandler for LayerApp {
     fn remove_capability(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _seat: wl_seat::WlSeat,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
+        if capability == Capability::Keyboard
+            && self.active_scene == SceneKind::Osk
+            && self.osk.seat() == Some(&seat)
+        {
+            self.osk.ensure_virtual_keyboard(qh);
+        }
         if capability == Capability::Pointer {
             if self
                 .drag
@@ -2341,13 +2521,14 @@ impl SeatHandler for LayerApp {
     }
 
     fn remove_seat(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
-        let auto_opened = self.osk.auto_opened;
         if self.osk.detach_seat(&seat) {
-            self.on_osk_input_lost(auto_opened);
+            self.renderer.context_mut().osk_state = OskState::default();
+            self.on_osk_editor_lost();
             // SCTK removes the seat from its list after this callback.
             if self.visible {
                 if let Some(next) = self.seat_state.seats().find(|next| next != &seat) {
                     self.osk.attach_seat(&next, qh);
+                    self.draw_pill();
                 }
             }
         }
@@ -2359,9 +2540,13 @@ impl PointerHandler for LayerApp {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _pointer: &wl_pointer::WlPointer,
+        pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
+        if self.pointer.as_ref() != Some(pointer) {
+            return;
+        }
+        let seat = pointer.data::<PointerData<()>>().map(PointerData::seat);
         for event in events {
             let Some(kind) = self.surface_kind(&event.surface) else {
                 continue;
@@ -2369,7 +2554,7 @@ impl PointerHandler for LayerApp {
             let (x, y) = (event.position.0 as f32, event.position.1 as f32);
             match event.kind {
                 PointerEventKind::Press { button: 0x110, .. } if self.drag.is_none() => {
-                    self.begin_drag(None, kind, x, y);
+                    self.begin_drag(seat, None, kind, x, y);
                 }
                 PointerEventKind::Motion { .. } => self.update_drag(None, x, y),
                 PointerEventKind::Release { button: 0x110, .. } => self.finish_drag(None),
@@ -2400,16 +2585,17 @@ impl TouchHandler for LayerApp {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _touch: &wl_touch::WlTouch,
+        touch: &wl_touch::WlTouch,
         _serial: u32,
         _time: u32,
         surface: wl_surface::WlSurface,
         id: i32,
         position: (f64, f64),
     ) {
-        if self.drag.is_none() {
+        if self.drag.is_none() && self.touch.as_ref() == Some(touch) {
+            let seat = touch.data::<TouchData<()>>().map(TouchData::seat);
             if let Some(kind) = self.surface_kind(&surface) {
-                self.begin_drag(Some(id), kind, position.0 as f32, position.1 as f32);
+                self.begin_drag(seat, Some(id), kind, position.0 as f32, position.1 as f32);
             }
         }
     }
@@ -2418,24 +2604,28 @@ impl TouchHandler for LayerApp {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _touch: &wl_touch::WlTouch,
+        touch: &wl_touch::WlTouch,
         _serial: u32,
         _time: u32,
         id: i32,
     ) {
-        self.finish_drag(Some(id));
+        if self.touch.as_ref() == Some(touch) {
+            self.finish_drag(Some(id));
+        }
     }
 
     fn motion(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _touch: &wl_touch::WlTouch,
+        touch: &wl_touch::WlTouch,
         _time: u32,
         id: i32,
         position: (f64, f64),
     ) {
-        self.update_drag(Some(id), position.0 as f32, position.1 as f32);
+        if self.touch.as_ref() == Some(touch) {
+            self.update_drag(Some(id), position.0 as f32, position.1 as f32);
+        }
     }
 
     fn shape(
@@ -2459,8 +2649,10 @@ impl TouchHandler for LayerApp {
     ) {
     }
 
-    fn cancel(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _touch: &wl_touch::WlTouch) {
-        self.abort_drag();
+    fn cancel(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, touch: &wl_touch::WlTouch) {
+        if self.touch.as_ref() == Some(touch) {
+            self.abort_drag();
+        }
     }
 }
 
@@ -2503,6 +2695,21 @@ mod tests {
             Some(RegionRect(34, 0, 152, 48))
         );
         assert_eq!(EdgeHandle::Top.input_rect((220, 0)), None);
+    }
+
+    #[test]
+    fn keyboard_button_only_adds_a_disjoint_region_to_the_resting_bottom_pill() {
+        for w in [640, 960] {
+            let [pill, keyboard] = EdgeHandle::Bottom.input_rects((w, 48), true);
+            let keyboard = keyboard.unwrap();
+            let RegionRect(x, y, width, _) = keyboard;
+            let RegionRect(left, _, pill_width, _) = pill.unwrap();
+            assert!(x > left + pill_width);
+            assert!(x + width < i32::try_from(w).unwrap());
+            assert!(keyboard.contains((x + 22) as f32, (y + 22) as f32));
+            assert_eq!(EdgeHandle::Bottom.input_rects((w, 48), false), [pill, None]);
+            assert!(EdgeHandle::Top.input_rects((w, 48), true)[1].is_none());
+        }
     }
 
     #[test]
