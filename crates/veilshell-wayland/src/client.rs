@@ -985,7 +985,7 @@ impl LayerApp {
                     self.show_scene(SceneKind::Pill, false);
                 }
                 emit => {
-                    self.osk.emit(emit);
+                    self.osk.emit(emit, &self.qh);
                     self.draw_overlay();
                 }
             },

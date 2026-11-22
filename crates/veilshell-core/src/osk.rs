@@ -503,6 +503,10 @@ pub const fn char_to_evdev(ch: char) -> Option<(u32, bool)> {
 }
 
 /// Self-contained US-QWERTY `XKB` keymap uploaded to `zwp_virtual_keyboard_v1`.
+///
+/// Includes all four `XKB` required types (`ONE_LEVEL`, `TWO_LEVEL`, `ALPHABETIC`, `KEYPAD`)
+/// and avoids invalid `virtual_modifiers None` declarations so both `libxkbcommon` and
+/// `Xwayland`/`xkbcomp` compile and apply it without warnings or crashes.
 pub const US_QWERTY_XKB_KEYMAP: &str = r#"xkb_keymap {
   xkb_keycodes "veilshell" {
     minimum = 8;
@@ -519,11 +523,12 @@ pub const US_QWERTY_XKB_KEYMAP: &str = r#"xkb_keymap {
     <AC11> = 48; <TLDE> = 49; <LFSH> = 50; <BKSL> = 51;
     <AB01> = 52; <AB02> = 53; <AB03> = 54; <AB04> = 55; <AB05> = 56;
     <AB06> = 57; <AB07> = 58; <AB08> = 59; <AB09> = 60; <AB10> = 61;
-    <SPCE> = 65;
+    <SPCE> = 65; <CAPS> = 66;
     <UP>   = 111; <LEFT> = 113; <RGHT> = 114; <DOWN> = 116;
+    indicator 1 = "Caps Lock";
   };
   xkb_types "veilshell" {
-    virtual_modifiers None;
+    virtual_modifiers NumLock;
     type "ONE_LEVEL" {
       modifiers = none;
       level_name[Level1] = "Any";
@@ -541,11 +546,26 @@ pub const US_QWERTY_XKB_KEYMAP: &str = r#"xkb_keymap {
       level_name[Level1] = "Base";
       level_name[Level2] = "Caps";
     };
+    type "KEYPAD" {
+      modifiers = Shift+NumLock;
+      map[Shift] = Level2;
+      map[NumLock] = Level2;
+      level_name[Level1] = "Base";
+      level_name[Level2] = "Number";
+    };
   };
   xkb_compatibility "veilshell" {
+    virtual_modifiers NumLock;
+    interpret.useModMapMods = AnyLevel;
+    interpret.repeat = False;
     interpret Any+AnyOf(all) { action = SetMods(modifiers=modMapMods,clearLocks); };
+    indicator "Caps Lock" {
+      whichModState = locked;
+      modifiers = Lock;
+    };
   };
   xkb_symbols "veilshell" {
+    name[group1] = "English (US)";
     key <ESC>  { [ Escape ] };
     key <AE01> { [ 1, exclam ] };
     key <AE02> { [ 2, at ] };
@@ -600,11 +620,13 @@ pub const US_QWERTY_XKB_KEYMAP: &str = r#"xkb_keymap {
     key <AB09> { [ period, greater ] };
     key <AB10> { [ slash, question ] };
     key <SPCE> { [ space ] };
+    key <CAPS> { [ Caps_Lock ] };
     key <UP>   { [ Up ] };
     key <LEFT> { [ Left ] };
     key <RGHT> { [ Right ] };
     key <DOWN> { [ Down ] };
     modifier_map Shift { <LFSH> };
+    modifier_map Lock { <CAPS> };
     modifier_map Control { <LCTL> };
   };
 };
@@ -736,6 +758,22 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn xkb_keymap_includes_all_four_required_types_and_no_none_vmod() {
+        assert!(!US_QWERTY_XKB_KEYMAP.contains("virtual_modifiers None"));
+        for required in [
+            "\"ONE_LEVEL\"",
+            "\"TWO_LEVEL\"",
+            "\"ALPHABETIC\"",
+            "\"KEYPAD\"",
+        ] {
+            assert!(
+                US_QWERTY_XKB_KEYMAP.contains(required),
+                "missing required XKB type {required}"
+            );
         }
     }
 }

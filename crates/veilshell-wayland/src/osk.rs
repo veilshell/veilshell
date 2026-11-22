@@ -127,6 +127,7 @@ impl Dispatch2<ZwpInputMethodV2, LayerApp> for InputMethodData {
 pub(crate) struct OskWaylandState {
     im_manager: Option<ZwpInputMethodManagerV2>,
     vk_manager: Option<ZwpVirtualKeyboardManagerV1>,
+    seat: Option<WlSeat>,
     pub(crate) input_method: Option<ZwpInputMethodV2>,
     pub(crate) virtual_keyboard: Option<ZwpVirtualKeyboardV1>,
     pub(crate) im_pending_active: bool,
@@ -148,6 +149,7 @@ impl OskWaylandState {
         Self {
             im_manager,
             vk_manager,
+            seat: None,
             input_method: None,
             virtual_keyboard: None,
             im_pending_active: false,
@@ -158,27 +160,36 @@ impl OskWaylandState {
         }
     }
 
-    /// Create input-method and virtual-keyboard objects on the first available `wl_seat`.
+    /// Attach the input-method listener on the first available `wl_seat` (virtual keyboard
+    /// is created lazily on the first OSK keystroke so startup never disturbs compositor keymaps).
     pub(crate) fn attach_seat(&mut self, seat: &WlSeat, qh: &QueueHandle<LayerApp>) {
+        if self.seat.is_none() {
+            self.seat = Some(seat.clone());
+        }
         if self.input_method.is_none() {
             if let Some(mgr) = &self.im_manager {
                 self.input_method = Some(mgr.get_input_method(seat, qh, InputMethodData));
             }
         }
-        if self.virtual_keyboard.is_none() {
-            if let Some(mgr) = &self.vk_manager {
-                let vk = mgr.create_virtual_keyboard(seat, qh, VirtualKeyboardData);
-                if upload_xkb_keymap(&vk).is_some() {
-                    self.virtual_keyboard = Some(vk);
-                } else {
-                    vk.destroy();
-                }
-            }
+    }
+
+    fn ensure_virtual_keyboard(&mut self, qh: &QueueHandle<LayerApp>) {
+        if self.virtual_keyboard.is_some() {
+            return;
+        }
+        let (Some(mgr), Some(seat)) = (&self.vk_manager, &self.seat) else {
+            return;
+        };
+        let vk = mgr.create_virtual_keyboard(seat, qh, VirtualKeyboardData);
+        if upload_xkb_keymap(&vk).is_some() {
+            self.virtual_keyboard = Some(vk);
+        } else {
+            vk.destroy();
         }
     }
 
     /// Emit text or virtual keystrokes to the active client/compositor.
-    pub(crate) fn emit(&mut self, action: OskEmit) {
+    pub(crate) fn emit(&mut self, action: OskEmit, qh: &QueueHandle<LayerApp>) {
         match action {
             OskEmit::None | OskEmit::Dismiss => {}
             OskEmit::Text {
@@ -195,10 +206,12 @@ impl OskWaylandState {
                     }
                 }
                 if let Some(code) = evdev_code {
+                    self.ensure_virtual_keyboard(qh);
                     self.send_vk_stroke(code, shift, ctrl);
                 }
             }
             OskEmit::SpecialKey { evdev_code, ctrl } => {
+                self.ensure_virtual_keyboard(qh);
                 self.send_vk_stroke(evdev_code, false, ctrl);
             }
         }
