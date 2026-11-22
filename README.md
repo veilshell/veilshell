@@ -89,8 +89,8 @@ veilctl quit             # Stop the daemon cleanly
 
 If VeilShell is running in the foreground, Ctrl+C also shuts it down cleanly.
 
-Tap the **keyboard icon** near the bottom-right corner to type in the focused
-app. The typing rows stay centered around a wide spacebar. Shortcuts sit
+Tap the translucent **keyboard icon** near the bottom-right corner to type in
+the focused app. The typing rows stay centered around a wide spacebar. Shortcuts sit
 beside the keys in wide landscape views, or above them in portrait and on
 narrower outputs. **TERM** adds Escape, Tab and all four arrows to the letter
 layout. Hold Backspace or an arrow to repeat. Tap **HIDE** or swipe down to

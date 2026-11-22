@@ -451,24 +451,14 @@ fn build_pill(
     push_bottom_pill_bar(&mut out.draw_list, width, height, palette, ctx);
     out.push_hit(HitRect::new(0.0, 0.0, width, height), HitTarget::BottomPill);
     if let Some(button) = keyboard_button_bounds(width, height).filter(|_| ctx.keyboard_button) {
-        out.draw_list.push_rect(
-            RoundedRect::filled(
-                button.x + 1.0,
-                button.y + 6.0,
-                button.w - 2.0,
-                button.h - 12.0,
-                10.0,
-                palette.surface.with_alpha(0.44),
-            )
-            .with_glass_border(palette.foreground.with_alpha(0.14), 1.0, 0.06),
-        );
+        // Keep the full touch target without painting a tile behind the icon.
         shade_glyphs::draw(
             &mut out.draw_list,
             Glyph::Keyboard,
             button.x + button.w * 0.5,
             button.y + button.h * 0.5,
             24.0,
-            palette.foreground,
+            palette.foreground.with_alpha(0.60),
         );
         out.push_hit(button, HitTarget::OpenKeyboard);
     }

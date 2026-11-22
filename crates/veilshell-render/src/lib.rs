@@ -598,24 +598,27 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_button_is_translucent_and_has_a_separate_bottom_right_hit_target() {
+    fn bare_translucent_keyboard_icon_keeps_its_bottom_right_touch_target() {
         let palette = ThemePalette::default_dark();
         let mut ctx = SceneContext::default();
         for width in [348.0, 360.0, 640.0, 853.0, 1280.0] {
             let pill = bottom_pill_bounds(width, 48.0);
             let button = keyboard_button_bounds(width, 48.0).unwrap();
+            assert!((button.w - 44.0).abs() < f32::EPSILON);
+            assert!((button.h - 44.0).abs() < f32::EPSILON);
             assert!(button.x > pill.x + pill.w + 24.0);
             assert!((width - button.x - button.w - 12.0).abs() < f32::EPSILON);
             let x = button.x + 22.0;
             ctx.keyboard_button = true;
             let layout = build_scene_layout(SceneKind::Pill, width, 48.0, &palette, &ctx);
-            let [DrawCommand::Rect(_), DrawCommand::Rect(back), DrawCommand::Image(glyph)] =
+            let [DrawCommand::Rect(_), DrawCommand::Image(glyph)] =
                 layout.draw_list.commands.as_slice()
             else {
-                panic!("expected the pill and keyboard button");
+                panic!("expected the pill and a keyboard icon without a backplate");
             };
-            assert!(back.fill.a <= 0.5 && glyph.alpha >= 0.9);
-            assert!(button.contains(glyph.x + glyph.w * 0.5, glyph.y + glyph.h * 0.5));
+            assert!((0.5..=0.65).contains(&glyph.alpha));
+            assert!(button.contains(glyph.x, glyph.y));
+            assert!(button.contains(glyph.x + glyph.w, glyph.y + glyph.h));
             assert_eq!(layout.hit_test(x, 24.0), Some(&HitTarget::OpenKeyboard));
             assert_eq!(
                 layout.hit_test(width * 0.5, 36.0),
@@ -626,6 +629,39 @@ mod tests {
             assert_ne!(layout.hit_test(x, 24.0), Some(&HitTarget::OpenKeyboard));
         }
         assert!(keyboard_button_bounds(240.0, 48.0).is_none());
+    }
+
+    #[test]
+    fn keyboard_opener_pixels_leave_the_corner_and_touch_padding_clear() {
+        let spec = SnapshotSpec {
+            scene: SceneKind::Pill,
+            viewport: ViewportSize {
+                width: 960,
+                height: 48,
+                scale: 1.25,
+            },
+            orientation: Orientation::Normal,
+        };
+        let frame = SdfSoftwareRenderer::default()
+            .render_snapshot(&spec, &ThemePalette::default_dark())
+            .unwrap();
+        // At 1.25x the rightmost target starts at x=1130, but only the
+        // 24-logical-pixel icon within it should paint any pixels.
+        let max_icon_alpha = frame
+            .rgba
+            .chunks_exact(4)
+            .enumerate()
+            .filter(|(i, _)| i % frame.width as usize >= 1130)
+            .map(|(i, pixel)| {
+                let x = i % frame.width as usize;
+                let y = i / frame.width as usize;
+                if !(1142..1173).contains(&x) || !(15..45).contains(&y) {
+                    assert_eq!(pixel[3], 0, "unexpected backing pixel at {x},{y}");
+                }
+                pixel[3]
+            })
+            .max();
+        assert_eq!(max_icon_alpha, Some(153));
     }
 
     #[test]
