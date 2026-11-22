@@ -6,8 +6,11 @@
 
 struct ViewportUniforms {
     size: vec2<f32>,
+    atlas_size: vec2<f32>,
     wallpaper_enabled: u32,
-    _pad: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 @group(0) @binding(0)
@@ -18,6 +21,9 @@ var t_wallpaper: texture_2d<f32>;
 
 @group(0) @binding(2)
 var s_wallpaper: sampler;
+
+@group(0) @binding(3)
+var t_atlas: texture_2d<f32>;
 
 struct PrimitiveInput {
     @location(0) rect: vec4<f32>,
@@ -42,6 +48,8 @@ const KIND_BACKDROP: u32 = 0u;
 const KIND_GLOW: u32 = 1u;
 const KIND_RECT: u32 = 2u;
 const KIND_GLYPH: u32 = 3u;
+const KIND_IMAGE: u32 = 4u;
+const KIND_ALPHA_GLYPH: u32 = 5u;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vid: u32, inst: PrimitiveInput) -> VertexOutput {
@@ -67,7 +75,10 @@ fn vs_main(@builtin(vertex_index) vid: u32, inst: PrimitiveInput) -> VertexOutpu
         let pad = inst.params0.w;
         quad_min = inst.rect.xy - vec2<f32>(pad, pad);
         quad_size = inst.rect.zw + vec2<f32>(pad * 2.0, pad * 2.0);
-    } else if kind == KIND_GLYPH {
+    } else if kind == KIND_IMAGE {
+        quad_min = inst.rect.xy - vec2<f32>(1.0, 1.0);
+        quad_size = inst.rect.zw + vec2<f32>(2.0, 2.0);
+    } else if kind == KIND_GLYPH || kind == KIND_ALPHA_GLYPH {
         quad_min = inst.rect.xy;
         quad_size = inst.rect.zw;
     }
@@ -191,6 +202,46 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             discard;
         }
         return out;
+    }
+
+    if kind == KIND_IMAGE {
+        let half_ext = in.rect.zw * 0.5;
+        let center = in.rect.xy + half_ext;
+        let r = clamp(in.params1.x, 0.0, min(half_ext.x, half_ext.y));
+        let dist = sdf_rounded_box(frag - center, half_ext, r);
+        let cov = clamp(0.5 - dist, 0.0, 1.0);
+        if cov <= 0.001 {
+            discard;
+        }
+        let atlas_sz = max(u_viewport.atlas_size, vec2<f32>(1.0, 1.0));
+        let local_uv = clamp(
+            (frag - in.rect.xy) / max(in.rect.zw, vec2<f32>(1.0, 1.0)),
+            vec2<f32>(0.0, 0.0),
+            vec2<f32>(1.0, 1.0),
+        );
+        let min_px = in.params0.xy + vec2<f32>(0.5, 0.5);
+        let max_px = in.params0.xy + max(in.params0.zw - vec2<f32>(0.5, 0.5), vec2<f32>(0.5, 0.5));
+        let sample_px = clamp(in.params0.xy + local_uv * in.params0.zw, min_px, max_px);
+        let tex = textureSampleLevel(t_atlas, s_wallpaper, sample_px / atlas_sz, 0.0);
+        let a = clamp(tex.a * in.color0.a * cov, 0.0, 1.0);
+        if a <= 0.001 {
+            discard;
+        }
+        return vec4<f32>(clamp(tex.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * a, a);
+    }
+
+    if kind == KIND_ALPHA_GLYPH {
+        let atlas_sz = max(u_viewport.atlas_size, vec2<f32>(1.0, 1.0));
+        let local = frag - in.rect.xy;
+        let min_px = vec2<f32>(0.5, 0.5);
+        let max_px = max(in.params0.zw - vec2<f32>(0.5, 0.5), vec2<f32>(0.5, 0.5));
+        let sample_px = in.params0.xy + clamp(local, min_px, max_px);
+        let cov = textureSampleLevel(t_atlas, s_wallpaper, sample_px / atlas_sz, 0.0).a;
+        let a = clamp(in.color0.a * cov, 0.0, 1.0);
+        if a <= 0.001 {
+            discard;
+        }
+        return vec4<f32>(clamp(in.color0.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * a, a);
     }
 
     // KIND_GLYPH: crisp 5x7 ASCII bitmap glyph packed into meta.y (rows 0..4) & meta.z (rows 4..7)

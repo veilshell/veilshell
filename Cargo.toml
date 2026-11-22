@@ -22,6 +22,7 @@ keywords = ["wayland", "tablet", "touch", "shell", "hyprland"]
 categories = ["gui", "os::linux-apis"]
 
 [workspace.dependencies]
+ab_glyph = "0.2"
 veilshell-core = { path = "crates/veilshell-core" }
 veilshell-compositor = { path = "crates/veilshell-compositor" }
 veilshell-hw = { path = "crates/veilshell-hw" }

@@ -1,8 +1,12 @@
 //! Glassmorphic scene layout builders and interactive hit-testing for all `VeilShell` surfaces.
 
+use std::sync::Arc;
+
 use veilshell_core::{OskState, Rgba, ShiftState, ThemePalette};
 
-use crate::primitives::{DrawList, HitRect, HitTarget, RoundedRect, SceneOutput, TextAlign};
+use crate::primitives::{
+    DrawList, HitRect, HitTarget, ImageQuad, RgbaImage, RoundedRect, SceneOutput, TextAlign,
+};
 use crate::SceneKind;
 
 /// Visual application tile shown in the paged `Home` app grid.
@@ -12,6 +16,7 @@ pub struct AppTile {
     pub label: String,
     pub exec: String,
     pub tint: Rgba,
+    pub icon: Option<Arc<RgbaImage>>,
 }
 
 /// Active window card shown in the `Recents` deck.
@@ -21,6 +26,8 @@ pub struct RecentsCard {
     pub app_id: String,
     pub title: String,
     pub focused: bool,
+    pub foreign_id: Option<String>,
+    pub thumbnail: Option<Arc<RgbaImage>>,
 }
 
 /// Dynamic data injected into scene layout builders (live windows, apps, hardware state, gestures).
@@ -77,21 +84,27 @@ impl Default for SceneContext {
             recents_cards: vec![
                 RecentsCard {
                     id: "0x1".into(),
-                    app_id: "FOOT".into(),
-                    title: "TERMINAL".into(),
+                    app_id: "Foot".into(),
+                    title: "Terminal".into(),
                     focused: true,
+                    foreign_id: None,
+                    thumbnail: None,
                 },
                 RecentsCard {
                     id: "0x2".into(),
-                    app_id: "CHROMIUM".into(),
-                    title: "VEILSHELL".into(),
+                    app_id: "Chromium".into(),
+                    title: "VeilShell".into(),
                     focused: false,
+                    foreign_id: None,
+                    thumbnail: None,
                 },
                 RecentsCard {
                     id: "0x3".into(),
-                    app_id: "OBSIDIAN".into(),
-                    title: "SURFACE NOTES".into(),
+                    app_id: "Obsidian".into(),
+                    title: "Surface Notes".into(),
                     focused: false,
+                    foreign_id: None,
+                    thumbnail: None,
                 },
             ],
             osk_state: OskState::default(),
@@ -103,18 +116,18 @@ impl Default for SceneContext {
 #[must_use]
 pub fn default_demo_apps() -> Vec<AppTile> {
     [
-        ("TERM", "TERMINAL", "foot", (122, 162, 247)),
-        ("WEB", "BROWSER", "chromium", (166, 161, 231)),
-        ("DIR", "FILES", "nautilus", (168, 201, 99)),
-        ("NOTE", "NOTES", "obsidian", (231, 174, 109)),
-        ("CONF", "SETTINGS", "systemsettings", (173, 147, 234)),
-        ("MUS", "MUSIC", "spotify", (245, 123, 156)),
-        ("CAL", "CALENDAR", "gnome-calendar", (63, 177, 186)),
-        ("MAIL", "MAIL", "thunderbird", (245, 154, 118)),
-        ("IMG", "PHOTOS", "loupe", (133, 185, 255)),
-        ("CODE", "EDITOR", "nvim", (192, 226, 124)),
-        ("SYS", "MONITOR", "btop", (255, 142, 171)),
-        ("APP", "PACKAGES", "pacman", (189, 162, 251)),
+        ("TERM", "Terminal", "foot", (122, 162, 247)),
+        ("WEB", "Browser", "chromium", (166, 161, 231)),
+        ("DIR", "Files", "nautilus", (168, 201, 99)),
+        ("NOTE", "Notes", "obsidian", (231, 174, 109)),
+        ("CONF", "Settings", "systemsettings", (173, 147, 234)),
+        ("MUS", "Music", "spotify", (245, 123, 156)),
+        ("CAL", "Calendar", "gnome-calendar", (63, 177, 186)),
+        ("MAIL", "Mail", "thunderbird", (245, 154, 118)),
+        ("IMG", "Photos", "loupe", (133, 185, 255)),
+        ("CODE", "Editor", "nvim", (192, 226, 124)),
+        ("SYS", "Monitor", "btop", (255, 142, 171)),
+        ("APP", "Packages", "pacman", (189, 162, 251)),
     ]
     .into_iter()
     .map(|(badge, label, exec, (r, g, b))| AppTile {
@@ -122,6 +135,7 @@ pub fn default_demo_apps() -> Vec<AppTile> {
         label: label.to_owned(),
         exec: exec.to_owned(),
         tint: Rgba::from_rgb_u8(r, g, b),
+        icon: None,
     })
     .collect()
 }
@@ -205,13 +219,13 @@ fn mix(a: Rgba, b: Rgba, t: f32) -> Rgba {
     }
 }
 
-fn truncate_ascii_label(raw: &str, max_chars: usize) -> String {
-    let upper = raw.trim().to_ascii_uppercase();
-    let count = upper.chars().count();
+fn truncate_label(raw: &str, max_chars: usize) -> String {
+    let trimmed = raw.trim();
+    let count = trimmed.chars().count();
     if count <= max_chars || max_chars < 4 {
-        return upper;
+        return trimmed.to_owned();
     }
-    let mut out: String = upper.chars().take(max_chars - 2).collect();
+    let mut out: String = trimmed.chars().take(max_chars - 2).collect();
     out.push_str("..");
     out
 }
@@ -341,17 +355,17 @@ fn build_status_bar(
     list.push_text(
         width * 0.5,
         bar_y + 15.0,
-        "VEILSHELL",
+        "VeilShell",
         2,
         palette.accent.with_alpha(alpha),
         TextAlign::Center,
     );
 
     let net = match (ctx.wifi_connected, ctx.lte_connected) {
-        (true, true) => "WIFI LTE",
-        (true, false) => "WIFI",
+        (true, true) => "Wi-Fi LTE",
+        (true, false) => "Wi-Fi",
         (false, true) => "LTE",
-        (false, false) => "OFFLINE",
+        (false, false) => "Offline",
     };
     let status = format!("{net}  {}%", ctx.battery_pct);
     list.push_text(
@@ -432,16 +446,29 @@ fn build_home(
             .with_shadow(16.0, 8.0, 0.32 * progress),
         );
 
-        let badge = truncate_ascii_label(&app.badge, 4);
-        let label = truncate_ascii_label(&app.label, 12);
-        out.draw_list.push_text(
-            cx,
-            cy - 7.0,
-            badge,
-            2,
-            palette.foreground.with_alpha(progress),
-            TextAlign::Center,
-        );
+        let label = truncate_label(&app.label, 14);
+        if let Some(icon) = &app.icon {
+            let icon_size = (tile * 0.68).round();
+            out.draw_list.push_image(ImageQuad {
+                x: cx - icon_size * 0.5,
+                y: cy - icon_size * 0.5,
+                w: icon_size,
+                h: icon_size,
+                radius: icon_size * 0.18,
+                alpha: progress,
+                image: Arc::clone(icon),
+            });
+        } else {
+            let badge = truncate_label(&app.badge, 4);
+            out.draw_list.push_text(
+                cx,
+                cy - 7.0,
+                badge,
+                2,
+                palette.foreground.with_alpha(progress),
+                TextAlign::Center,
+            );
+        }
         out.draw_list.push_text(
             cx,
             cy + tile * 0.5 + 12.0,
@@ -535,7 +562,7 @@ fn build_recents(
         out.draw_list.push_text(
             width * 0.5,
             card_y + 68.0,
-            "NO OPEN WINDOWS",
+            "No Open Windows",
             2,
             palette.foreground.with_alpha(progress),
             TextAlign::Center,
@@ -543,7 +570,7 @@ fn build_recents(
         out.draw_list.push_text(
             width * 0.5,
             card_y + 102.0,
-            "TAP BACKDROP TO RETURN",
+            "Tap backdrop to return",
             2,
             palette.muted.with_alpha(progress),
             TextAlign::Center,
@@ -600,7 +627,7 @@ fn build_recents(
         out.draw_list.push_text(
             card_x + 28.0,
             card_y + 27.0,
-            truncate_ascii_label(&card.app_id, 14),
+            truncate_label(&card.app_id, 16),
             2,
             palette.foreground.with_alpha(progress),
             TextAlign::Left,
@@ -627,12 +654,16 @@ fn build_recents(
         );
 
         // Card preview pane
+        let pane_x = card_x + 18.0;
+        let pane_y = card_y + 68.0;
+        let pane_w = card_w - 36.0;
+        let pane_h = card_h - 118.0;
         out.draw_list.push_rect(
             RoundedRect::filled(
-                card_x + 18.0,
-                card_y + 68.0,
-                card_w - 36.0,
-                card_h - 118.0,
+                pane_x,
+                pane_y,
+                pane_w,
+                pane_h,
                 16.0,
                 palette.background.with_alpha(0.75 * progress),
             )
@@ -642,21 +673,58 @@ fn build_recents(
                 0.04 * progress,
             ),
         );
-        out.draw_list.push_text(
-            card_x + card_w * 0.5,
-            card_y + card_h * 0.5,
-            truncate_ascii_label(&card.title, 18),
-            2,
-            palette.muted.with_alpha(progress),
-            TextAlign::Center,
-        );
+        if let Some(thumb) = &card.thumbnail {
+            let avail_w = (pane_w - 8.0).max(16.0);
+            let avail_h = (pane_h - 8.0).max(16.0);
+            let scale = (avail_w / thumb.width as f32).min(avail_h / thumb.height as f32);
+            let iw = (thumb.width as f32 * scale).max(1.0);
+            let ih = (thumb.height as f32 * scale).max(1.0);
+            let ix = pane_x + (pane_w - iw) * 0.5;
+            let iy = pane_y + (pane_h - ih) * 0.5;
+            out.draw_list.push_image(ImageQuad {
+                x: ix,
+                y: iy,
+                w: iw,
+                h: ih,
+                radius: 12.0,
+                alpha: progress,
+                image: Arc::clone(thumb),
+            });
+            let pill_h = 24.0_f32.min(pane_h * 0.3);
+            let pill_y = pane_y + pane_h - pill_h - 8.0;
+            out.draw_list.push_rect(RoundedRect::filled(
+                pane_x + 10.0,
+                pill_y,
+                (pane_w - 20.0).max(24.0),
+                pill_h,
+                8.0,
+                palette.background.with_alpha(0.76 * progress),
+            ));
+            out.draw_list.push_text(
+                card_x + card_w * 0.5,
+                pill_y + (pill_h - 7.0) * 0.5,
+                truncate_label(&card.title, 26),
+                1,
+                palette.foreground.with_alpha(progress),
+                TextAlign::Center,
+            );
+        } else {
+            out.draw_list.push_text(
+                card_x + card_w * 0.5,
+                card_y + card_h * 0.5,
+                truncate_label(&card.title, 20),
+                2,
+                palette.muted.with_alpha(progress),
+                TextAlign::Center,
+            );
+        }
         out.draw_list.push_text(
             card_x + card_w * 0.5,
             card_y + card_h - 30.0,
             if card.focused {
-                "ACTIVE"
+                "Active"
             } else {
-                "TAP TO FOCUS"
+                "Tap to focus"
             },
             2,
             if card.focused {
@@ -733,19 +801,19 @@ fn build_shade(
     out.draw_list.push_text(
         panel_x + panel_w - 32.0,
         panel_y + 32.0,
-        format!("BATTERY {}%", ctx.battery_pct),
+        format!("Battery {}%", ctx.battery_pct),
         2,
         palette.accent.with_alpha(progress),
         TextAlign::Right,
     );
 
     let tiles = [
-        ("wifi", "WI-FI", ctx.wifi_connected),
-        ("bluetooth", "BLUETOOTH", ctx.bluetooth_enabled),
-        ("lte", "LTE MODEM", ctx.lte_connected),
-        ("autorotate", "AUTO-ROTATE", !ctx.rotation_locked),
-        ("tablet_mode", "TABLET MODE", ctx.tablet_mode),
-        ("night_light", "NIGHT LIGHT", ctx.night_light),
+        ("wifi", "Wi-Fi", ctx.wifi_connected),
+        ("bluetooth", "Bluetooth", ctx.bluetooth_enabled),
+        ("lte", "LTE Modem", ctx.lte_connected),
+        ("autorotate", "Auto-Rotate", !ctx.rotation_locked),
+        ("tablet_mode", "Tablet Mode", ctx.tablet_mode),
+        ("night_light", "Night Light", ctx.night_light),
     ];
 
     let inner_x = panel_x + 28.0;
@@ -794,7 +862,7 @@ fn build_shade(
         out.draw_list.push_text(
             tx + tile_w * 0.5,
             ty + 48.0,
-            if *active { "ON" } else { "OFF" },
+            if *active { "On" } else { "Off" },
             2,
             fg.with_alpha(0.82 * progress),
             TextAlign::Center,
@@ -813,7 +881,7 @@ fn build_shade(
         slider_start_y,
         inner_w,
         "brightness",
-        "BRIGHTNESS",
+        "Brightness",
         ctx.brightness_pct,
         palette,
         progress,
@@ -824,7 +892,7 @@ fn build_shade(
         slider_start_y + 72.0,
         inner_w,
         "volume",
-        "VOLUME",
+        "Volume",
         ctx.volume_pct,
         palette,
         progress,

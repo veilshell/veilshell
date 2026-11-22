@@ -18,8 +18,8 @@ use veilshell_core::{Orientation, ThemePalette};
 #[cfg(feature = "wgpu")]
 pub use gpu::WgpuRenderer;
 pub use primitives::{
-    DrawCommand, DrawList, HitRect, HitRegion, HitTarget, RoundedRect, SceneOutput, TextAlign,
-    TextLabel,
+    DrawCommand, DrawList, HitRect, HitRegion, HitTarget, ImageQuad, RgbaImage, RoundedRect,
+    SceneOutput, ShmPixelFormat, TextAlign, TextLabel,
 };
 pub use scene::{
     build_scene, build_scene_layout, build_top_strip_scene, default_demo_apps, home_page_count,
@@ -148,55 +148,66 @@ impl WallpaperImage {
     /// # Errors
     /// Returns [`RenderError::Io`] or [`RenderError::Encode`] if reading or decoding fails.
     pub fn load_png(path: impl AsRef<Path>) -> Result<Self, RenderError> {
-        let file = File::open(path)?;
-        let mut decoder = png::Decoder::new(BufReader::new(file));
-        decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-        let mut reader = decoder
-            .read_info()
-            .map_err(|e| RenderError::Encode(format!("png header: {e}")))?;
-        let buf_len = reader
-            .output_buffer_size()
-            .ok_or_else(|| RenderError::Encode("png buffer size overflow".to_owned()))?;
-        let mut buf = vec![0_u8; buf_len];
-        let info = reader
-            .next_frame(&mut buf)
-            .map_err(|e| RenderError::Encode(format!("png decode: {e}")))?;
-        let bytes = &buf[..info.buffer_size()];
-        let rgba = match info.color_type {
-            png::ColorType::Rgba => bytes.to_vec(),
-            png::ColorType::Rgb => {
-                let mut out = Vec::with_capacity((info.width * info.height * 4) as usize);
-                for rgb in bytes.chunks_exact(3) {
-                    out.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
-                }
-                out
-            }
-            png::ColorType::Grayscale => {
-                let mut out = Vec::with_capacity((info.width * info.height * 4) as usize);
-                for &g in bytes {
-                    out.extend_from_slice(&[g, g, g, 255]);
-                }
-                out
-            }
-            png::ColorType::GrayscaleAlpha => {
-                let mut out = Vec::with_capacity((info.width * info.height * 4) as usize);
-                for ga in bytes.chunks_exact(2) {
-                    out.extend_from_slice(&[ga[0], ga[0], ga[0], ga[1]]);
-                }
-                out
-            }
-            png::ColorType::Indexed => {
-                return Err(RenderError::Encode(
-                    "indexed PNG could not be expanded".to_owned(),
-                ));
-            }
-        };
+        let (width, height, rgba) = decode_png_rgba(path)?;
         Ok(Self {
-            width: info.width,
-            height: info.height,
+            width,
+            height,
             rgba,
         })
     }
+}
+
+pub(crate) fn decode_png_rgba(path: impl AsRef<Path>) -> Result<(u32, u32, Vec<u8>), RenderError> {
+    let file = File::open(path)?;
+    let mut decoder = png::Decoder::new(BufReader::new(file));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| RenderError::Encode(format!("png header: {e}")))?;
+    let buf_len = reader
+        .output_buffer_size()
+        .ok_or_else(|| RenderError::Encode("png buffer size overflow".to_owned()))?;
+    let mut buf = vec![0_u8; buf_len];
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|e| RenderError::Encode(format!("png decode: {e}")))?;
+    if info.width == 0 || info.height == 0 || info.width > 4096 || info.height > 4096 {
+        return Err(RenderError::Encode(format!(
+            "unsupported PNG dimensions {}x{}",
+            info.width, info.height
+        )));
+    }
+    let bytes = &buf[..info.buffer_size()];
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => bytes.to_vec(),
+        png::ColorType::Rgb => {
+            let mut out = Vec::with_capacity((info.width * info.height * 4) as usize);
+            for rgb in bytes.chunks_exact(3) {
+                out.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            }
+            out
+        }
+        png::ColorType::Grayscale => {
+            let mut out = Vec::with_capacity((info.width * info.height * 4) as usize);
+            for &g in bytes {
+                out.extend_from_slice(&[g, g, g, 255]);
+            }
+            out
+        }
+        png::ColorType::GrayscaleAlpha => {
+            let mut out = Vec::with_capacity((info.width * info.height * 4) as usize);
+            for ga in bytes.chunks_exact(2) {
+                out.extend_from_slice(&[ga[0], ga[0], ga[0], ga[1]]);
+            }
+            out
+        }
+        png::ColorType::Indexed => {
+            return Err(RenderError::Encode(
+                "indexed PNG could not be expanded".to_owned(),
+            ));
+        }
+    };
+    Ok((info.width, info.height, rgba))
 }
 
 /// Errors returned during rendering or offscreen snapshot capture.
@@ -367,6 +378,7 @@ impl ActiveRenderer {
     ///
     /// # Errors
     /// Returns [`RenderError`] if the image dimensions are invalid.
+    #[cfg_attr(not(feature = "wgpu"), allow(unused_variables))]
     pub fn set_wallpaper(&mut self, wallpaper: Option<&WallpaperImage>) -> Result<(), RenderError> {
         match self {
             Self::Software(_) => Ok(()),
@@ -694,12 +706,47 @@ mod tests {
     #[cfg(feature = "wgpu")]
     #[test]
     fn wgpu_matches_software_sdf_pixel_parity() {
+        use std::sync::Arc;
+
         let Ok(mut gpu) = WgpuRenderer::new() else {
             eprintln!("skipping wgpu GPU parity test: no Vulkan/GLES adapter available");
             return;
         };
         let mut sw = SdfSoftwareRenderer::default();
         let palette = ThemePalette::default_dark();
+
+        let icon_w = 32_u32;
+        let icon_h = 32_u32;
+        let mut icon_rgba = vec![0_u8; (icon_w * icon_h * 4) as usize];
+        for y in 0..icon_h {
+            for x in 0..icon_w {
+                let idx = ((y * icon_w + x) * 4) as usize;
+                icon_rgba[idx] = ((x * 255) / (icon_w - 1)) as u8;
+                icon_rgba[idx + 1] = ((y * 255) / (icon_h - 1)) as u8;
+                icon_rgba[idx + 2] = 210;
+                icon_rgba[idx + 3] = if x < 4 || x >= icon_w - 4 { 180 } else { 255 };
+            }
+        }
+        let icon = Arc::new(RgbaImage::new(icon_w, icon_h, icon_rgba).expect("icon"));
+
+        let thumb_w = 64_u32;
+        let thumb_h = 44_u32;
+        let mut thumb_rgba = vec![0_u8; (thumb_w * thumb_h * 4) as usize];
+        for y in 0..thumb_h {
+            for x in 0..thumb_w {
+                let idx = ((y * thumb_w + x) * 4) as usize;
+                thumb_rgba[idx] = if (x / 8 + y / 8) % 2 == 0 { 65 } else { 190 };
+                thumb_rgba[idx + 1] = ((y * 255) / (thumb_h - 1)) as u8;
+                thumb_rgba[idx + 2] = 235;
+                thumb_rgba[idx + 3] = 255;
+            }
+        }
+        let thumb = Arc::new(RgbaImage::new(thumb_w, thumb_h, thumb_rgba).expect("thumb"));
+
+        sw.context.home_apps[0].icon = Some(Arc::clone(&icon));
+        sw.context.recents_cards[0].thumbnail = Some(Arc::clone(&thumb));
+        gpu.context.home_apps[0].icon = Some(icon);
+        gpu.context.recents_cards[0].thumbnail = Some(thumb);
 
         for scene in [
             SceneKind::Pill,
@@ -847,5 +894,65 @@ mod tests {
                 Some(&HitTarget::OskKey { label: expected_id })
             );
         }
+    }
+
+    #[test]
+    fn rgba_image_resize_and_shm_conversion() {
+        // Xrgb8888 little-endian [B, G, R, X] -> straight RGBA [R, G, B, 255]
+        let xrgb_bytes = [
+            10, 20, 30, 0, // row 0 col 0 -> RGB(30, 20, 10)
+            40, 50, 60, 0, // row 0 col 1 -> RGB(60, 50, 40)
+            70, 80, 90, 0, // row 1 col 0 -> RGB(90, 80, 70)
+            100, 110, 120, 0, // row 1 col 1 -> RGB(120, 110, 100)
+        ];
+        let flipped =
+            RgbaImage::from_wayland_shm(2, 2, 8, &xrgb_bytes, ShmPixelFormat::Xrgb8888, true)
+                .expect("xrgb flipped converts");
+        assert_eq!(&flipped.rgba[0..4], &[90, 80, 70, 255]);
+        assert_eq!(&flipped.rgba[8..12], &[30, 20, 10, 255]);
+
+        // Argb8888 premultiplied [B, G, R, A] where A=128 (~0.5) -> straight RGB doubled cleanly
+        let argb_bytes = [64, 32, 16, 128];
+        let straight =
+            RgbaImage::from_wayland_shm(1, 1, 4, &argb_bytes, ShmPixelFormat::Argb8888, false)
+                .expect("argb unpremultiplies");
+        assert_eq!(straight.rgba[3], 128);
+        assert!(straight.rgba[0] >= 31 && straight.rgba[0] <= 33);
+        assert!(straight.rgba[1] >= 63 && straight.rgba[1] <= 65);
+        assert!(straight.rgba[2] >= 127 && straight.rgba[2] <= 129);
+
+        let large = RgbaImage::new(200, 100, vec![200; 200 * 100 * 4]).expect("valid image");
+        let shrunk = large.resize_fit(50, 50);
+        assert_eq!(shrunk.width, 50);
+        assert_eq!(shrunk.height, 25);
+        assert_ne!(large.id(), shrunk.id());
+    }
+
+    #[test]
+    fn truetype_font_layouts_and_renders_crisp_glyphs() {
+        let label = TextLabel {
+            x: 10.0,
+            y: 10.0,
+            text: "VeilShell".to_owned(),
+            scale: 2,
+            color: veilshell_core::Rgba::from_rgb_u8(255, 255, 255),
+            align: TextAlign::Left,
+        };
+        if font::has_system_font() {
+            match font::layout_text_glyphs(&label) {
+                font::TextLayout::TrueType(glyphs) => {
+                    assert!(!glyphs.is_empty(), "expected rasterized TrueType glyphs");
+                    assert!(glyphs
+                        .iter()
+                        .any(|g| g.glyph.alpha.iter().any(|&a| a > 0 && a < 255)));
+                }
+                font::TextLayout::Bitmap5x7 => panic!("expected TrueType layout when font exists"),
+            }
+        }
+        let mut list = DrawList::default();
+        list.commands.push(DrawCommand::Text(label));
+        let sw = SdfSoftwareRenderer::default();
+        let frame = sw.rasterize(180, 48, &list).expect("text rasterizes");
+        assert!(frame.rgba.chunks_exact(4).any(|px| px[3] > 0));
     }
 }

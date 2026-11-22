@@ -10,8 +10,13 @@ use std::sync::mpsc;
 use bytemuck::{Pod, Zeroable};
 use veilshell_core::{Rgba, ThemePalette};
 
-use crate::font::{glyph_rows, measure_text_width, GLYPH_ADVANCE, GLYPH_H, GLYPH_W};
-use crate::primitives::{DrawCommand, DrawList, RoundedRect, SceneOutput, TextAlign, TextLabel};
+use crate::font::{
+    glyph_rows, layout_text_glyphs, measure_text_width, PositionedGlyph, TextLayout, GLYPH_ADVANCE,
+    GLYPH_H, GLYPH_W,
+};
+use crate::primitives::{
+    DrawCommand, DrawList, ImageQuad, RgbaImage, RoundedRect, SceneOutput, TextAlign, TextLabel,
+};
 use crate::scene::{build_scene, build_scene_layout, build_top_strip_scene, SceneContext};
 use crate::{RenderError, RenderFrame, RendererBackend, SceneKind, SnapshotSpec, WallpaperImage};
 
@@ -22,15 +27,254 @@ const KIND_BACKDROP: u32 = 0;
 const KIND_GLOW: u32 = 1;
 const KIND_RECT: u32 = 2;
 const KIND_GLYPH: u32 = 3;
+const KIND_IMAGE: u32 = 4;
+const KIND_ALPHA_GLYPH: u32 = 5;
 
 const INITIAL_INSTANCE_CAPACITY: usize = 512;
+const INITIAL_ATLAS_SIZE: u32 = 1024;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct ViewportUniforms {
     size: [f32; 2],
+    atlas_size: [f32; 2],
     wallpaper_enabled: u32,
-    _pad: u32,
+    _pad: [u32; 3],
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum AtlasKey {
+    Glyph { ch: char, px_tenths: u16 },
+    Image(u64),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AtlasSlot {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+}
+
+struct GpuAtlas {
+    width: u32,
+    height: u32,
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    cursor_x: u32,
+    cursor_y: u32,
+    row_h: u32,
+    entries: HashMap<AtlasKey, AtlasSlot>,
+}
+
+impl GpuAtlas {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32) -> Self {
+        let texture = create_atlas_texture(device, width, height);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[0_u8; 4],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Self {
+            width,
+            height,
+            texture,
+            view,
+            cursor_x: 0,
+            cursor_y: 0,
+            row_h: 0,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn alloc_padded(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
+        let pw = w.checked_add(2)?;
+        let ph = h.checked_add(2)?;
+        if pw > self.width || ph > self.height {
+            return None;
+        }
+        if self.cursor_x + pw > self.width {
+            self.cursor_x = 0;
+            self.cursor_y += self.row_h;
+            self.row_h = 0;
+        }
+        if self.cursor_y + ph > self.height {
+            return None;
+        }
+        let pos = (self.cursor_x, self.cursor_y);
+        self.cursor_x += pw;
+        self.row_h = self.row_h.max(ph);
+        Some(pos)
+    }
+
+    fn get_or_upload_glyph(
+        &mut self,
+        queue: &wgpu::Queue,
+        pg: &PositionedGlyph,
+    ) -> Option<AtlasSlot> {
+        let key = AtlasKey::Glyph {
+            ch: pg.ch,
+            px_tenths: pg.px_tenths,
+        };
+        if let Some(slot) = self.entries.get(&key).copied() {
+            return Some(slot);
+        }
+        let w = pg.glyph.width;
+        let h = pg.glyph.height;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let (ox, oy) = self.alloc_padded(w, h)?;
+        let pw = w as usize + 2;
+        let ph = h as usize + 2;
+        let mut padded = vec![0_u8; pw * ph * 4];
+        for px in padded.chunks_exact_mut(4) {
+            px[0] = 255;
+            px[1] = 255;
+            px[2] = 255;
+            px[3] = 0;
+        }
+        let uw = w as usize;
+        for gy in 0..h as usize {
+            for gx in 0..uw {
+                let dst_off = ((gy + 1) * pw + (gx + 1)) * 4;
+                padded[dst_off + 3] = pg.glyph.alpha[gy * uw + gx];
+            }
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: ox, y: oy, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &padded,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(pw as u32 * 4),
+                rows_per_image: Some(ph as u32),
+            },
+            wgpu::Extent3d {
+                width: w + 2,
+                height: h + 2,
+                depth_or_array_layers: 1,
+            },
+        );
+        let slot = AtlasSlot {
+            x: ox + 1,
+            y: oy + 1,
+            w,
+            h,
+        };
+        self.entries.insert(key, slot);
+        Some(slot)
+    }
+
+    fn get_or_upload_image(&mut self, queue: &wgpu::Queue, image: &RgbaImage) -> Option<AtlasSlot> {
+        let key = AtlasKey::Image(image.id());
+        if let Some(slot) = self.entries.get(&key).copied() {
+            return Some(slot);
+        }
+        let w = image.width;
+        let h = image.height;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let (ox, oy) = self.alloc_padded(w, h)?;
+        let pw = w as usize + 2;
+        let ph = h as usize + 2;
+        let mut padded = vec![0_u8; pw * ph * 4];
+        let uw = w as usize;
+        let uh = h as usize;
+        for dy in 0..ph {
+            let sy = dy.saturating_sub(1).min(uh - 1);
+            for dx in 0..pw {
+                let sx = dx.saturating_sub(1).min(uw - 1);
+                let src_off = (sy * uw + sx) * 4;
+                let dst_off = (dy * pw + dx) * 4;
+                padded[dst_off..dst_off + 4].copy_from_slice(&image.rgba[src_off..src_off + 4]);
+            }
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: ox, y: oy, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &padded,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(pw as u32 * 4),
+                rows_per_image: Some(ph as u32),
+            },
+            wgpu::Extent3d {
+                width: w + 2,
+                height: h + 2,
+                depth_or_array_layers: 1,
+            },
+        );
+        let slot = AtlasSlot {
+            x: ox + 1,
+            y: oy + 1,
+            w,
+            h,
+        };
+        self.entries.insert(key, slot);
+        Some(slot)
+    }
+
+    fn reset_or_grow(&mut self, device: &wgpu::Device, max_dim: u32) -> bool {
+        self.cursor_x = 0;
+        self.cursor_y = 0;
+        self.row_h = 0;
+        self.entries.clear();
+
+        let target_dim = (self.width.saturating_mul(2)).min(max_dim).min(4096);
+        if self.width < 2048.min(max_dim) && target_dim > self.width {
+            self.width = target_dim;
+            self.height = target_dim;
+            self.texture = create_atlas_texture(device, target_dim, target_dim);
+            self.view = self
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn create_atlas_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("veilshell-gpu-atlas"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
 }
 
 #[repr(C)]
@@ -99,6 +343,7 @@ pub struct WgpuRenderer {
     wallpaper_sampler: wgpu::Sampler,
     wallpaper_texture: wgpu::Texture,
     wallpaper_enabled: bool,
+    atlas: GpuAtlas,
     sdf_bind_group: wgpu::BindGroup,
     offscreen: Option<OffscreenTarget>,
 }
@@ -181,6 +426,16 @@ impl WgpuRenderer {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
                     count: None,
                 },
             ],
@@ -284,12 +539,14 @@ impl WgpuRenderer {
 
         let wallpaper_texture = create_dummy_wallpaper_texture(&device, &queue);
         let wallpaper_view = wallpaper_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let atlas = GpuAtlas::new(&device, &queue, INITIAL_ATLAS_SIZE, INITIAL_ATLAS_SIZE);
         let sdf_bind_group = create_sdf_bind_group(
             &device,
             &sdf_bgl,
             &uniform_buffer,
             &wallpaper_view,
             &wallpaper_sampler,
+            &atlas.view,
         );
 
         let mut renderer = Self {
@@ -311,6 +568,7 @@ impl WgpuRenderer {
             wallpaper_sampler,
             wallpaper_texture,
             wallpaper_enabled: false,
+            atlas,
             sdf_bind_group,
             offscreen: None,
         };
@@ -520,6 +778,7 @@ impl WgpuRenderer {
             &self.uniform_buffer,
             &blurred_view,
             &self.wallpaper_sampler,
+            &self.atlas.view,
         );
         self.wallpaper_texture = blurred;
         self.wallpaper_enabled = true;
@@ -538,6 +797,7 @@ impl WgpuRenderer {
             &self.uniform_buffer,
             &view,
             &self.wallpaper_sampler,
+            &self.atlas.view,
         );
         self.wallpaper_enabled = false;
     }
@@ -559,7 +819,7 @@ impl WgpuRenderer {
             return Err(RenderError::InvalidViewport);
         }
 
-        let primitives = encode_draw_list(list, width as f32, height as f32);
+        let primitives = self.encode_frame_primitives(list, width as f32, height as f32);
         self.upload_frame_data(width, height, &primitives);
         self.ensure_pipeline(format);
 
@@ -627,7 +887,7 @@ impl WgpuRenderer {
             return Err(RenderError::InvalidViewport);
         }
 
-        let primitives = encode_draw_list(list, width as f32, height as f32);
+        let primitives = self.encode_frame_primitives(list, width as f32, height as f32);
         self.upload_frame_data(width, height, &primitives);
         self.ensure_pipeline(wgpu::TextureFormat::Rgba8Unorm);
         self.ensure_offscreen_target(width, height);
@@ -721,11 +981,39 @@ impl WgpuRenderer {
         })
     }
 
+    fn encode_frame_primitives(
+        &mut self,
+        list: &DrawList,
+        width: f32,
+        height: f32,
+    ) -> Vec<GpuPrimitive> {
+        if let Some(prims) = encode_draw_list(list, width, height, &self.queue, &mut self.atlas) {
+            return prims;
+        }
+        let max_dim = self.device.limits().max_texture_dimension_2d.min(4096);
+        let grew = self.atlas.reset_or_grow(&self.device, max_dim);
+        if grew {
+            let wp_view = self
+                .wallpaper_texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            self.sdf_bind_group = create_sdf_bind_group(
+                &self.device,
+                &self.sdf_bgl,
+                &self.uniform_buffer,
+                &wp_view,
+                &self.wallpaper_sampler,
+                &self.atlas.view,
+            );
+        }
+        encode_draw_list(list, width, height, &self.queue, &mut self.atlas).unwrap_or_default()
+    }
+
     fn upload_frame_data(&mut self, width: u32, height: u32, primitives: &[GpuPrimitive]) {
         let uniforms = ViewportUniforms {
             size: [width as f32, height as f32],
+            atlas_size: [self.atlas.width as f32, self.atlas.height as f32],
             wallpaper_enabled: u32::from(self.wallpaper_enabled),
-            _pad: 0,
+            _pad: [0; 3],
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
@@ -999,6 +1287,7 @@ fn create_sdf_bind_group(
     uniform_buffer: &wgpu::Buffer,
     wallpaper_view: &wgpu::TextureView,
     wallpaper_sampler: &wgpu::Sampler,
+    atlas_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("veilshell-sdf-bg"),
@@ -1016,6 +1305,10 @@ fn create_sdf_bind_group(
                 binding: 2,
                 resource: wgpu::BindingResource::Sampler(wallpaper_sampler),
             },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(atlas_view),
+            },
         ],
     })
 }
@@ -1025,8 +1318,14 @@ const fn rgba_arr(c: Rgba) -> [f32; 4] {
     [c.r, c.g, c.b, c.a]
 }
 
-fn encode_draw_list(list: &DrawList, width: f32, height: f32) -> Vec<GpuPrimitive> {
-    let mut out = Vec::with_capacity(list.commands.len() * 3);
+fn encode_draw_list(
+    list: &DrawList,
+    width: f32,
+    height: f32,
+    queue: &wgpu::Queue,
+    atlas: &mut GpuAtlas,
+) -> Option<Vec<GpuPrimitive>> {
+    let mut out = Vec::with_capacity(list.commands.len() * 4);
     for cmd in &list.commands {
         match cmd {
             DrawCommand::BackdropGradient { top, bottom } => {
@@ -1057,10 +1356,45 @@ fn encode_draw_list(list: &DrawList, width: f32, height: f32) -> Vec<GpuPrimitiv
                 }
             }
             DrawCommand::Rect(rect) => push_rect_primitive(&mut out, *rect),
-            DrawCommand::Text(label) => push_text_primitives(&mut out, label),
+            DrawCommand::Text(label) => {
+                if !push_text_primitives(&mut out, label, queue, atlas) {
+                    return None;
+                }
+            }
+            DrawCommand::Image(quad) => {
+                if !push_image_primitive(&mut out, quad, queue, atlas) {
+                    return None;
+                }
+            }
         }
     }
-    out
+    Some(out)
+}
+
+fn push_image_primitive(
+    out: &mut Vec<GpuPrimitive>,
+    quad: &ImageQuad,
+    queue: &wgpu::Queue,
+    atlas: &mut GpuAtlas,
+) -> bool {
+    if quad.w <= 0.0 || quad.h <= 0.0 || quad.alpha <= 0.001 {
+        return true;
+    }
+    if quad.image.width == 0 || quad.image.height == 0 {
+        return true;
+    }
+    let Some(slot) = atlas.get_or_upload_image(queue, &quad.image) else {
+        return false;
+    };
+    out.push(GpuPrimitive {
+        rect: [quad.x, quad.y, quad.w, quad.h],
+        color0: [1.0, 1.0, 1.0, quad.alpha],
+        color1: [0.0; 4],
+        params0: [slot.x as f32, slot.y as f32, slot.w as f32, slot.h as f32],
+        params1: [quad.radius, 0.0, 0.0, 0.0],
+        meta: [KIND_IMAGE, 0, 0, 0],
+    });
+    true
 }
 
 fn push_rect_primitive(out: &mut Vec<GpuPrimitive>, rect: RoundedRect) {
@@ -1092,43 +1426,75 @@ fn push_rect_primitive(out: &mut Vec<GpuPrimitive>, rect: RoundedRect) {
     });
 }
 
-fn push_text_primitives(out: &mut Vec<GpuPrimitive>, label: &TextLabel) {
+fn push_text_primitives(
+    out: &mut Vec<GpuPrimitive>,
+    label: &TextLabel,
+    queue: &wgpu::Queue,
+    atlas: &mut GpuAtlas,
+) -> bool {
     if label.text.is_empty() || label.color.a <= 0.001 {
-        return;
+        return true;
     }
-    let scale = label.scale.max(1);
-    let total_w = measure_text_width(&label.text, scale) as f32;
-    let start_x = match label.align {
-        TextAlign::Left => label.x,
-        TextAlign::Center => label.x - total_w * 0.5,
-        TextAlign::Right => label.x - total_w,
-    }
-    .round();
-    let start_y = label.y.round();
-    let advance = (GLYPH_ADVANCE * scale) as f32;
-    let gw = (GLYPH_W * scale) as f32;
-    let gh = (GLYPH_H * scale) as f32;
     let color = rgba_arr(label.color);
-
-    for (idx, ch) in label.text.chars().enumerate() {
-        let rows = glyph_rows(ch);
-        if rows == [0; 7] {
-            continue;
+    match layout_text_glyphs(label) {
+        TextLayout::TrueType(glyphs) => {
+            for pg in glyphs {
+                let Some(slot) = atlas.get_or_upload_glyph(queue, &pg) else {
+                    return false;
+                };
+                out.push(GpuPrimitive {
+                    rect: [
+                        pg.x as f32,
+                        pg.y as f32,
+                        pg.glyph.width as f32,
+                        pg.glyph.height as f32,
+                    ],
+                    color0: color,
+                    color1: [0.0; 4],
+                    params0: [slot.x as f32, slot.y as f32, slot.w as f32, slot.h as f32],
+                    params1: [0.0; 4],
+                    meta: [KIND_ALPHA_GLYPH, 0, 0, 0],
+                });
+            }
+            true
         }
-        let bits_lo = u32::from(rows[0])
-            | (u32::from(rows[1]) << 5)
-            | (u32::from(rows[2]) << 10)
-            | (u32::from(rows[3]) << 15);
-        let bits_hi = u32::from(rows[4]) | (u32::from(rows[5]) << 5) | (u32::from(rows[6]) << 10);
-        let gx = start_x + idx as f32 * advance;
-        out.push(GpuPrimitive {
-            rect: [gx, start_y, gw, gh],
-            color0: color,
-            color1: [0.0; 4],
-            params0: [scale as f32, 0.0, 0.0, 0.0],
-            params1: [0.0; 4],
-            meta: [KIND_GLYPH, bits_lo, bits_hi, 0],
-        });
+        TextLayout::Bitmap5x7 => {
+            let scale = label.scale.max(1);
+            let total_w = measure_text_width(&label.text, scale) as f32;
+            let start_x = match label.align {
+                TextAlign::Left => label.x,
+                TextAlign::Center => label.x - total_w * 0.5,
+                TextAlign::Right => label.x - total_w,
+            }
+            .round();
+            let start_y = label.y.round();
+            let advance = (GLYPH_ADVANCE * scale) as f32;
+            let gw = (GLYPH_W * scale) as f32;
+            let gh = (GLYPH_H * scale) as f32;
+
+            for (idx, ch) in label.text.chars().enumerate() {
+                let rows = glyph_rows(ch);
+                if rows == [0; 7] {
+                    continue;
+                }
+                let bits_lo = u32::from(rows[0])
+                    | (u32::from(rows[1]) << 5)
+                    | (u32::from(rows[2]) << 10)
+                    | (u32::from(rows[3]) << 15);
+                let bits_hi =
+                    u32::from(rows[4]) | (u32::from(rows[5]) << 5) | (u32::from(rows[6]) << 10);
+                let gx = start_x + idx as f32 * advance;
+                out.push(GpuPrimitive {
+                    rect: [gx, start_y, gw, gh],
+                    color0: color,
+                    color1: [0.0; 4],
+                    params0: [scale as f32, 0.0, 0.0, 0.0],
+                    params1: [0.0; 4],
+                    meta: [KIND_GLYPH, bits_lo, bits_hi, 0],
+                });
+            }
+            true
+        }
     }
 }
 

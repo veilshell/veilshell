@@ -23,6 +23,7 @@ pub struct WindowInfo {
     pub workspace: String,
     pub focused: bool,
     pub floating: bool,
+    pub foreign_id: Option<String>,
 }
 
 /// Physical output metadata reported by a compositor.
@@ -156,6 +157,7 @@ impl Default for MockBackend {
                     workspace: "1".into(),
                     focused: true,
                     floating: false,
+                    foreign_id: None,
                 },
                 WindowInfo {
                     id: WindowId("0x2".into()),
@@ -164,6 +166,7 @@ impl Default for MockBackend {
                     workspace: "2".into(),
                     focused: false,
                     floating: false,
+                    foreign_id: None,
                 },
                 WindowInfo {
                     id: WindowId("0x3".into()),
@@ -172,6 +175,7 @@ impl Default for MockBackend {
                     workspace: "3".into(),
                     focused: false,
                     floating: false,
+                    foreign_id: None,
                 },
             ],
             outputs: vec![OutputInfo {
@@ -380,6 +384,8 @@ struct HyprClient {
     mapped: bool,
     #[serde(rename = "focusHistoryID", default = "default_focus_history")]
     focus_history_id: i32,
+    #[serde(default)]
+    stable_id: Option<String>,
 }
 
 const fn default_mapped() -> bool {
@@ -427,6 +433,7 @@ pub fn parse_hyprland_clients_json(raw: &str) -> Result<Vec<WindowInfo>, Composi
             workspace: c.workspace.name,
             focused: c.focus_history_id == 0,
             floating: c.floating,
+            foreign_id: c.stable_id,
         })
         .collect())
 }
@@ -631,15 +638,18 @@ mod tests {
                 "workspace": { "id": 1, "name": "1" },
                 "floating": false,
                 "mapped": true,
-                "focusHistoryID": 0
+                "focusHistoryID": 0,
+                "stableId": "1800000c"
             }
         ]"#;
         let windows = parse_hyprland_clients_json(clients_json).expect("clients parsed");
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].id.0, "0x55a1bc");
         assert!(windows[0].focused);
+        assert_eq!(windows[0].foreign_id.as_deref(), Some("1800000c"));
         assert!(!windows[1].focused);
         assert!(windows[1].floating);
+        assert_eq!(windows[1].foreign_id, None);
         assert_eq!(windows[1].app_id, "chromium");
 
         let monitors_json = r#"[

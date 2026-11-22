@@ -7,8 +7,12 @@ use std::path::Path;
 
 use veilshell_core::{Rgba, ThemePalette};
 
-use crate::font::{glyph_rows, measure_text_width, GLYPH_ADVANCE, GLYPH_H, GLYPH_W};
-use crate::primitives::{DrawCommand, DrawList, RoundedRect, SceneOutput, TextAlign, TextLabel};
+use crate::font::{
+    glyph_rows, layout_text_glyphs, measure_text_width, TextLayout, GLYPH_ADVANCE, GLYPH_H, GLYPH_W,
+};
+use crate::primitives::{
+    DrawCommand, DrawList, ImageQuad, RoundedRect, SceneOutput, TextAlign, TextLabel,
+};
 use crate::scene::{build_scene, build_scene_layout, build_top_strip_scene, SceneContext};
 use crate::{RenderError, RenderFrame, RendererBackend, SceneKind, SnapshotSpec};
 
@@ -158,6 +162,7 @@ fn execute_command(rgba: &mut [u8], width: u32, height: u32, cmd: &DrawCommand) 
         } => draw_radial_glow(rgba, width, height, *cx, *cy, *radius, *color),
         DrawCommand::Rect(rect) => draw_rounded_rect(rgba, width, height, *rect),
         DrawCommand::Text(label) => draw_text(rgba, width, height, label),
+        DrawCommand::Image(quad) => draw_image_quad(rgba, width, height, quad),
     }
 }
 
@@ -428,46 +433,167 @@ fn draw_rounded_rect(buf: &mut [u8], w: u32, h: u32, rect: RoundedRect) {
 }
 
 fn draw_text(buf: &mut [u8], width: u32, height: u32, label: &TextLabel) {
-    let scale = label.scale.max(1);
-    let total_w = measure_text_width(&label.text, scale) as f32;
-    let start_x = match label.align {
-        TextAlign::Left => label.x,
-        TextAlign::Center => label.x - total_w * 0.5,
-        TextAlign::Right => label.x - total_w,
+    if label.text.is_empty() || label.color.a <= 0.001 {
+        return;
     }
-    .round() as i64;
-    let start_y = label.y.round() as i64;
+
     let width_i64 = i64::from(width);
     let height_i64 = i64::from(height);
-    let advance_i64 = i64::from(GLYPH_ADVANCE * scale);
 
-    for (ch_idx, ch) in label.text.chars().enumerate() {
-        let rows = glyph_rows(ch);
-        let Ok(ch_off) = i64::try_from(ch_idx) else {
-            break;
-        };
-        let gx = start_x + ch_off * advance_i64;
-        for (ry, mask) in rows.iter().enumerate().take(GLYPH_H as usize) {
-            for rx in 0..GLYPH_W {
-                if (mask & (1 << (GLYPH_W - 1 - rx))) == 0 {
-                    continue;
-                }
-                for sy in 0..scale {
-                    let py = start_y + i64::from(ry as u32 * scale + sy);
+    match layout_text_glyphs(label) {
+        TextLayout::TrueType(glyphs) => {
+            for pg in glyphs {
+                let gw = pg.glyph.width as usize;
+                for gy in 0..pg.glyph.height {
+                    let py = i64::from(pg.y) + i64::from(gy);
                     if py < 0 || py >= height_i64 {
                         continue;
                     }
-                    let row_off = (py as usize) * (width as usize);
-                    for sx in 0..scale {
-                        let px = gx + i64::from(rx * scale + sx);
+                    let src_row = (gy as usize) * gw;
+                    let dst_row = (py as usize) * (width as usize);
+                    for gx in 0..pg.glyph.width {
+                        let cov = pg.glyph.alpha[src_row + gx as usize];
+                        if cov == 0 {
+                            continue;
+                        }
+                        let px = i64::from(pg.x) + i64::from(gx);
                         if px < 0 || px >= width_i64 {
                             continue;
                         }
-                        let idx = (row_off + px as usize) * 4;
-                        blend_pixel(buf, idx, label.color);
+                        let idx = (dst_row + px as usize) * 4;
+                        let alpha = label.color.a * (f32::from(cov) / 255.0);
+                        blend_pixel(buf, idx, label.color.with_alpha(alpha));
                     }
                 }
             }
+        }
+        TextLayout::Bitmap5x7 => {
+            let scale = label.scale.max(1);
+            let total_w = measure_text_width(&label.text, scale) as f32;
+            let start_x = match label.align {
+                TextAlign::Left => label.x,
+                TextAlign::Center => label.x - total_w * 0.5,
+                TextAlign::Right => label.x - total_w,
+            }
+            .round() as i64;
+            let start_y = label.y.round() as i64;
+            let advance_i64 = i64::from(GLYPH_ADVANCE * scale);
+
+            for (ch_idx, ch) in label.text.chars().enumerate() {
+                let rows = glyph_rows(ch);
+                let Ok(ch_off) = i64::try_from(ch_idx) else {
+                    break;
+                };
+                let gx = start_x + ch_off * advance_i64;
+                for (ry, mask) in rows.iter().enumerate().take(GLYPH_H as usize) {
+                    for rx in 0..GLYPH_W {
+                        if (mask & (1 << (GLYPH_W - 1 - rx))) == 0 {
+                            continue;
+                        }
+                        for sy in 0..scale {
+                            let py = start_y + i64::from(ry as u32 * scale + sy);
+                            if py < 0 || py >= height_i64 {
+                                continue;
+                            }
+                            let row_off = (py as usize) * (width as usize);
+                            for sx in 0..scale {
+                                let px = gx + i64::from(rx * scale + sx);
+                                if px < 0 || px >= width_i64 {
+                                    continue;
+                                }
+                                let idx = (row_off + px as usize) * 4;
+                                blend_pixel(buf, idx, label.color);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn draw_image_quad(buf: &mut [u8], buf_w: u32, buf_h: u32, quad: &ImageQuad) {
+    if quad.w <= 0.0 || quad.h <= 0.0 || quad.alpha <= 0.001 {
+        return;
+    }
+    let img = &quad.image;
+    if img.width == 0 || img.height == 0 {
+        return;
+    }
+
+    let half_w = quad.w * 0.5;
+    let half_h = quad.h * 0.5;
+    let cx = quad.x + half_w;
+    let cy = quad.y + half_h;
+    let corner_r = quad.radius.min(half_w).min(half_h).max(0.0);
+
+    let min_x = ((quad.x - 1.0).floor().max(0.0) as u32).min(buf_w);
+    let max_x = ((quad.x + quad.w + 1.0).ceil().max(0.0) as u32).min(buf_w);
+    let min_y = ((quad.y - 1.0).floor().max(0.0) as u32).min(buf_h);
+    let max_y = ((quad.y + quad.h + 1.0).ceil().max(0.0) as u32).min(buf_h);
+
+    let img_w = img.width as f32;
+    let img_h = img.height as f32;
+    let last_src_x = img.width - 1;
+    let last_src_y = img.height - 1;
+    let src_stride = img.width as usize;
+
+    for py_idx in min_y..max_y {
+        let py = py_idx as f32 + 0.5;
+        let rel_y = py - cy;
+        let tex_v = ((py - quad.y) / quad.h).clamp(0.0, 1.0);
+        let ty = (tex_v * img_h - 0.5).clamp(0.0, img_h - 1.0);
+        let y0 = (ty.floor() as u32).min(last_src_y);
+        let y1 = (y0 + 1).min(last_src_y);
+        let fy = ty - y0 as f32;
+        let row_off = (py_idx as usize) * (buf_w as usize);
+
+        for px_idx in min_x..max_x {
+            let px = px_idx as f32 + 0.5;
+            let dist = sdf_rounded_box(px - cx, rel_y, half_w, half_h, corner_r);
+            let cov = (0.5 - dist).clamp(0.0, 1.0);
+            if cov <= 0.001 {
+                continue;
+            }
+
+            let tex_u = ((px - quad.x) / quad.w).clamp(0.0, 1.0);
+            let tx = (tex_u * img_w - 0.5).clamp(0.0, img_w - 1.0);
+            let x0 = (tx.floor() as u32).min(last_src_x);
+            let x1 = (x0 + 1).min(last_src_x);
+            let fx = tx - x0 as f32;
+
+            let i00 = (y0 as usize * src_stride + x0 as usize) * 4;
+            let i10 = (y0 as usize * src_stride + x1 as usize) * 4;
+            let i01 = (y1 as usize * src_stride + x0 as usize) * 4;
+            let i11 = (y1 as usize * src_stride + x1 as usize) * 4;
+
+            let w00 = (1.0 - fx) * (1.0 - fy);
+            let w10 = fx * (1.0 - fy);
+            let w01 = (1.0 - fx) * fy;
+            let w11 = fx * fy;
+
+            let chan = |c: usize| -> f32 {
+                (f32::from(img.rgba[i00 + c]) * w00
+                    + f32::from(img.rgba[i10 + c]) * w10
+                    + f32::from(img.rgba[i01 + c]) * w01
+                    + f32::from(img.rgba[i11 + c]) * w11)
+                    / 255.0
+            };
+            let sa = chan(3) * quad.alpha * cov;
+            if sa <= 0.001 {
+                continue;
+            }
+            let idx = (row_off + px_idx as usize) * 4;
+            blend_pixel(
+                buf,
+                idx,
+                Rgba {
+                    r: chan(0),
+                    g: chan(1),
+                    b: chan(2),
+                    a: sa,
+                },
+            );
         }
     }
 }

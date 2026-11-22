@@ -55,10 +55,10 @@
 - [x] `veilshell-wayland`: `zwp_input_method_v2` + `zwp_virtual_keyboard_v1` integration (auto-pop on text focus in Tablet Mode, numeric layer switch on `ContentPurpose`, direct `commit_string` + virtual-keyboard fallback for special keys & Ctrl combos, non-overlapping bottom-pill hide during `TouchOsk`, downward-swipe dismiss)
 - [x] Tier 3 live Hyprland verification updated to capture & verify all 5 surfaces (`home`, `shade`, `recents`, `osk`, `pill`) cleanly
 
-#### Sprint 3B — GPU (`wgpu`) Acceleration, Typography/Icons & Live Recents Thumbnails (In Progress)
-- [x] `wgpu` Vulkan/GLES WGSL SDF renderer backend consuming the existing `DrawList` + pre-blurred static wallpaper glass cache (blur once on wallpaper change) + zero-copy `wgpu::Surface` Wayland presentation & automatic `SdfSoftwareRenderer` fallback
-- [ ] TrueType/FreeType font atlas (`swash` / `cosmic-text`) and `.desktop` app icon theme loader replacing the bitmap HUD font & initials badges
-- [ ] Live window thumbnails via `hyprland-toplevel-export-v1` in the Recents Deck
+#### Sprint 3B — GPU (`wgpu`) Acceleration, Typography/Icons & Live Recents Thumbnails (Complete)
+- [x] `wgpu` Vulkan/GLES WGSL SDF renderer backend consuming the existing `DrawList` + pre-blurred static wallpaper glass cache (blur once on wallpaper change) + zero-copy `wgpu::Surface` Wayland presentation & automatic `SdfSoftwareRenderer` fallback (preferring Vulkan before GLES so lazy XWayland sessions never stall)
+- [x] `ab_glyph` system TrueType/OpenType font atlas (with 5×7 HUD fallback) and freedesktop `.desktop` `PNG` app icon theme loader with glass tile fallback badges
+- [x] Live window thumbnails in the Recents Deck via `ext-foreign-toplevel-list-v1` + `ext-image-copy-capture-v1` (with `wl_shm` format conversion & premultiplied area-box downscaling)
 
 ### Phase 4 — Packaging, Multi-Compositor Ports & `v0.1.0` Release
 - [ ] Arch Linux / AUR `PKGBUILD` (`packaging/arch/PKGBUILD`) + optional standalone SDDM session entry

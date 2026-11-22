@@ -1,5 +1,6 @@
 //! `Wayland` `wlr-layer-shell` surface descriptors, touch models, and multi-surface daemon runtime.
 
+mod capture;
 pub mod client;
 #[cfg(feature = "wgpu")]
 mod gpu;

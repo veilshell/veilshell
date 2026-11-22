@@ -37,6 +37,7 @@ use veilshell_render::{
     SceneContext, SceneKind, SceneOutput, WallpaperImage,
 };
 
+use crate::capture::ToplevelCaptureState;
 #[cfg(feature = "wgpu")]
 use crate::gpu::WgpuWaylandSurface;
 use crate::osk::OskWaylandState;
@@ -382,7 +383,7 @@ pub(crate) struct LayerApp {
     layer_shell: LayerShell,
     seat_state: SeatState,
     output_state: OutputState,
-    shm: Shm,
+    pub(crate) shm: Shm,
     target_output: Option<wl_output::WlOutput>,
     output_name: Option<String>,
     viewport_w: u32,
@@ -401,6 +402,7 @@ pub(crate) struct LayerApp {
     touch: Option<wl_touch::WlTouch>,
     drag: Option<ActiveDrag>,
     pub(crate) osk: OskWaylandState,
+    pub(crate) capture: ToplevelCaptureState,
     handler: Box<dyn ShellActionHandler>,
     exit: bool,
     // SAFETY ORDERING: `conn` MUST remain the last field so `wl_display` outlives all
@@ -455,6 +457,13 @@ impl LayerApp {
                 ShellAction::RequestRefresh(scene),
                 self.renderer.context_mut(),
             );
+            if scene == SceneKind::Recents {
+                self.capture.apply_cached_and_capture(
+                    &mut self.renderer.context_mut().recents_cards,
+                    &self.shm,
+                    &self.qh,
+                );
+            }
         }
 
         let prev_scene = self.active_scene;
@@ -538,7 +547,7 @@ impl LayerApp {
         surf.present_draw_list(&self.qh, &self.shm, &mut self.renderer, &list, false);
     }
 
-    fn draw_overlay(&mut self) {
+    pub(crate) fn draw_overlay(&mut self) {
         let Some(surf) = &mut self.overlay else {
             return;
         };
@@ -945,6 +954,11 @@ impl LayerApp {
                     ShellAction::RequestRefresh(SceneKind::Recents),
                     self.renderer.context_mut(),
                 );
+                self.capture.apply_cached_and_capture(
+                    &mut self.renderer.context_mut().recents_cards,
+                    &self.shm,
+                    &self.qh,
+                );
                 self.draw_overlay();
             }
             HitTarget::ShadeToggle { id } => {
@@ -1078,6 +1092,7 @@ pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
         touch: None,
         drag: None,
         osk: OskWaylandState::bind_globals(&globals, &qh),
+        capture: ToplevelCaptureState::bind_globals(&globals, &qh),
         handler: Box::new(handler),
         exit: false,
         conn: conn.clone(),
@@ -1162,6 +1177,7 @@ pub fn run_shell_daemon<H: ShellActionHandler + 'static>(
             .map_err(|e| WaylandError::Runtime(e.to_string()))?;
     }
 
+    app.capture.destroy();
     app.osk.destroy();
     let _ = flush_conn.flush();
 

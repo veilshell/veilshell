@@ -1,9 +1,254 @@
 //! Renderer-agnostic 2D glassmorphic drawing primitives (`DrawList`) and hit-testing regions.
 //!
-//! Both the analytic CPU SDF renderer and the future `wgpu` WGSL shader consume
+//! Both the analytic CPU SDF renderer and the `wgpu` WGSL shader consume
 //! the exact same [`DrawList`] so live frames and headless snapshots match.
 
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use veilshell_core::Rgba;
+
+static NEXT_IMAGE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_image_id() -> u64 {
+    NEXT_IMAGE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Supported little-endian `Wayland` `wl_shm` 32-bit pixel formats for window thumbnail capture.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ShmPixelFormat {
+    /// Premultiplied `[B, G, R, A]` bytes.
+    Argb8888,
+    /// Opaque `[B, G, R, X]` bytes.
+    Xrgb8888,
+    /// Premultiplied `[R, G, B, A]` bytes.
+    Abgr8888,
+    /// Opaque `[R, G, B, X]` bytes.
+    Xbgr8888,
+}
+
+/// Decoded straight `RGBA8` image asset with a unique monotonic identity for GPU atlas caching.
+#[derive(Clone, Debug)]
+pub struct RgbaImage {
+    id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl PartialEq for RgbaImage {
+    fn eq(&self, other: &Self) -> bool {
+        self.width == other.width && self.height == other.height && self.rgba == other.rgba
+    }
+}
+
+impl Eq for RgbaImage {}
+
+impl RgbaImage {
+    /// Construct a validated straight `RGBA8` image.
+    #[must_use]
+    pub fn new(width: u32, height: u32, rgba: Vec<u8>) -> Option<Self> {
+        let expected = usize::try_from(width)
+            .ok()?
+            .checked_mul(usize::try_from(height).ok()?)?
+            .checked_mul(4)?;
+        if width == 0 || height == 0 || rgba.len() != expected {
+            return None;
+        }
+        Some(Self {
+            id: next_image_id(),
+            width,
+            height,
+            rgba,
+        })
+    }
+
+    /// Unique monotonically increasing image identity (never reused within a process).
+    #[must_use]
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Load a `PNG` icon or image from disk and normalize it to straight `RGBA8`.
+    ///
+    /// # Errors
+    /// Returns [`crate::RenderError`] if reading, decoding, or dimension validation fails.
+    pub fn load_png(path: impl AsRef<Path>) -> Result<Self, crate::RenderError> {
+        let (width, height, rgba) = crate::decode_png_rgba(path)?;
+        Self::new(width, height, rgba)
+            .ok_or_else(|| crate::RenderError::Encode("invalid PNG image dimensions".to_owned()))
+    }
+
+    /// Resize this image to fit inside `(max_w, max_h)` while preserving aspect ratio.
+    ///
+    /// Uses premultiplied area-box averaging when downscaling (avoiding dark fringes on icons)
+    /// and returns an exact copy when the image already fits.
+    #[must_use]
+    pub fn resize_fit(&self, max_w: u32, max_h: u32) -> Self {
+        let max_w = max_w.max(1);
+        let max_h = max_h.max(1);
+        if self.width <= max_w && self.height <= max_h {
+            return Self {
+                id: next_image_id(),
+                width: self.width,
+                height: self.height,
+                rgba: self.rgba.clone(),
+            };
+        }
+
+        let scale = (max_w as f32 / self.width as f32).min(max_h as f32 / self.height as f32);
+        let dst_w = ((self.width as f32 * scale).round() as u32).clamp(1, max_w);
+        let dst_h = ((self.height as f32 * scale).round() as u32).clamp(1, max_h);
+
+        let src_w = self.width as usize;
+        let src_h = self.height as usize;
+        let out_w = dst_w as usize;
+        let out_h = dst_h as usize;
+        let mut out = vec![0_u8; out_w * out_h * 4];
+
+        let scale_x = self.width as f32 / dst_w as f32;
+        let scale_y = self.height as f32 / dst_h as f32;
+
+        for dy in 0..out_h {
+            let sy0 = ((dy as f32 * scale_y).floor() as usize).min(src_h - 1);
+            let sy1 = (((dy + 1) as f32 * scale_y).ceil() as usize).clamp(sy0 + 1, src_h);
+            for dx in 0..out_w {
+                let sx0 = ((dx as f32 * scale_x).floor() as usize).min(src_w - 1);
+                let sx1 = (((dx + 1) as f32 * scale_x).ceil() as usize).clamp(sx0 + 1, src_w);
+
+                let mut sum_r = 0.0_f32;
+                let mut sum_g = 0.0_f32;
+                let mut sum_b = 0.0_f32;
+                let mut sum_a = 0.0_f32;
+                let mut count = 0_u32;
+
+                for sy in sy0..sy1 {
+                    let row_off = sy * src_w;
+                    for sx in sx0..sx1 {
+                        let off = (row_off + sx) * 4;
+                        let a = f32::from(self.rgba[off + 3]) / 255.0;
+                        sum_r += (f32::from(self.rgba[off]) / 255.0) * a;
+                        sum_g += (f32::from(self.rgba[off + 1]) / 255.0) * a;
+                        sum_b += (f32::from(self.rgba[off + 2]) / 255.0) * a;
+                        sum_a += a;
+                        count += 1;
+                    }
+                }
+
+                let inv = 1.0 / (count.max(1) as f32);
+                let avg_a = (sum_a * inv).clamp(0.0, 1.0);
+                let dst_off = (dy * out_w + dx) * 4;
+                if avg_a <= 0.0005 {
+                    out[dst_off..dst_off + 4].fill(0);
+                } else {
+                    let r = ((sum_r * inv) / avg_a).clamp(0.0, 1.0);
+                    let g = ((sum_g * inv) / avg_a).clamp(0.0, 1.0);
+                    let b = ((sum_b * inv) / avg_a).clamp(0.0, 1.0);
+                    out[dst_off] = (r * 255.0).round() as u8;
+                    out[dst_off + 1] = (g * 255.0).round() as u8;
+                    out[dst_off + 2] = (b * 255.0).round() as u8;
+                    out[dst_off + 3] = (avg_a * 255.0).round() as u8;
+                }
+            }
+        }
+
+        Self {
+            id: next_image_id(),
+            width: dst_w,
+            height: dst_h,
+            rgba: out,
+        }
+    }
+
+    /// Convert a little-endian `Wayland` `wl_shm` pixel buffer into straight `RGBA8`.
+    #[must_use]
+    pub fn from_wayland_shm(
+        width: u32,
+        height: u32,
+        stride: usize,
+        bytes: &[u8],
+        format: ShmPixelFormat,
+        flip_y: bool,
+    ) -> Option<Self> {
+        let w = usize::try_from(width).ok()?;
+        let h = usize::try_from(height).ok()?;
+        let row_bytes = w.checked_mul(4)?;
+        if width == 0 || height == 0 || stride < row_bytes {
+            return None;
+        }
+        let min_len = h
+            .checked_sub(1)?
+            .checked_mul(stride)?
+            .checked_add(row_bytes)?;
+        if bytes.len() < min_len {
+            return None;
+        }
+
+        let mut rgba = vec![0_u8; w * h * 4];
+        for y in 0..h {
+            let src_y = if flip_y { h - 1 - y } else { y };
+            let src_row = &bytes[src_y * stride..src_y * stride + row_bytes];
+            let dst_row = &mut rgba[y * row_bytes..(y + 1) * row_bytes];
+            for (sp, dp) in src_row.chunks_exact(4).zip(dst_row.chunks_exact_mut(4)) {
+                match format {
+                    ShmPixelFormat::Xrgb8888 => {
+                        dp[0] = sp[2];
+                        dp[1] = sp[1];
+                        dp[2] = sp[0];
+                        dp[3] = 255;
+                    }
+                    ShmPixelFormat::Argb8888 => unpremultiply_pixel(sp[2], sp[1], sp[0], sp[3], dp),
+                    ShmPixelFormat::Xbgr8888 => {
+                        dp[0] = sp[0];
+                        dp[1] = sp[1];
+                        dp[2] = sp[2];
+                        dp[3] = 255;
+                    }
+                    ShmPixelFormat::Abgr8888 => unpremultiply_pixel(sp[0], sp[1], sp[2], sp[3], dp),
+                }
+            }
+        }
+
+        Some(Self {
+            id: next_image_id(),
+            width,
+            height,
+            rgba,
+        })
+    }
+}
+
+#[inline]
+fn unpremultiply_pixel(r: u8, g: u8, b: u8, a: u8, dst: &mut [u8]) {
+    if a == 0 {
+        dst.fill(0);
+    } else if a == 255 {
+        dst[0] = r;
+        dst[1] = g;
+        dst[2] = b;
+        dst[3] = 255;
+    } else {
+        let a_u16 = u16::from(a);
+        let half = a_u16 / 2;
+        dst[0] = ((u16::from(r) * 255 + half) / a_u16).min(255) as u8;
+        dst[1] = ((u16::from(g) * 255 + half) / a_u16).min(255) as u8;
+        dst[2] = ((u16::from(b) * 255 + half) / a_u16).min(255) as u8;
+        dst[3] = a;
+    }
+}
+
+/// Textured rounded-corner image quad primitive for app icons and live window thumbnails.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageQuad {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub radius: f32,
+    pub alpha: f32,
+    pub image: Arc<RgbaImage>,
+}
 
 /// Axis-aligned logical-pixel hit-test rectangle.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -181,8 +426,10 @@ pub enum DrawCommand {
     },
     /// Analytic SDF rounded rectangle with optional shadow and glass rim.
     Rect(RoundedRect),
-    /// Pixel-aligned bitmap text label.
+    /// Pixel-aligned bitmap or TrueType text label.
     Text(TextLabel),
+    /// Rounded-corner textured RGBA image quad (app icon or live thumbnail).
+    Image(ImageQuad),
 }
 
 /// Ordered draw list produced by scene layout and consumed by a renderer backend.
@@ -231,5 +478,10 @@ impl DrawList {
             color,
             align,
         }));
+    }
+
+    /// Append a textured rounded-corner image quad primitive.
+    pub fn push_image(&mut self, quad: ImageQuad) {
+        self.commands.push(DrawCommand::Image(quad));
     }
 }

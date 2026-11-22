@@ -172,21 +172,31 @@ impl LiveActionHandler {
         }
         if scene == SceneKind::Recents {
             if let Ok(windows) = self.compositor.list_windows() {
+                let prev_thumbs: std::collections::HashMap<String, _> = ctx
+                    .recents_cards
+                    .iter()
+                    .filter_map(|c| c.thumbnail.as_ref().map(|t| (c.id.clone(), t.clone())))
+                    .collect();
                 ctx.recents_cards = windows
                     .into_iter()
-                    .map(|w| RecentsCard {
-                        id: w.id.0,
-                        app_id: if w.app_id.is_empty() {
-                            "WINDOW".to_owned()
-                        } else {
-                            w.app_id
-                        },
-                        title: if w.title.is_empty() {
-                            "UNTITLED".to_owned()
-                        } else {
-                            w.title
-                        },
-                        focused: w.focused,
+                    .map(|w| {
+                        let thumbnail = prev_thumbs.get(&w.id.0).cloned();
+                        RecentsCard {
+                            id: w.id.0,
+                            app_id: if w.app_id.is_empty() {
+                                "Window".to_owned()
+                            } else {
+                                w.app_id
+                            },
+                            title: if w.title.is_empty() {
+                                "Untitled".to_owned()
+                            } else {
+                                w.title
+                            },
+                            focused: w.focused,
+                            foreign_id: w.foreign_id,
+                            thumbnail,
+                        }
                     })
                     .collect();
             }
