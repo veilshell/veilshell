@@ -6,6 +6,9 @@ and standalone preview. Host-specific integration belongs in an adapter.
 
 ## Development Workflow
 
+See [AGENTS.md](AGENTS.md) for the feature analysis, implementation handoff,
+and verification workflow.
+
 The workspace uses `clippy::pedantic` and forbids unsafe code outside the
 isolated Wayland GPU surface bridge:
 

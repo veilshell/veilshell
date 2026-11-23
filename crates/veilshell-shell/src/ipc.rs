@@ -52,6 +52,7 @@ pub fn spawn_ipc_listener(
     socket_path: &Path,
     cmd_tx: Sender<DaemonCommand>,
     session: ShellSession,
+    overlay_gap_gestures: bool,
 ) -> std::io::Result<()> {
     // Do not replace a running overlay's endpoint (or an unrelated file).
     let listener = UnixListener::bind(socket_path)?;
@@ -63,7 +64,7 @@ pub fn spawn_ipc_listener(
                 let Ok(stream) = incoming else {
                     break;
                 };
-                if handle_client(stream, &cmd_tx, session) {
+                if handle_client(stream, &cmd_tx, session, overlay_gap_gestures) {
                     break;
                 }
             }
@@ -78,6 +79,7 @@ fn handle_client(
     mut stream: UnixStream,
     cmd_tx: &Sender<DaemonCommand>,
     session: ShellSession,
+    overlay_gap_gestures: bool,
 ) -> bool {
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(cloned) => cloned,
@@ -99,7 +101,7 @@ fn handle_client(
             let Some(scene_str) = parts.next() else {
                 let _ = writeln!(
                     stream,
-                    "err usage: show <pill|home|launcher|settings|recents|shade|osk>"
+                    "err usage: show <pill|home|drawer|launcher|settings|recents|shade|osk>"
                 );
                 return false;
             };
@@ -109,6 +111,8 @@ fn handle_client(
             };
             if scene == SceneKind::Settings && !session.owns_compositor() {
                 let _ = writeln!(stream, "err Settings requires a standalone session");
+            } else if scene == SceneKind::Drawer {
+                write_show_drawer(&mut stream, cmd_tx, session, overlay_gap_gestures);
             } else if scene == SceneKind::Osk {
                 let (reply, result) = mpsc::channel();
                 if cmd_tx.send(DaemonCommand::ShowKeyboard(reply)).is_err() {
@@ -132,28 +136,7 @@ fn handle_client(
             let _ = writeln!(stream, "ok theme {name}");
         }
         "wallpaper" => handle_wallpaper_cmd(&mut stream, trimmed, cmd_tx),
-        "status" => {
-            let (tx, rx) = mpsc::channel();
-            if cmd_tx.send(DaemonCommand::QueryStatus(tx)).is_ok() {
-                if let Ok(st) = rx.recv_timeout(Duration::from_secs(1)) {
-                    let _ = writeln!(
-                        stream,
-                        "daemon     : running (scene: {}, visible: {}, output: {} {}x{}, renderer: {})",
-                        st.active_scene.as_str(),
-                        st.visible,
-                        st.output_name.as_deref().unwrap_or("default"),
-                        st.width,
-                        st.height,
-                        st.renderer
-                    );
-                    if let Some(layout) = st.standalone_layout {
-                        let _ = writeln!(stream, "  session    : standalone ({layout})");
-                    }
-                } else {
-                    let _ = writeln!(stream, "err status timeout");
-                }
-            }
-        }
+        "status" => write_status(&mut stream, cmd_tx),
         "mode" => {
             let (tx, rx) = mpsc::channel();
             if cmd_tx
@@ -182,6 +165,81 @@ fn handle_client(
     false
 }
 
+fn write_show_drawer(
+    stream: &mut UnixStream,
+    cmd_tx: &Sender<DaemonCommand>,
+    session: ShellSession,
+    overlay_gap_gestures: bool,
+) {
+    const UNAVAILABLE: &str = "err Drawer requires standalone Tablet mode";
+    if !session.owns_compositor() && !overlay_gap_gestures {
+        let _ = writeln!(stream, "{UNAVAILABLE}");
+        return;
+    }
+
+    let (tx, rx) = mpsc::channel();
+    if cmd_tx.send(DaemonCommand::QueryStatus(tx)).is_err() {
+        let _ = writeln!(stream, "err daemon not running");
+        return;
+    }
+    let Ok(status) = rx.recv_timeout(Duration::from_secs(1)) else {
+        let _ = writeln!(stream, "err show timed out");
+        return;
+    };
+    if !status.tablet_navigation {
+        let reason = if overlay_gap_gestures {
+            "err Drawer requires a visible touch navigation overlay"
+        } else {
+            UNAVAILABLE
+        };
+        let _ = writeln!(stream, "{reason}");
+        return;
+    }
+    // The Wayland handler also gates Drawer at execution time (mode can change
+    // after the status reply through hardware or the shell UI).
+    if cmd_tx
+        .send(DaemonCommand::ShowScene(SceneKind::Drawer))
+        .is_ok()
+    {
+        let _ = writeln!(stream, "ok scene drawer");
+    } else {
+        let _ = writeln!(stream, "err daemon not running");
+    }
+}
+
+fn write_status(stream: &mut UnixStream, cmd_tx: &Sender<DaemonCommand>) {
+    let (tx, rx) = mpsc::channel();
+    if cmd_tx.send(DaemonCommand::QueryStatus(tx)).is_err() {
+        return;
+    }
+    let Ok(st) = rx.recv_timeout(Duration::from_secs(1)) else {
+        let _ = writeln!(stream, "err status timeout");
+        return;
+    };
+    let _ = writeln!(
+        stream,
+        "daemon     : running (scene: {}, visible: {}, output: {} {}x{}, renderer: {})",
+        st.active_scene.as_str(),
+        st.visible,
+        st.output_name.as_deref().unwrap_or("default"),
+        st.width,
+        st.height,
+        st.renderer
+    );
+    if let Some(layout) = st.standalone_layout {
+        let _ = writeln!(stream, "  session    : standalone ({layout})");
+    }
+    if let Some(layout) = st.tablet_shade_layout {
+        let _ = writeln!(stream, "  tablet shade: {layout}");
+    }
+    if let Some((top, bottom)) = st.overlay_gaps {
+        let _ = writeln!(
+            stream,
+            "  overlay gaps: top {top}px, bottom {bottom}px (logical)"
+        );
+    }
+}
+
 fn handle_wallpaper_cmd(stream: &mut UnixStream, trimmed: &str, cmd_tx: &Sender<DaemonCommand>) {
     let arg = trimmed.strip_prefix("wallpaper").map_or("", str::trim);
     if arg.is_empty() {
@@ -207,7 +265,7 @@ fn handle_wallpaper_cmd(stream: &mut UnixStream, trimmed: &str, cmd_tx: &Sender<
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use veilshell_wayland::channel;
+    use veilshell_wayland::{channel, RuntimeStatus};
 
     #[test]
     fn a_second_daemon_does_not_unlink_an_existing_control_socket() {
@@ -215,11 +273,139 @@ mod tests {
         let path = std::env::temp_dir().join(format!("veilshell-test-{}.sock", now.as_nanos()));
         let original = UnixListener::bind(&path).unwrap();
         let (commands, _) = channel::channel();
-        let failure = spawn_ipc_listener(&path, commands, ShellSession::Overlay).unwrap_err();
+        let failure =
+            spawn_ipc_listener(&path, commands, ShellSession::Overlay, false).unwrap_err();
         let can_connect = UnixStream::connect(&path).is_ok();
         drop(original);
         fs::remove_file(&path).unwrap();
         assert_eq!(failure.kind(), std::io::ErrorKind::AddrInUse);
         assert!(can_connect);
+    }
+
+    #[test]
+    fn drawer_show_rejects_overlay_without_dispatching() {
+        let (commands, events) = channel::channel();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(b"show drawer\n").unwrap();
+        assert!(!handle_client(
+            server,
+            &commands,
+            ShellSession::Overlay,
+            false
+        ));
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        assert_eq!(reply, "err Drawer requires standalone Tablet mode\n");
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn drawer_show_requires_runtime_touch_navigation_capability() {
+        for (session, layout, gap_depths, visible, allowed) in [
+            (ShellSession::Standalone, Some("Desk"), None, true, false),
+            (ShellSession::Standalone, Some("Tablet"), None, false, false),
+            (ShellSession::Standalone, Some("Tablet"), None, true, true),
+            (ShellSession::Overlay, None, Some((0, 0)), true, true),
+            (ShellSession::Overlay, None, Some((0, 0)), false, false),
+        ] {
+            let (commands, events) = channel::channel();
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client.write_all(b"show drawer\n").unwrap();
+            let handle = thread::spawn(move || {
+                assert!(!handle_client(
+                    server,
+                    &commands,
+                    session,
+                    gap_depths.is_some()
+                ));
+            });
+            // Keep the test bounded even if the handler stops querying status.
+            let DaemonCommand::QueryStatus(status) = events.recv().unwrap() else {
+                panic!("Drawer must check whether Tablet navigation is enabled");
+            };
+            status
+                .send(RuntimeStatus {
+                    active_scene: SceneKind::Pill,
+                    visible,
+                    output_name: None,
+                    width: 960,
+                    height: 640,
+                    renderer: "test".into(),
+                    standalone_layout: layout,
+                    tablet_shade_layout: None,
+                    tablet_navigation: allowed,
+                    overlay_gaps: gap_depths,
+                })
+                .unwrap();
+            handle.join().unwrap();
+            let mut reply = String::new();
+            client.read_to_string(&mut reply).unwrap();
+            if allowed {
+                assert_eq!(reply, "ok scene drawer\n");
+                assert!(matches!(
+                    events.try_recv().unwrap(),
+                    DaemonCommand::ShowScene(SceneKind::Drawer)
+                ));
+            } else if session.owns_compositor() {
+                assert_eq!(reply, "err Drawer requires standalone Tablet mode\n");
+            } else {
+                assert_eq!(
+                    reply,
+                    "err Drawer requires a visible touch navigation overlay\n"
+                );
+            }
+            assert!(events.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn status_reports_logical_strip_depths_only_for_the_opt_in() {
+        for (gap_depths, expected) in [
+            (None, None),
+            (
+                Some((0, 0)),
+                Some("  overlay gaps: top 0px, bottom 0px (logical)"),
+            ),
+            (
+                Some((5, 12)),
+                Some("  overlay gaps: top 5px, bottom 12px (logical)"),
+            ),
+        ] {
+            let (commands, events) = channel::channel();
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client.write_all(b"status\n").unwrap();
+            let handle = thread::spawn(move || {
+                assert!(!handle_client(
+                    server,
+                    &commands,
+                    ShellSession::Overlay,
+                    gap_depths.is_some()
+                ));
+            });
+            let DaemonCommand::QueryStatus(status) = events.recv().unwrap() else {
+                panic!("expected a status request");
+            };
+            status
+                .send(RuntimeStatus {
+                    active_scene: SceneKind::Pill,
+                    visible: true,
+                    output_name: Some("eDP-1".into()),
+                    width: 960,
+                    height: 640,
+                    renderer: "test".into(),
+                    standalone_layout: None,
+                    tablet_shade_layout: None,
+                    tablet_navigation: gap_depths.is_some(),
+                    overlay_gaps: gap_depths,
+                })
+                .unwrap();
+            handle.join().unwrap();
+            let mut reply = String::new();
+            client.read_to_string(&mut reply).unwrap();
+            assert_eq!(
+                reply.lines().find(|line| line.contains("overlay gaps")),
+                expected
+            );
+        }
     }
 }

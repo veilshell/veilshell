@@ -6,7 +6,9 @@ pub mod client;
 mod gpu;
 mod motion;
 mod osk;
+mod overlay_gaps;
 mod scale;
+mod tablet_nav;
 
 pub use client::{
     run_layer_surface, run_shell_daemon, DaemonCommand, RuntimeStatus, ShadeReply, ShellAction,
@@ -19,8 +21,14 @@ pub use smithay_client_toolkit::reexports::calloop::channel;
 pub enum LayerRole {
     /// Thin bottom gesture indicator bar.
     BottomPill,
+    /// Swipe-only navigation target at the bottom of the Tablet session.
+    TabletBottom,
     /// Subtle top-center pull handle for Quick Settings.
     TopStrip,
+    /// Invisible bottom work-area strip in the opt-in desktop overlay.
+    OverlayBottomGap,
+    /// Invisible top work-area strip in the opt-in desktop overlay.
+    OverlayTopGap,
     /// Standalone Tablet status bar, above the app work area.
     TabletStatus,
     /// Standalone desktop panel, reserved above the work area.
@@ -47,7 +55,9 @@ impl LayerRole {
     pub const fn from_scene(scene: veilshell_render::SceneKind) -> Self {
         match scene {
             veilshell_render::SceneKind::Pill => Self::BottomPill,
-            veilshell_render::SceneKind::Home => Self::HomeGrid,
+            veilshell_render::SceneKind::Home | veilshell_render::SceneKind::Drawer => {
+                Self::HomeGrid
+            }
             veilshell_render::SceneKind::Launcher => Self::DesktopLauncher,
             veilshell_render::SceneKind::Settings => Self::Settings,
             veilshell_render::SceneKind::Recents => Self::RecentsDeck,
@@ -58,12 +68,15 @@ impl LayerRole {
 
     /// Map this [`LayerRole`] back to its rendered [`veilshell_render::SceneKind`].
     ///
-    /// [`LayerRole::TopStrip`] maps to [`veilshell_render::SceneKind::Pill`] as a passive bar role.
+    /// Passive edge roles map to [`veilshell_render::SceneKind::Pill`].
     #[must_use]
     pub const fn to_scene(self) -> veilshell_render::SceneKind {
         match self {
             Self::BottomPill
+            | Self::TabletBottom
             | Self::TopStrip
+            | Self::OverlayBottomGap
+            | Self::OverlayTopGap
             | Self::TabletStatus
             | Self::DeskPanel
             | Self::Wallpaper => veilshell_render::SceneKind::Pill,
@@ -120,6 +133,16 @@ impl Anchor {
             right: false,
         }
     }
+
+    /// Anchor to the top edge across the full width.
+    #[must_use]
+    pub const fn top_bar() -> Self {
+        Self {
+            left: true,
+            right: true,
+            ..Self::top_center()
+        }
+    }
 }
 
 /// Declarative geometry and interactivity spec for a layer surface.
@@ -135,17 +158,23 @@ pub struct LayerSurfaceSpec {
 
 /// Logical depth of the top and bottom gesture zones.
 pub const EDGE_HANDLE_DEPTH: u32 = 48;
+/// The visible part of the reference's bottom hit box (60 px minus 8 offscreen).
+pub const TABLET_BOTTOM_DEPTH: u32 = 52;
 
 impl LayerSurfaceSpec {
     /// Compute the default surface specification for a given [`LayerRole`] and logical viewport.
     #[must_use]
     pub fn for_role(role: LayerRole, viewport_w: u32, viewport_h: u32) -> Self {
         match role {
-            LayerRole::BottomPill => Self {
+            LayerRole::BottomPill | LayerRole::TabletBottom => Self {
                 role,
                 anchor: Anchor::bottom_bar(),
                 width: viewport_w,
-                height: EDGE_HANDLE_DEPTH,
+                height: if role == LayerRole::TabletBottom {
+                    TABLET_BOTTOM_DEPTH
+                } else {
+                    EDGE_HANDLE_DEPTH
+                },
                 exclusive_zone: 0,
                 keyboard_interactivity: false,
             },
@@ -157,6 +186,19 @@ impl LayerSurfaceSpec {
                 exclusive_zone: 0,
                 keyboard_interactivity: false,
             },
+            LayerRole::OverlayTopGap | LayerRole::OverlayBottomGap => Self {
+                role,
+                anchor: if role == LayerRole::OverlayTopGap {
+                    Anchor::top_bar()
+                } else {
+                    Anchor::bottom_bar()
+                },
+                width: viewport_w,
+                // A live native-config result must supply the depth.
+                height: 0,
+                exclusive_zone: 0,
+                keyboard_interactivity: false,
+            },
             LayerRole::TabletStatus => Self {
                 role,
                 anchor: Anchor {
@@ -165,8 +207,9 @@ impl LayerSurfaceSpec {
                     ..Anchor::top_center()
                 },
                 width: viewport_w,
-                height: EDGE_HANDLE_DEPTH,
-                exclusive_zone: 48,
+                height: veilshell_render::TABLET_STATUS_HEIGHT,
+                exclusive_zone: i32::try_from(veilshell_render::TABLET_STATUS_HEIGHT)
+                    .unwrap_or(i32::MAX),
                 keyboard_interactivity: false,
             },
             LayerRole::Wallpaper => Self {

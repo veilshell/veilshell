@@ -1,5 +1,8 @@
 //! `veilshell` multi-surface `Wayland` tablet & touch shell daemon.
 
+#[path = "veilshell/app_switch.rs"]
+mod app_switch;
+
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -7,14 +10,14 @@ use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use signal_hook::{
     consts::signal::{SIGINT, SIGTERM},
     iterator::Signals,
 };
 
-use veilshell_compositor::{CompositorBackend, HyprlandBackend, MockBackend, WindowId};
+use veilshell_compositor::{CompositorBackend, HyprlandBackend, MockBackend, WindowId, WindowInfo};
 use veilshell_core::{
     ModeEvent, ModePolicy, ModeStateMachine, Orientation, RotationLock, ShellMode, ThemePalette,
 };
@@ -26,7 +29,8 @@ use veilshell_render::{
     ShadePage, WallpaperImage,
 };
 use veilshell_shell::apps::{
-    apps_to_tiles, current_clock_hhmm, discover_desktop_apps, running_app_window,
+    apps_to_tiles, current_clock_hhmm, current_tablet_clock, discover_desktop_apps,
+    running_app_window,
 };
 use veilshell_shell::ipc::{default_socket_path, spawn_ipc_listener};
 use veilshell_shell::session::ShellSession;
@@ -44,15 +48,47 @@ struct LiveActionHandler<C> {
     desktop_apps: Vec<veilshell_core::DesktopApp>,
     hw: LinuxHardware,
     session: ShellSession,
+    overlay_gap_gestures: bool,
     mode_sm: ModeStateMachine,
     rotation: RotationLock,
     target_output: Option<String>,
     auto_rotate: bool,
     session_tx: Option<Sender<DaemonCommand>>,
     shade_tx: Option<Sender<DaemonCommand>>,
+    app_switch_order: app_switch::AppSwitchOrder,
+    recents_output: Option<String>,
 }
 
 impl<C: CompositorBackend> LiveActionHandler<C> {
+    fn overlay_gap_gestures(&self) -> bool {
+        self.session == ShellSession::Overlay && self.overlay_gap_gestures
+    }
+
+    fn scoped_recents(&self, ctx: &SceneContext) -> bool {
+        if self.session.owns_compositor() {
+            ctx.uses_tablet_status()
+        } else {
+            self.overlay_gap_gestures() && ctx.uses_touch_navigation()
+        }
+    }
+
+    fn recents_target_is_current(&self, id: &str, ctx: &SceneContext) -> bool {
+        let Some((output, card)) = self
+            .recents_output
+            .as_deref()
+            .zip(ctx.recents_cards.iter().find(|card| card.id == id))
+        else {
+            return false;
+        };
+        // A user can select a card long after the initial snapshot. Never
+        // focus it if it moved to a different workspace or output, and
+        // don't dispatch to a reused address if the stable ID changed.
+        self.compositor.list_tablet_windows(output).is_ok_and(|ws| {
+            ws.iter()
+                .any(|w| w.id.0 == id && w.foreign_id == card.foreign_id)
+        })
+    }
+
     fn change_setting(&self, action: veilshell_render::SettingsAction, ctx: &mut SceneContext) {
         if !self.session.owns_compositor() {
             return;
@@ -136,6 +172,9 @@ impl<C: CompositorBackend> LiveActionHandler<C> {
     }
 
     fn request_power(&self, action: PowerAction, ctx: &mut SceneContext) {
+        if !self.session.owns_compositor() {
+            return;
+        }
         if !self
             .session_tx
             .as_ref()
@@ -162,8 +201,16 @@ impl<C: CompositorBackend> LiveActionHandler<C> {
         ctx.tablet_mode = self.mode_sm.effective_mode() == ShellMode::Tablet;
     }
 
+    fn sync_clock(&self, ctx: &mut SceneContext) {
+        if self.session.owns_compositor() || self.overlay_gap_gestures() {
+            (ctx.clock_text, ctx.home_date_text) = current_tablet_clock();
+        } else {
+            ctx.clock_text = current_clock_hhmm();
+        }
+    }
+
     fn sync_fast_sysfs(&self, ctx: &mut SceneContext) {
-        ctx.clock_text = current_clock_hhmm();
+        self.sync_clock(ctx);
         if let Some((pct, _)) = read_sysfs_battery() {
             ctx.battery_pct = pct;
         }
@@ -201,47 +248,28 @@ impl<C: CompositorBackend> LiveActionHandler<C> {
         }
     }
 
-    fn refresh_context(&self, scene: SceneKind, ctx: &mut SceneContext) {
-        ctx.clock_text = current_clock_hhmm();
+    fn refresh_context(&mut self, scene: SceneKind, ctx: &mut SceneContext) {
         if scene == SceneKind::Shade {
+            self.sync_clock(ctx);
             self.sync_hardware_snapshot(ctx);
-            shade::refresh_optional(ctx);
             ctx.shade.feedback = None;
-            if let Some(tx) = &self.shade_tx {
-                shade::request(ctx, tx, self.session, None);
+            if !self.overlay_gap_gestures() {
+                shade::refresh_optional(ctx);
+                if let Some(tx) = &self.shade_tx {
+                    shade::request(ctx, tx, self.session, None);
+                }
             }
         } else {
             self.sync_fast_sysfs(ctx);
         }
+        // Touch navigation uses refresh_tablet_overview with the gesture
+        // output. A missing scope must not expose the global list.
         if scene == SceneKind::Recents {
-            if let Ok(windows) = self.compositor.list_windows() {
-                let prev_thumbs: std::collections::HashMap<String, _> = ctx
-                    .recents_cards
-                    .iter()
-                    .filter_map(|c| c.thumbnail.as_ref().map(|t| (c.id.clone(), t.clone())))
-                    .collect();
-                ctx.recents_cards = windows
-                    .into_iter()
-                    .map(|w| {
-                        let thumbnail = prev_thumbs.get(&w.id.0).cloned();
-                        RecentsCard {
-                            id: w.id.0,
-                            app_id: if w.app_id.is_empty() {
-                                "Window".to_owned()
-                            } else {
-                                w.app_id
-                            },
-                            title: if w.title.is_empty() {
-                                "Untitled".to_owned()
-                            } else {
-                                w.title
-                            },
-                            focused: w.focused,
-                            foreign_id: w.foreign_id,
-                            thumbnail,
-                        }
-                    })
-                    .collect();
+            self.recents_output = None;
+            if self.overlay_gap_gestures() || self.scoped_recents(ctx) {
+                ctx.recents_cards.clear();
+            } else if let Ok(windows) = self.compositor.list_windows() {
+                replace_recents(ctx, windows);
             }
         }
     }
@@ -358,8 +386,110 @@ impl<C: CompositorBackend> LiveActionHandler<C> {
     }
 }
 
+fn replace_recents(ctx: &mut SceneContext, windows: Vec<WindowInfo>) {
+    let mut previous: std::collections::HashMap<_, _> = ctx
+        .recents_cards
+        .drain(..)
+        .filter_map(|card| {
+            card.thumbnail
+                .map(|thumb| ((card.id, card.foreign_id), thumb))
+        })
+        .collect();
+    ctx.recents_cards = windows
+        .into_iter()
+        .map(|w| {
+            let thumbnail = previous.remove(&(w.id.0.clone(), w.foreign_id.clone()));
+            RecentsCard {
+                id: w.id.0,
+                app_id: if w.app_id.is_empty() {
+                    "Window".to_owned()
+                } else {
+                    w.app_id
+                },
+                title: if w.title.is_empty() {
+                    "Untitled".to_owned()
+                } else {
+                    w.title
+                },
+                focused: w.focused,
+                foreign_id: w.foreign_id,
+                thumbnail,
+            }
+        })
+        .collect();
+}
+
 impl<C: CompositorBackend> ShellActionHandler for LiveActionHandler<C> {
+    fn overlay_gap_depths(&self) -> (u32, u32) {
+        if self.overlay_gap_gestures() {
+            self.compositor.overlay_gap_depths()
+        } else {
+            (0, 0)
+        }
+    }
+
+    fn refresh_tablet_overview(&mut self, output: &str, ctx: &mut SceneContext) {
+        self.recents_output = None;
+        if !self.scoped_recents(ctx) {
+            ctx.recents_cards.clear();
+            return;
+        }
+        match self.compositor.list_tablet_windows(output) {
+            Ok(windows) => {
+                if self.overlay_gap_gestures() {
+                    self.recents_output = Some(output.to_owned());
+                }
+                replace_recents(ctx, windows);
+            }
+            Err(err) => {
+                ctx.recents_cards.clear();
+                eprintln!("veilshell: could not list windows on '{output}': {err}");
+            }
+        }
+    }
+
+    fn switch_tablet_app(
+        &mut self,
+        output: &str,
+        direction: i32,
+        from_home: bool,
+        ctx: &SceneContext,
+    ) -> bool {
+        if !self.scoped_recents(ctx) {
+            return false;
+        }
+        match self.app_switch_order.focus_adjacent(
+            &mut self.compositor,
+            output,
+            direction,
+            from_home,
+            Instant::now,
+        ) {
+            Ok(focused) => focused,
+            Err(err) => {
+                eprintln!("veilshell: app switch failed: {err}");
+                false
+            }
+        }
+    }
+
     fn on_action(&mut self, action: ShellAction, ctx: &mut SceneContext) {
+        if self.overlay_gap_gestures() {
+            match &action {
+                // This profile opens Shade but doesn't mutate host settings,
+                // launch host helper panels, or dispatch workspace changes.
+                ShellAction::SwitchWorkspace(_)
+                | ShellAction::ToggleSetting(_)
+                | ShellAction::SetSlider { .. }
+                | ShellAction::Shade(_) => return,
+                ShellAction::FocusWindow(id) | ShellAction::CloseWindow(id)
+                    if !self.recents_target_is_current(id, ctx) =>
+                {
+                    return;
+                }
+                _ => {}
+            }
+        }
         match action {
             ShellAction::Settings(action) => self.change_setting(action, ctx),
             ShellAction::RequestRefresh(scene) => self.refresh_context(scene, ctx),
@@ -645,6 +775,7 @@ fn parse_policy_flag(raw: &str) -> Option<ModePolicy> {
 struct CliOptions {
     dry_run: bool,
     no_watchers: bool,
+    overlay_gap_gestures: bool,
     scene: SceneKind,
     policy: ModePolicy,
     osk_policy: OskPolicy,
@@ -661,7 +792,7 @@ enum CliOutcome {
 }
 
 #[allow(clippy::too_many_lines)]
-fn parse_cli(args: &[String]) -> CliOutcome {
+fn parse_cli(args: &[String], session: ShellSession) -> CliOutcome {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         print_help();
         return CliOutcome::Exit(ExitCode::SUCCESS);
@@ -673,6 +804,11 @@ fn parse_cli(args: &[String]) -> CliOutcome {
 
     let dry_run = args.iter().any(|a| a == "--dry-run");
     let no_watchers = args.iter().any(|a| a == "--no-watchers");
+    let overlay_gap_gestures = args.iter().any(|a| a == "--overlay-gap-gestures");
+    if overlay_gap_gestures && session.owns_compositor() {
+        eprintln!("--overlay-gap-gestures is overlay-only; it cannot run in a standalone session");
+        return CliOutcome::Exit(ExitCode::FAILURE);
+    }
     let scene = match parse_flag(args, "--scene") {
         Some(raw) => {
             let Some(parsed) = SceneKind::parse_name(&raw) else {
@@ -683,6 +819,10 @@ fn parse_cli(args: &[String]) -> CliOutcome {
         }
         None => SceneKind::Pill,
     };
+    if overlay_gap_gestures && scene == SceneKind::Settings {
+        eprintln!("Settings requires a standalone session");
+        return CliOutcome::Exit(ExitCode::FAILURE);
+    }
 
     let policy = match parse_flag(args, "--policy") {
         Some(raw) => {
@@ -705,6 +845,8 @@ fn parse_cli(args: &[String]) -> CliOutcome {
                 return CliOutcome::Exit(ExitCode::FAILURE);
             }
         }
+    } else if overlay_gap_gestures {
+        OskPolicy::Manual
     } else {
         OskPolicy::Auto
     };
@@ -746,6 +888,7 @@ fn parse_cli(args: &[String]) -> CliOutcome {
     CliOutcome::Run(CliOptions {
         dry_run,
         no_watchers,
+        overlay_gap_gestures,
         scene,
         policy,
         osk_policy,
@@ -794,7 +937,13 @@ fn initial_scene(
     session: ShellSession,
     apps: &[veilshell_core::DesktopApp],
     visible: bool,
+    overlay_gap_gestures: bool,
 ) -> SceneContext {
+    let (clock_text, home_date_text) = if session.owns_compositor() || overlay_gap_gestures {
+        current_tablet_clock()
+    } else {
+        (current_clock_hhmm(), String::new())
+    };
     let mut ctx = SceneContext {
         settings: session
             .owns_compositor()
@@ -802,14 +951,19 @@ fn initial_scene(
             .flatten()
             .as_deref()
             .map(settings::load),
-        clock_text: current_clock_hhmm(),
+        clock_text,
+        home_date_text,
         tablet_mode: visible,
+        overlay_gap_gestures,
         home_apps: apps_to_tiles(apps),
         power_menu: session.owns_compositor().then_some(PowerMenu::default()),
         ..SceneContext::default()
     };
     ctx.shade.auto_rotate_available = false;
     ctx.shade.quiet = None;
+    if overlay_gap_gestures {
+        ctx.shade.power_profile = None;
+    }
     if let Some(view) = &mut ctx.settings {
         ctx.session_wallpaper = load_session_wallpaper(view);
         ctx.tablet_status.battery = read_sysfs_battery();
@@ -832,7 +986,8 @@ fn load_session_wallpaper(
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
-    let opts = match parse_cli(&args) {
+    let session = ShellSession::current();
+    let opts = match parse_cli(&args, session) {
         CliOutcome::Run(o) => o,
         CliOutcome::Exit(code) => return code,
     };
@@ -841,6 +996,7 @@ fn main() -> ExitCode {
         None
     } else {
         match live_backend() {
+            Ok(backend) if opts.overlay_gap_gestures => Some(backend.with_overlay_gap_gestures()),
             Ok(backend) => Some(backend),
             Err(err) => {
                 eprintln!("veilshell: {err}");
@@ -848,8 +1004,14 @@ fn main() -> ExitCode {
             }
         }
     };
+    run_daemon(opts, session, compositor)
+}
 
-    let session = ShellSession::current();
+fn run_daemon(
+    opts: CliOptions,
+    session: ShellSession,
+    compositor: Option<HyprlandBackend>,
+) -> ExitCode {
     let palette = session.palette();
     let discovered = discover_desktop_apps();
     let hw = LinuxHardware::auto_detect();
@@ -861,7 +1023,12 @@ fn main() -> ExitCode {
         || mode_sm.effective_mode() == ShellMode::Tablet
         || opts.scene != SceneKind::Pill;
 
-    let mut scene_ctx = initial_scene(session, &discovered, initial_visible);
+    let mut scene_ctx = initial_scene(
+        session,
+        &discovered,
+        initial_visible,
+        opts.overlay_gap_gestures,
+    );
 
     let Some(compositor) = compositor else {
         print_dry_run(&opts, hw, palette, scene_ctx, initial_visible);
@@ -878,19 +1045,27 @@ fn main() -> ExitCode {
         desktop_apps: discovered,
         hw: hw.clone(),
         session,
+        overlay_gap_gestures: opts.overlay_gap_gestures,
         mode_sm,
         rotation: RotationLock::default(),
         target_output: opts.output_name.clone(),
         auto_rotate: false,
         session_tx: session.owns_compositor().then(|| cmd_tx.clone()),
         shade_tx: Some(cmd_tx.clone()),
+        app_switch_order: app_switch::AppSwitchOrder::default(),
+        recents_output: None,
     };
     handler.sync_hardware_snapshot(&mut scene_ctx);
     if let Err(err) = handler.apply_mode_layout(mode_sm.effective_mode()) {
         eprintln!("veilshell: could not apply initial session layout: {err}");
     }
 
-    if let Err(err) = spawn_ipc_listener(&opts.socket_path, cmd_tx.clone(), session) {
+    if let Err(err) = spawn_ipc_listener(
+        &opts.socket_path,
+        cmd_tx.clone(),
+        session,
+        opts.overlay_gap_gestures,
+    ) {
         eprintln!(
             "veilshell: could not bind IPC socket {}: {err}",
             opts.socket_path.display()
@@ -958,6 +1133,9 @@ fn print_dry_run(
     println!("  scene      : {}", opts.scene.as_str());
     println!("  policy     : {:?}", opts.policy);
     println!("  app OSK    : {:?}", opts.osk_policy);
+    if opts.overlay_gap_gestures {
+        println!("  overlay gaps: requested (not queried in dry run)");
+    }
     println!("  visible    : {visible}");
     let apps = ctx.home_apps.len();
     match ActiveRenderer::new(opts.renderer, ctx) {
@@ -983,8 +1161,10 @@ fn print_help() {
          \tveilshell [OPTIONS]\n\n\
          OPTIONS:\n\
          \t--policy <auto|laptop|tablet>          Initial Laptop/Tablet mode policy (default: auto)\n\
-         \t--osk <auto|manual>                    Manual never claims the input method (default: auto)\n\
-         \t--scene <pill|home|launcher|settings|recents|shade|osk>  Initial surface scene (default: pill)\n\
+         \t--overlay-gap-gestures                 Overlay only: touch navigation from uncovered Hyprland gaps\n\
+         \t                                       Use --policy tablet to keep the overlay visible\n\
+         \t--osk <auto|manual>                    Manual never claims the input method (default: auto; manual with gap gestures)\n\
+         \t--scene <pill|home|drawer|launcher|settings|recents|shade|osk>  Initial surface scene (default: pill)\n\
          \t--renderer <auto|wgpu|software>        Rendering backend (default: auto)\n\
          \t--wallpaper <PNG_PATH>                 Static PNG wallpaper for pre-blurred GPU glass\n\
          \t--output <NAME>                        Bind surfaces to a specific Wayland output\n\
@@ -1004,12 +1184,12 @@ mod tests {
 
     #[test]
     fn manual_osk_is_an_independent_opt_in() {
-        let CliOutcome::Run(options) = parse_cli(&[]) else {
+        let CliOutcome::Run(options) = parse_cli(&[], ShellSession::Standalone) else {
             panic!("expected default options");
         };
         assert_eq!(options.osk_policy, OskPolicy::Auto);
         let args = ["--policy", "tablet", "--osk", "manual"].map(str::to_owned);
-        let CliOutcome::Run(options) = parse_cli(&args) else {
+        let CliOutcome::Run(options) = parse_cli(&args, ShellSession::Overlay) else {
             panic!("expected manual OSK options");
         };
         assert_eq!(options.osk_policy, OskPolicy::Manual);
@@ -1017,10 +1197,43 @@ mod tests {
         for args in [vec!["--osk"], vec!["--osk", "unknown"]] {
             let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
             assert!(matches!(
-                parse_cli(&args),
+                parse_cli(&args, ShellSession::Overlay),
                 CliOutcome::Exit(ExitCode::FAILURE)
             ));
         }
+    }
+
+    #[test]
+    fn overlay_gap_flag_is_explicit_and_overlay_only() {
+        let CliOutcome::Run(default) = parse_cli(&[], ShellSession::Overlay) else {
+            panic!("expected default overlay options");
+        };
+        assert!(!default.overlay_gap_gestures);
+        assert_eq!(default.osk_policy, OskPolicy::Auto);
+
+        let args = ["--overlay-gap-gestures", "--dry-run", "--policy", "tablet"].map(str::to_owned);
+        let CliOutcome::Run(gap) = parse_cli(&args, ShellSession::Overlay) else {
+            panic!("expected overlay gap options");
+        };
+        assert!(gap.overlay_gap_gestures);
+        assert_eq!(gap.policy, ModePolicy::ForceTablet);
+        assert_eq!(gap.osk_policy, OskPolicy::Manual);
+        assert!(matches!(
+            parse_cli(&args, ShellSession::Standalone),
+            CliOutcome::Exit(ExitCode::FAILURE)
+        ));
+
+        let args = ["--overlay-gap-gestures", "--osk", "auto"].map(str::to_owned);
+        let CliOutcome::Run(gap) = parse_cli(&args, ShellSession::Overlay) else {
+            panic!("expected overlay gap options with automatic OSK override");
+        };
+        assert_eq!(gap.policy, ModePolicy::Auto);
+        assert_eq!(gap.osk_policy, OskPolicy::Auto);
+        let args = ["--overlay-gap-gestures", "--scene", "settings"].map(str::to_owned);
+        assert!(matches!(
+            parse_cli(&args, ShellSession::Overlay),
+            CliOutcome::Exit(ExitCode::FAILURE)
+        ));
     }
 
     #[test]
@@ -1063,13 +1276,159 @@ mod tests {
             desktop_apps: Vec::new(),
             hw: LinuxHardware::new(None),
             session,
+            overlay_gap_gestures: false,
             mode_sm: ModeStateMachine::new(ModePolicy::Auto, true),
             rotation: RotationLock::default(),
             target_output: Some("eDP-1".to_owned()),
             auto_rotate: true,
             session_tx: None,
             shade_tx: None,
+            app_switch_order: app_switch::AppSwitchOrder::default(),
+            recents_output: None,
         }
+    }
+
+    #[test]
+    fn tablet_overview_uses_the_output_snapshot_and_clears_on_error() {
+        let mut shell = handler(ShellSession::Standalone);
+        shell.mode_sm = ModeStateMachine::new(ModePolicy::ForceTablet, false);
+        let mut ctx = SceneContext {
+            power_menu: Some(PowerMenu::default()),
+            ..SceneContext::default()
+        };
+
+        shell.on_action(ShellAction::RequestRefresh(SceneKind::Recents), &mut ctx);
+        assert_eq!(ctx.recents_cards, Vec::<RecentsCard>::new());
+
+        shell
+            .compositor
+            .focus_window(&WindowId("0x2".into()))
+            .unwrap();
+        shell.refresh_tablet_overview("eDP-1", &mut ctx);
+        assert_eq!(ctx.recents_cards[0].id, "0x2");
+        assert!(ctx.recents_cards[0].focused);
+
+        shell.refresh_tablet_overview("eDP", &mut ctx);
+        assert_eq!(ctx.recents_cards, Vec::<RecentsCard>::new());
+        assert!(!shell.switch_tablet_app("eDP", 1, true, &ctx));
+    }
+
+    #[test]
+    fn desk_and_overlay_recents_keep_the_legacy_window_query() {
+        for (session, policy) in [
+            (ShellSession::Standalone, ModePolicy::ForceLaptop),
+            (ShellSession::Overlay, ModePolicy::ForceTablet),
+        ] {
+            let mut shell = handler(session);
+            shell.mode_sm = ModeStateMachine::new(policy, false);
+            let mut ctx = SceneContext {
+                power_menu: session.owns_compositor().then_some(PowerMenu::default()),
+                recents_cards: Vec::new(),
+                ..SceneContext::default()
+            };
+            shell
+                .compositor
+                .focus_window(&WindowId("0x2".into()))
+                .unwrap();
+
+            shell.on_action(ShellAction::RequestRefresh(SceneKind::Recents), &mut ctx);
+
+            assert_eq!(ctx.recents_cards.len(), 3);
+            assert_eq!(ctx.recents_cards[0].id, "0x1");
+            assert!(ctx.recents_cards[1].focused);
+            assert!(!shell.switch_tablet_app("eDP-1", 1, true, &ctx));
+        }
+    }
+
+    #[test]
+    fn overlay_gap_recents_and_switcher_require_the_named_output_and_never_fall_back() {
+        let mut shell = handler(ShellSession::Overlay);
+        shell.overlay_gap_gestures = true;
+        let mut ctx = initial_scene(ShellSession::Overlay, &[], true, true);
+        assert!(ctx.uses_touch_navigation());
+        assert!(!ctx.uses_tablet_status());
+        assert!(ctx.power_menu.is_none());
+        assert!(ctx.settings.is_none());
+        assert!(!ctx.shade.auto_rotate_available);
+
+        shell.on_action(ShellAction::RequestRefresh(SceneKind::Recents), &mut ctx);
+        assert_eq!(ctx.recents_cards, []);
+        shell.refresh_tablet_overview("eDP", &mut ctx);
+        assert_eq!(ctx.recents_cards, []);
+        assert!(!shell.switch_tablet_app("eDP", 1, true, &ctx));
+
+        assert!(shell.switch_tablet_app("eDP-1", 1, true, &ctx));
+        assert!(shell.switch_tablet_app("eDP-1", 1, false, &ctx));
+        shell.refresh_tablet_overview("eDP-1", &mut ctx);
+        assert_eq!(ctx.recents_cards[0].id, "0x2");
+        assert!(ctx.recents_cards[0].focused);
+        assert_eq!(shell.compositor.last_workspace_delta(), 0);
+        assert_eq!(shell.compositor.launched_commands(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn overlay_gap_actions_recheck_scoped_cards_and_do_not_run_host_controls() {
+        let mut shell = handler(ShellSession::Overlay);
+        shell.overlay_gap_gestures = true;
+        let mut ctx = initial_scene(ShellSession::Overlay, &[], true, true);
+        shell.refresh_tablet_overview("eDP-1", &mut ctx);
+        shell.on_action(ShellAction::FocusWindow("0x2".into()), &mut ctx);
+        assert!(shell.compositor.list_windows().unwrap()[1].focused);
+        ctx.recents_cards[0].foreign_id = Some("stale-card".into());
+        shell.on_action(ShellAction::CloseWindow("0x1".into()), &mut ctx);
+        assert_eq!(shell.compositor.list_windows().unwrap().len(), 3);
+        shell.refresh_tablet_overview("unknown-output", &mut ctx);
+        shell.on_action(ShellAction::FocusWindow("0x1".into()), &mut ctx);
+        assert!(shell.compositor.list_windows().unwrap()[1].focused);
+
+        shell.on_action(ShellAction::SwitchWorkspace(1), &mut ctx);
+        assert_eq!(shell.compositor.last_workspace_delta(), 0);
+        shell.on_action(ShellAction::ToggleSetting("tablet_mode"), &mut ctx);
+        assert_eq!(shell.mode_sm.policy(), ModePolicy::Auto);
+        let (tx, rx) = channel::channel();
+        shell.shade_tx = Some(tx);
+        // Use an unsupported page so even a regression can't run a real
+        // host tool. The opt-in must not queue the request at all.
+        shell.on_action(
+            ShellAction::Shade(ShadeAction::Host(ShadePage::Main)),
+            &mut ctx,
+        );
+        assert!(ctx.shade.pending.is_none());
+        assert!(rx.try_recv().is_err());
+
+        // Keep session_tx absent: even a guard regression cannot run power.
+        let menu = PowerMenu::Running(PowerAction::Lock);
+        ctx.power_menu = Some(menu);
+        shell.on_action(ShellAction::RequestPower(PowerAction::Lock), &mut ctx);
+        assert_eq!(ctx.power_menu, Some(menu));
+    }
+
+    #[test]
+    fn recents_keeps_thumbnails_only_for_the_same_card_identity() {
+        let mut ctx = SceneContext::default();
+        let mut windows = MockBackend::default().list_windows().unwrap();
+        for (card, window) in ctx.recents_cards.iter_mut().zip(&mut windows) {
+            let foreign_id = format!("stable-{}", card.id);
+            card.foreign_id = Some(foreign_id.clone());
+            window.foreign_id = Some(foreign_id);
+        }
+        let surviving_thumb = ctx.recents_cards[0].thumbnail.clone().unwrap();
+        windows.pop();
+        windows.swap(0, 1);
+        windows[0].foreign_id = Some("replacement-same-address".into());
+        windows[1].title = "Renamed terminal".into();
+
+        replace_recents(&mut ctx, windows);
+
+        assert_eq!(ctx.recents_cards.len(), 2);
+        assert_eq!(ctx.recents_cards[0].id, "0x2");
+        assert!(ctx.recents_cards[0].thumbnail.is_none());
+        let kept = &ctx.recents_cards[1];
+        assert_eq!(kept.title, "Renamed terminal");
+        assert!(Arc::ptr_eq(
+            kept.thumbnail.as_ref().unwrap(),
+            &surviving_thumb
+        ));
     }
 
     #[test]

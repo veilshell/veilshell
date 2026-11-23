@@ -17,8 +17,13 @@ mod settings;
 pub use settings::{build_wallpaper, SettingsAction, SettingsView, WallpaperPreset};
 mod shade;
 mod shade_glyphs;
+mod tablet_drawer;
+mod tablet_home;
+mod tablet_shade;
 mod tablet_status;
-pub use tablet_status::{build_tablet_status, TabletStatus};
+pub use tablet_status::{
+    build_tablet_status, build_tablet_status_background, TabletStatus, TABLET_STATUS_HEIGHT,
+};
 pub mod software;
 
 use std::fmt;
@@ -36,20 +41,25 @@ pub use primitives::{
 };
 pub use recents::{recents_preview_pixels, recents_stride};
 pub use scene::{
-    bottom_pill_bounds, build_scene, build_scene_layout, build_top_strip_scene, default_demo_apps,
-    home_page_count, home_reveal_travel, keyboard_button_bounds, top_handle_bounds, AppTile,
-    RecentsCard, SceneContext,
+    bottom_pill_bounds, build_scene, build_scene_layout, build_shade_over_home,
+    build_top_strip_scene, default_demo_apps, home_page_count, home_reveal_travel,
+    keyboard_button_bounds, top_handle_bounds, AppTile, RecentsCard, SceneContext,
+    TabletOverviewOrigin,
 };
 pub use shade::{
     shade_reveal_travel, ShadeAction, ShadeChoice, ShadeExtras, ShadePage, ShadeStatus,
+    TabletNotifications, TabletShadePage,
 };
 pub use software::SdfSoftwareRenderer;
+pub use tablet_drawer::{drawer_max_scroll, TabletDrawerState};
+pub use tablet_shade::{tablet_shade_is_split, tablet_shade_scale};
 
 /// High-level shell scene rendered either live on `Wayland` or offscreen to a snapshot.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SceneKind {
     Pill,
     Home,
+    Drawer,
     Launcher,
     Settings,
     Recents,
@@ -64,6 +74,7 @@ impl SceneKind {
         match raw.trim().to_ascii_lowercase().as_str() {
             "pill" => Some(Self::Pill),
             "home" => Some(Self::Home),
+            "drawer" => Some(Self::Drawer),
             "launcher" => Some(Self::Launcher),
             "settings" => Some(Self::Settings),
             "recents" => Some(Self::Recents),
@@ -79,6 +90,7 @@ impl SceneKind {
         match self {
             Self::Pill => "pill",
             Self::Home => "home",
+            Self::Drawer => "drawer",
             Self::Launcher => "launcher",
             Self::Settings => "settings",
             Self::Recents => "recents",
@@ -447,7 +459,7 @@ impl ActiveRenderer {
         }
     }
 
-    /// Render the top pull handle strip offscreen.
+    /// Render the legacy top pull handle offscreen, or a blank gap strip when opted in.
     ///
     /// # Errors
     /// Returns [`RenderError`] if dimensions are zero or GPU rendering fails.
@@ -457,6 +469,9 @@ impl ActiveRenderer {
         height: u32,
         palette: &ThemePalette,
     ) -> Result<RenderFrame, RenderError> {
+        if self.context().uses_overlay_gap_gestures() {
+            return self.rasterize(width, height, &DrawList::default());
+        }
         match self {
             Self::Software(sw) => sw.render_top_strip(width, height, palette),
             #[cfg(feature = "wgpu")]
@@ -595,6 +610,55 @@ mod tests {
         let pressed = rect(&build_top_strip_scene(220.0, 48.0, &palette, 0.0, true));
         assert!(pressed.w > top.w && pressed.h > top.h);
         assert!(top.fill.a < 0.5 && pressed.fill.a > 0.9);
+    }
+
+    #[test]
+    fn gap_mode_does_not_paint_or_offer_idle_handles_even_during_contact() {
+        let palette = ThemePalette::default_dark();
+        let ctx = SceneContext {
+            overlay_gap_gestures: true,
+            top_pressed: true,
+            top_drag_y: 12.0,
+            pill_pressed: true,
+            pill_drag_y: -40.0,
+            ..SceneContext::default()
+        };
+        let pill = build_scene_layout(SceneKind::Pill, 1280.0, 20.0, &palette, &ctx);
+        assert_eq!(pill, SceneOutput::default());
+        let mut renderer = ActiveRenderer::new(RendererPreference::Software, ctx).unwrap();
+        let top = renderer.render_top_strip(1280, 12, &palette).unwrap();
+        assert!(top.rgba.iter().all(|&value| value == 0));
+        assert_eq!(
+            build_scene_layout(
+                SceneKind::Settings,
+                1280.0,
+                800.0,
+                &palette,
+                renderer.context()
+            ),
+            SceneOutput::default()
+        );
+    }
+
+    #[test]
+    fn touch_only_motion_keeps_default_overlay_snapshot_bytes() {
+        let palette = ThemePalette::default_dark();
+        let renderer = SdfSoftwareRenderer::default();
+        let mut ctx = renderer.context.clone();
+        ctx.tablet_overview = Some(TabletOverviewOrigin::Home);
+        ctx.drawer.scroll = 100.0;
+        ctx.shade.tablet_page = TabletShadePage::Notifications;
+        ctx.shade.tablet_page_position = Some(0.5);
+        ctx.shade.tablet_notifications = TabletNotifications::Empty;
+        let (w, h) = (800, 1280);
+        for scene in [SceneKind::Recents, SceneKind::Shade, SceneKind::Drawer] {
+            let render = |ctx: &SceneContext| {
+                renderer
+                    .rasterize(w, h, &build_scene(scene, w as f32, h as f32, &palette, ctx))
+                    .unwrap()
+            };
+            assert_eq!(render(&ctx), render(&renderer.context), "{scene:?}");
+        }
     }
 
     #[test]

@@ -65,10 +65,29 @@ Laptop Mode, which hides VeilShell without changing the host layout.
 Tablet Mode uses Hyprland's one-window-at-a-time layout. Normal apps fill
 the space below a 48-logical-pixel status strip, with no window gaps or
 borders. Other apps stay open in Recents. The strip shows the time and
-available Wi-Fi and battery status; pull down from the center handle for
-Quick Settings. The strip stays reserved while the shade is open and while
-typing. True fullscreen, such as when a player requests it, covers the strip
-and bottom pill; exiting fullscreen restores the tablet layout.
+available Wi-Fi and battery status. Pull down anywhere on that row in an
+ordinary app or on Home to open Shade. In portrait, the left half opens
+Notifications and the right half opens Controls; swipe sideways to switch.
+Landscape shows both panes. Notification history isn't connected yet.
+Reverse the pull before release to cancel, or swipe up to close and return
+to the app or Home page you came from. A row tap does not open Shade. The
+strip stays reserved while Shade is open and while typing. True fullscreen
+covers the status row and bottom pill; exiting restores the tablet layout.
+
+Tablet Home places a passive clock and local date ahead of the apps in its
+first page, with a grid that reflows in portrait and landscape. Swipe up on
+Home content to open **All Apps**; pull down from the top of the list to
+return to Home. It's separate from the searchable Desk launcher. Folders
+and grid editing aren't implemented.
+
+At the bottom center, flick up from an app to go Home, or pull up more slowly
+and release to open Recents. Flick up from Home's bottom center to open
+Recents; flick down there in Recents to return Home. Swipe right along the
+bottom to focus an older running window (the most recent from Home), or
+left for a newer one, on the same output. Recents uses bounded snapshots,
+not live window transforms. Hide the app keyboard before using the bottom
+gestures. See the
+[Tablet behavior audit](../../docs/tablet/README.md) for reference and tests.
 
 ### Settings
 

@@ -4,15 +4,20 @@ use std::env;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::str::FromStr;
+use std::sync::Arc;
 
 use veilshell_compositor::{CompositorBackend, HyprlandBackend, MockBackend};
 use veilshell_core::Orientation;
 use veilshell_hw::{detect_dmi_device, HardwareBackend, LinuxHardware};
 use veilshell_render::{
-    ActiveRenderer, RendererBackend, RendererPreference, SceneContext, SceneKind, SnapshotSpec,
-    ViewportSize, WallpaperImage,
+    tablet_shade_is_split, ActiveRenderer, RendererBackend, RendererPreference, RgbaImage,
+    SceneContext, SceneKind, SettingsView, SnapshotSpec, TabletNotifications, TabletOverviewOrigin,
+    TabletShadePage, TabletStatus, ViewportSize, WallpaperImage, WallpaperPreset,
 };
-use veilshell_shell::apps::{apps_to_tiles, current_clock_hhmm, discover_desktop_apps};
+use veilshell_shell::apps::{
+    apps_to_tiles, current_clock_hhmm, current_tablet_clock, discover_desktop_apps,
+};
 use veilshell_shell::ipc::{default_socket_path, send_daemon_command};
 use veilshell_shell::session::ShellSession;
 use veilshell_shell::ShellState;
@@ -82,7 +87,7 @@ fn cmd_daemon_simple(verb: &str) -> ExitCode {
 
 fn cmd_show(arg: Option<&str>) -> ExitCode {
     let Some(raw) = arg else {
-        eprintln!("usage: veilctl show <pill|home|launcher|settings|recents|shade|osk>");
+        eprintln!("usage: veilctl show <pill|home|drawer|launcher|settings|recents|shade|osk>");
         return ExitCode::FAILURE;
     };
     let Some(scene) = SceneKind::parse_name(raw) else {
@@ -311,10 +316,13 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
     let demo = args.iter().any(|a| a == "--demo");
     let power_menu = args.iter().any(|a| a == "--power-menu");
     let terminal_osk = args.iter().any(|a| a == "--terminal-osk");
-    let scene_name = parse_flag(args, "--scene").unwrap_or_else(|| "home".to_owned());
-    let Some(scene) = SceneKind::parse_name(&scene_name) else {
-        eprintln!("invalid --scene '{scene_name}' (expected: pill, home, recents, shade, osk)");
-        return ExitCode::FAILURE;
+    let tablet_home = args.iter().any(|a| a == "--tablet-home");
+    let (scene, viewport, tablet_overview, progress) = match snapshot_preview(args) {
+        Ok(preview) => preview,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
     };
     if power_menu && (!demo || scene != SceneKind::Shade) {
         eprintln!("--power-menu requires --demo --scene shade");
@@ -324,44 +332,11 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
         eprintln!("--terminal-osk requires --demo --scene osk");
         return ExitCode::FAILURE;
     }
+    if tablet_home && scene != SceneKind::Home {
+        eprintln!("--tablet-home requires --scene home");
+        return ExitCode::FAILURE;
+    }
 
-    let default_h = if scene == SceneKind::Pill {
-        veilshell_wayland::EDGE_HANDLE_DEPTH
-    } else if scene == SceneKind::Osk {
-        284_u32
-    } else {
-        853_u32
-    };
-    let width: u32 = match parse_flag(args, "--width") {
-        Some(raw) => {
-            let Ok(v) = raw.parse() else {
-                eprintln!("invalid --width '{raw}'");
-                return ExitCode::FAILURE;
-            };
-            v
-        }
-        None => 1280,
-    };
-    let height: u32 = match parse_flag(args, "--height") {
-        Some(raw) => {
-            let Ok(v) = raw.parse() else {
-                eprintln!("invalid --height '{raw}'");
-                return ExitCode::FAILURE;
-            };
-            v
-        }
-        None => default_h,
-    };
-    let scale: f32 = match parse_flag(args, "--scale") {
-        Some(raw) => {
-            let Ok(v) = raw.parse() else {
-                eprintln!("invalid --scale '{raw}'");
-                return ExitCode::FAILURE;
-            };
-            v
-        }
-        None => 1.0,
-    };
     let renderer_pref = match parse_flag(args, "--renderer") {
         Some(raw) => {
             let Some(parsed) = RendererPreference::parse_name(&raw) else {
@@ -372,7 +347,7 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
         }
         None => RendererPreference::Auto,
     };
-    let wallpaper = match parse_flag(args, "--wallpaper") {
+    let mut wallpaper = match parse_flag(args, "--wallpaper") {
         Some(path) => match WallpaperImage::load_png(&path) {
             Ok(img) => Some(img),
             Err(err) => {
@@ -392,19 +367,11 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
     } else {
         session.palette()
     };
-    let mut ctx = SceneContext::default();
-    if let Some(raw) = parse_flag(args, "--progress") {
-        let Ok(progress) = raw.parse::<f32>() else {
-            eprintln!("invalid --progress '{raw}'");
-            return ExitCode::FAILURE;
-        };
-        if !(0.0..=1.0).contains(&progress) || !matches!(scene, SceneKind::Home | SceneKind::Shade)
-        {
-            eprintln!("--progress requires a value in 0..=1 and a Home or Shade snapshot");
-            return ExitCode::FAILURE;
-        }
-        ctx.overlay_progress = progress;
-    }
+    let mut ctx = SceneContext {
+        overlay_progress: progress,
+        tablet_overview,
+        ..SceneContext::default()
+    };
     if let Some(raw) = parse_flag(args, "--home-position") {
         let Ok(position) = raw.parse::<f32>() else {
             eprintln!("invalid --home-position '{raw}'");
@@ -419,10 +386,54 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
     if power_menu {
         ctx.power_menu = Some(veilshell_render::power::PowerMenu::Actions);
     }
+    let tablet_shade = match tablet_shade_preview(
+        args,
+        &mut ctx,
+        scene,
+        demo,
+        (viewport.width, viewport.height),
+    ) {
+        Ok(tablet) => tablet,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let tablet_home_bg = tablet_home
+        || scene == SceneKind::Drawer
+        || tablet_overview == Some(TabletOverviewOrigin::Home);
+    let tablet_layout = tablet_home_bg || tablet_shade || tablet_overview.is_some();
+    if tablet_home_bg {
+        ctx.session_wallpaper = wallpaper
+            .take()
+            .and_then(|image| RgbaImage::new(image.width, image.height, image.rgba))
+            .map(Arc::new);
+    }
+    if tablet_layout {
+        ctx.power_menu
+            .get_or_insert(veilshell_render::power::PowerMenu::Closed);
+        ctx.settings = Some(SettingsView {
+            startup: "Tablet",
+            panel: true,
+            wallpaper: if ctx.session_wallpaper.is_some() {
+                WallpaperPreset::Omarchy
+            } else {
+                WallpaperPreset::Midnight
+            },
+            follow_omarchy_colors: false,
+            bindings: "Preview",
+            feedback: None,
+        });
+        ctx.home_date_text = "Sunday 22 November".into();
+    }
     ctx.osk_state.terminal = terminal_osk;
     if !demo {
         let snap = LinuxHardware::auto_detect().snapshot();
-        ctx.clock_text = current_clock_hhmm();
+        if tablet_layout {
+            (ctx.clock_text, ctx.home_date_text) = current_tablet_clock();
+        } else {
+            ctx.clock_text = current_clock_hhmm();
+        }
         ctx.battery_pct = snap.battery_pct;
         ctx.wifi_connected = snap.wifi_connected;
         ctx.bluetooth_enabled = snap.bluetooth_enabled;
@@ -455,11 +466,7 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
     let backend_label = renderer.backend_label();
     let spec = SnapshotSpec {
         scene,
-        viewport: ViewportSize {
-            width,
-            height,
-            scale,
-        },
+        viewport,
         orientation: Orientation::Normal,
     };
 
@@ -486,6 +493,139 @@ fn cmd_snapshot(args: &[String]) -> ExitCode {
     }
 }
 
+fn snapshot_preview(
+    args: &[String],
+) -> Result<(SceneKind, ViewportSize, Option<TabletOverviewOrigin>, f32), String> {
+    let name = snapshot_value(args, "--scene")?.unwrap_or("home");
+    let scene = SceneKind::parse_name(name).ok_or_else(|| {
+        format!("invalid --scene '{name}' (expected: pill, home, drawer, launcher, settings, recents, shade, osk)")
+    })?;
+    let tablet_overview = match snapshot_value(args, "--tablet-recents")? {
+        None => None,
+        Some(_) if scene != SceneKind::Recents => {
+            return Err("--tablet-recents requires --scene recents".into());
+        }
+        Some("app") => Some(TabletOverviewOrigin::App),
+        Some("home") => Some(TabletOverviewOrigin::Home),
+        Some(_) => return Err("--tablet-recents expects app or home".into()),
+    };
+    let mut progress = 1.0;
+    if let Some(raw) = snapshot_value(args, "--progress")? {
+        progress = parse_snapshot_number("--progress", raw)?;
+        if !(0.0..=1.0).contains(&progress)
+            || !(matches!(
+                scene,
+                SceneKind::Home | SceneKind::Shade | SceneKind::Drawer
+            ) || tablet_overview.is_some())
+        {
+            return Err(
+                "--progress requires 0..=1 and a Home, Shade, Drawer or Tablet Recents snapshot"
+                    .into(),
+            );
+        }
+    }
+    Ok((
+        scene,
+        snapshot_viewport(args, scene)?,
+        tablet_overview,
+        progress,
+    ))
+}
+
+fn snapshot_viewport(args: &[String], scene: SceneKind) -> Result<ViewportSize, String> {
+    let default_height = match scene {
+        SceneKind::Pill => veilshell_wayland::EDGE_HANDLE_DEPTH,
+        SceneKind::Osk => 284,
+        _ => 853,
+    };
+    let viewport = ViewportSize {
+        width: snapshot_value(args, "--width")?
+            .map_or(Ok(1280), |raw| parse_snapshot_number("--width", raw))?,
+        height: snapshot_value(args, "--height")?.map_or(Ok(default_height), |raw| {
+            parse_snapshot_number("--height", raw)
+        })?,
+        scale: snapshot_value(args, "--scale")?
+            .map_or(Ok(1.0), |raw| parse_snapshot_number("--scale", raw))?,
+    };
+    let (pixel_width, pixel_height) = viewport.physical_pixels();
+    if viewport.width == 0
+        || viewport.height == 0
+        || !viewport.scale.is_finite()
+        || viewport.scale <= 0.0
+        || pixel_width == 0
+        || pixel_height == 0
+    {
+        return Err("snapshot width, height, scale and scaled dimensions must be positive".into());
+    }
+    // Bound CPU allocations as well as GPU textures when using arbitrary CLI sizes.
+    if pixel_width > 8192 || pixel_height > 8192 {
+        return Err("snapshot scaled width and height must be at most 8192 px".into());
+    }
+    Ok(viewport)
+}
+
+fn parse_snapshot_number<T: FromStr>(flag: &str, raw: &str) -> Result<T, String> {
+    raw.parse().map_err(|_| format!("invalid {flag} '{raw}'"))
+}
+
+fn snapshot_value<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>, String> {
+    let Some(index) = args.iter().position(|arg| arg == flag) else {
+        return Ok(None);
+    };
+    args.get(index + 1)
+        .map(String::as_str)
+        .filter(|value| !value.starts_with("--"))
+        .map(Some)
+        .ok_or_else(|| format!("{flag} requires a value"))
+}
+
+fn tablet_shade_preview(
+    args: &[String],
+    ctx: &mut SceneContext,
+    scene: SceneKind,
+    demo: bool,
+    (width, height): (u32, u32),
+) -> Result<bool, &'static str> {
+    let tablet = args.iter().any(|a| a == "--tablet-shade");
+    let empty = args.iter().any(|a| a == "--empty-notifications");
+    if empty && (!tablet || !demo) {
+        return Err("--empty-notifications requires --demo --tablet-shade");
+    }
+    if args.iter().any(|a| a == "--shade-position") {
+        let position = parse_flag(args, "--shade-position").and_then(|raw| raw.parse::<f32>().ok());
+        if !tablet
+            || tablet_shade_is_split(width as f32, height as f32)
+            || ctx.overlay_progress < 0.98
+            || !position.is_some_and(|value| (0.0..=1.0).contains(&value))
+        {
+            return Err("--shade-position requires 0..=1 and an open portrait Tablet Shade");
+        }
+        ctx.shade.tablet_page_position = position;
+    }
+    if !tablet {
+        return Ok(false);
+    }
+    if scene != SceneKind::Shade {
+        return Err("--tablet-shade requires --scene shade");
+    }
+    ctx.shade.tablet_page = match parse_flag(args, "--tablet-shade").as_deref() {
+        Some("controls") => TabletShadePage::Controls,
+        Some("notifications") => TabletShadePage::Notifications,
+        _ => return Err("--tablet-shade expects controls or notifications (landscape shows both)"),
+    };
+    if empty {
+        ctx.shade.tablet_notifications = TabletNotifications::Empty;
+    }
+    if demo {
+        ctx.clock_text = "10:08".into();
+        ctx.tablet_status = TabletStatus {
+            wifi: Some(true),
+            battery: Some((82, false)),
+        };
+    }
+    Ok(true)
+}
+
 fn parse_flag(args: &[String], flag: &str) -> Option<String> {
     args.windows(2)
         .find(|pair| pair[0] == flag)
@@ -501,7 +641,8 @@ fn print_help() {
          COMMANDS:\n\
          \tstatus                            Show shell mode, theme, hardware, compositor, and daemon state\n\
          \thw                                Show live Linux hardware telemetry & matched device profile\n\
-         \tshow <pill|home|launcher|settings|recents|shade|osk> Switch the running daemon's active surface\n\
+         \tshow <pill|home|drawer|launcher|settings|recents|shade|osk> Switch the active surface\n\
+         \t                                  Drawer: visible standalone Tablet or --overlay-gap-gestures\n\
          \tmode <auto|laptop|tablet|desk|toggle>  Change shell mode (Desk is standalone only)\n\
          \twallpaper <PNG_PATH|clear>        Update or clear the GPU pre-blurred glass wallpaper\n\
          \treload-theme                      Reload colors.toml in the running daemon\n\
@@ -509,12 +650,125 @@ fn print_help() {
          \tapps                              List discovered .desktop applications\n\
          \ttheme                             Inspect the resolved color palette and WCAG contrast\n\
          \tsnapshot [OPTIONS]                Render an offscreen glassmorphic PNG snapshot\n\
-         \t  --scene <pill|home|launcher|recents|shade|osk> --renderer <auto|wgpu|software> [--wallpaper <PNG>]\n\
-         \t  --width <PX> --height <PX> --out <PATH> [--demo]\n\
+         \t  --scene <pill|home|drawer|launcher|settings|recents|shade|osk> --renderer <auto|wgpu|software> [--wallpaper <PNG>]\n\
+         \t  --width <PX> --height <PX> --scale <FACTOR> --out <PATH> [--demo]\n\
+         \t                                  Dimensions are logical; scaled dimensions must be 1..=8192 px\n\
          \t  --power-menu | --terminal-osk    Preview a demo subview (shade or osk)\n\
-         \t  --progress <0..1>                Home or Shade reveal progress\n\
+         \t  --progress <0..1>                Home, Shade, Drawer or Tablet Recents reveal progress\n\
          \t  --home-position <PAGE>           Fractional position in the Home pager\n\
+         \t  --tablet-home                   Use the standalone Tablet Home layout\n\
+         \t  --tablet-recents <app|home>      Preview standalone Tablet Recents from the chosen origin\n\
+         \t  --tablet-shade <controls|notifications>  Tablet Shade page (landscape shows both)\n\
+         \t  --shade-position <0..1>         Portrait Shade paging preview, notifications=0\n\
+         \t  --empty-notifications          Known-empty history fixture (Tablet Shade demo only)\n\
          \thelp                              Print this help message",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn preview(
+        args: &[&str],
+    ) -> Result<(SceneKind, ViewportSize, Option<TabletOverviewOrigin>, f32), String> {
+        snapshot_preview(&args.iter().map(ToString::to_string).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn tablet_snapshots_keep_recents_origin_opt_in() {
+        assert_eq!(preview(&["--scene", "recents"]).unwrap().2, None);
+        for (value, origin) in [
+            ("app", TabletOverviewOrigin::App),
+            ("home", TabletOverviewOrigin::Home),
+        ] {
+            let (_, _, parsed, progress) = preview(&[
+                "--scene",
+                "recents",
+                "--tablet-recents",
+                value,
+                "--progress",
+                "0.5",
+            ])
+            .unwrap();
+            assert_eq!(parsed, Some(origin));
+            assert_eq!(progress.to_bits(), 0.5_f32.to_bits());
+        }
+        let (scene, view, _, progress) = preview(&[
+            "--scene", "drawer", "--width", "800", "--height", "1280", "--scale", "1.5",
+        ])
+        .unwrap();
+        assert_eq!(scene, SceneKind::Drawer);
+        assert_eq!(view.physical_pixels(), (1200, 1920));
+        assert_eq!(progress.to_bits(), 1.0_f32.to_bits());
+        assert!(preview(&["--scene", "drawer", "--tablet-recents", "home"]).is_err());
+        assert!(preview(&["--scene", "recents", "--tablet-recents"]).is_err());
+        assert!(preview(&["--scene", "recents", "--tablet-recents", "unknown"]).is_err());
+        assert!(preview(&["--scene", "recents", "--progress", "0.5"]).is_err());
+    }
+
+    #[test]
+    fn snapshot_rejects_bad_sizes_and_progress_for_all_preview_layouts() {
+        for scene in ["home", "shade", "drawer", "recents"] {
+            for invalid in [
+                ["--width", "0"],
+                ["--height", "-1"],
+                ["--scale", "0"],
+                ["--scale", "NaN"],
+                ["--scale", "inf"],
+                ["--scale", "1000"],
+                ["--progress", "NaN"],
+                ["--progress", "-0.01"],
+                ["--progress", "1.01"],
+            ] {
+                let mut args = vec!["--scene", scene];
+                if scene == "recents" {
+                    args.extend(["--tablet-recents", "app"]);
+                }
+                let mut missing = args.clone();
+                missing.push(invalid[0]);
+                assert!(preview(&missing).is_err(), "{missing:?}");
+                args.extend(invalid);
+                assert!(preview(&args).is_err(), "{args:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn tablet_shade_empty_history_requires_an_explicit_demo_fixture() {
+        let mut ctx = SceneContext::default();
+        let parse = |ctx: &mut SceneContext, demo, flags: &[&str]| {
+            let args = flags.iter().map(ToString::to_string).collect::<Vec<_>>();
+            tablet_shade_preview(&args, ctx, SceneKind::Shade, demo, (800, 1280))
+        };
+        let live = ["--tablet-shade", "notifications"];
+        assert_eq!(parse(&mut ctx, false, &live), Ok(true));
+        assert_eq!(ctx.shade.tablet_page, TabletShadePage::Notifications);
+        assert_eq!(
+            ctx.shade.tablet_notifications,
+            TabletNotifications::Unavailable
+        );
+        let empty = ["--tablet-shade", "notifications", "--empty-notifications"];
+        assert!(parse(&mut ctx, false, &empty).is_err());
+        assert_eq!(parse(&mut ctx, true, &empty), Ok(true));
+        assert_eq!(ctx.shade.tablet_notifications, TabletNotifications::Empty);
+    }
+
+    #[test]
+    fn tablet_shade_pager_preview_requires_open_portrait() {
+        let args = ["--tablet-shade", "controls", "--shade-position", "0.5"].map(String::from);
+        let layout = |ctx: &mut SceneContext, view| {
+            tablet_shade_preview(&args, ctx, SceneKind::Shade, true, view)
+        };
+        let mut ctx = SceneContext {
+            overlay_progress: 0.75,
+            ..SceneContext::default()
+        };
+        assert!(layout(&mut ctx, (800, 1280)).is_err());
+        ctx.overlay_progress = 1.0;
+        assert!(layout(&mut ctx, (1280, 800)).is_err());
+        assert_eq!(layout(&mut ctx, (800, 1280)), Ok(true));
+        assert_eq!(ctx.shade.tablet_page_position, Some(0.5));
+    }
 }

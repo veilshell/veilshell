@@ -4,6 +4,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::*;
 
+#[test]
+fn tablet_clock_preserves_the_localized_date() {
+    assert_eq!(
+        parse_tablet_clock("08:05\ndomingo 22 noviembre\n"),
+        Some(("08:05".into(), "domingo 22 noviembre".into()))
+    );
+    assert_eq!(parse_tablet_clock("08:05\n"), None);
+    assert_eq!(parse_tablet_clock("clock\nSunday 22 November"), None);
+}
+
 const SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 12">
   <path fill="red" fill-opacity=".5" d="M0 0h12v12H0z"/>
 </svg>"#;

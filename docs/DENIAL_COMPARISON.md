@@ -37,8 +37,8 @@ using the [parity spec](DENIAL_PARITY_SPEC.md). See the
 
 | Feature | Denial | VeilShell Status | Current VeilShell Implementation / Gap Notes |
 |---|---|---|---|
-| Bottom gesture pill & swipe navigation | Built-in touch/trackpad gestures & spring animations | **Partial** | Home and Shade follow the pull and spring to either endpoint. Home pages track horizontal drags; bottom-edge swipes still reach Recents and adjacent workspaces. Denial's liquid pill deformation and shared window motion remain open. |
-| Home application launcher | Mobile paged Home with editable slots and a separate all-apps drawer | **Partial** | Responsive paged `.desktop` grid with freedesktop `PNG` icons and a badge fallback. No editable layout, folders, widgets, or separate drawer. |
+| Bottom gesture pill & swipe navigation | Built-in touch/trackpad gestures & spring animations | **Partial** | [Standalone Tablet](tablet/navigation.md) separates Home flicks, Recents pulls, and adjacent-window swipes. The overlay retains workspace switching. Liquid pill deformation and shared live-window motion remain open. |
+| Home application launcher | Mobile paged Home with editable slots and an opt-in all-apps drawer | **Partial** | Standalone Tablet has a clock/date, a responsive paged `.desktop` grid, and a [separate swipe-up drawer](tablet/home.md). Slot editing, folders and movable widgets remain open. |
 | App search / instant filter | Search in the desktop launcher | **Missing** | VeilShell requires browsing pages to find an app. A search surface should accept both physical keyboard and touch input. |
 | Live Recents / Window Overview | Live Wayland surfaces inside overview | **Partial** | Frameless, swipeable window previews with the app icon/name above each card, captured at higher resolution via `ext-foreign-toplevel-list-v1` + `ext-image-copy-capture-v1`. Tap to focus and swipe up to close; cached captures are limited to three nearby windows. |
 | Portrait / Landscape & Auto-Rotation | Responsive mobile/tablet layout + rotation | **Done** | Layout follows the compositor's output changes in both modes. Sensor-driven rotation and Rotation Lock are scoped to standalone. |
@@ -61,7 +61,7 @@ using the [parity spec](DENIAL_PARITY_SPEC.md). See the
 | Feature | Denial | VeilShell Status | Current VeilShell Implementation / Gap Notes |
 |---|---|---|---|
 | System Notifications (`org.freedesktop.Notifications`) | Native notification banners & history with lockscreen privacy | **Missing** | Standalone needs actionable notifications with lock-screen privacy. In overlay mode, notification delivery remains with the host desktop. |
-| MPRIS Media Player Widget | Embedded MPRIS dashboard widget (track info, art, progress, Play/Pause/Prev/Next) | **Missing** | `Shade` currently renders quick toggles and brightness/volume sliders only; needs an MPRIS D-Bus card when media is active. |
+| MPRIS media presentation | Desktop/other surfaces; no consolidated media card traced in the pinned [mobile Shade](tablet/shade.md) | **Partial** | Optional player controls are available from Shade's More page. A standalone in-Shade media card is not required for this mobile parity target. |
 | Per-Application Audio Mixer | Per-window volume mixing in control center | **Missing** | `Shade` has a single master PipeWire (`wpctl`) volume slider; per-stream mixing is not yet implemented. |
 
 ### 4. Quick Settings, Hardware & Connectivity

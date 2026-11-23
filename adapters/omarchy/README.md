@@ -24,6 +24,39 @@ running daemon; it never changes Hyprland settings on its own.
 For a separate login, see the [standalone SDDM preview](../session/README.md).
 It does not use this adapter's theme hook or user service.
 
+## Optional pill-free touch gestures
+
+For an overlay on a touchscreen, start VeilShell with:
+
+```bash
+veilshell --policy tablet --overlay-gap-gestures
+```
+
+If you have multiple outputs, add `--output` with the touchscreen's output
+name. Use these arguments when starting the daemon; don't start a second
+copy on the existing control socket.
+
+Pull down from the uncovered gap just below the bar to open the read-only
+Shade. From the gap below windows, flick up for **Home**, pull up more
+deliberately for **Recents**, or swipe sideways to switch between running
+windows on the same output and workspace. Swipe up on Home content for
+**All Apps**.
+
+`veilctl status` shows the mounted strip depths. The bar and windows
+still get first chance at input; a covered point isn't a gesture target.
+Border resizing and Hyprland's own touchscreen workspace swipe take
+precedence: the strips disarm when either setting is detected. If the
+strips are unavailable, `veilctl show home` still opens Home directly on
+the connected target output. Use **Close** on Home or `veilctl show pill`
+to return to the desktop without drawing a pill.
+
+Mouse and trackpad swipes don't activate these gestures. Stock Wayland still
+sends pointer input in otherwise empty strip pixels to the transparent
+surface, so this is not pointer pass-through on the wallpaper. A fullscreen
+app keeps its touches. There are no changes to Hyprland, Omarchy's gap
+sizes, or the default overlay profile.
+See [the behavior and tests](../../docs/tablet/overlay-gaps.md).
+
 If a test daemon is needed alongside an existing daemon, give it a different
 `--socket` and point its `veilctl` commands at that socket with `VEILSHELL_SOCKET`.
 VeilShell refuses to replace an existing socket. After an unclean exit,

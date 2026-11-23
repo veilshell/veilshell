@@ -2,8 +2,8 @@
 
 **A lightweight, touch-first Wayland shell for Linux tablets.**
 
-VeilShell adds gesture navigation, a paged app launcher, live Recents, Quick
-Settings, and an on-screen keyboard to a Linux desktop. It's built in Rust for
+VeilShell adds gesture navigation, a paged app launcher, window previews,
+Quick Settings, and an on-screen keyboard to a Linux desktop. It's built in Rust for
 older, fanless tablets, starting with the Microsoft Surface Go 3. The goal is
 one touch shell that works inside your existing desktop first and can later
 serve as the main interface in a dedicated tablet session.
@@ -77,6 +77,7 @@ run `veilctl` directly if it's on your `PATH`:
 
 ```bash
 veilctl show home        # Open paged .desktop app launcher
+veilctl show drawer      # Open All Apps in standalone Tablet Mode
 veilctl show launcher    # Toggle the searchable desktop launcher
 veilctl show recents     # Open the window deck (tap to focus, swipe up on a card to close)
 veilctl show shade       # Open Quick Settings shade
@@ -104,14 +105,33 @@ The app keyboard reflows when the compositor rotates the output. In overlay
 mode VeilShell follows that orientation without changing monitor rules. The
 app keyboard is not a login or lock-screen keyboard.
 
-Swipe up from near the bottom pill for Home, or down from near the top handle
-for Quick Settings. The handle brightens when grabbed and the panel follows
+In the **overlay**, swipe up from near the bottom pill for Home, or down from
+near the top handle for Quick Settings. The handle brightens when grabbed and the panel follows
 your finger. Tap on the mark itself to open; the larger area around it is
 swipe-only. Pull back toward the edge before lifting to cancel. Swipe
 down on Home or up on Quick Settings to close. Swipe across Home to slide to
 another app page, or swipe up again from Home's bottom edge to open Recents.
 In Recents, swipe across to browse windows and swipe up on a card to close it.
 A horizontal swipe on the bottom pill still changes workspaces.
+
+For a pill-free touchscreen overlay, opt into
+[`--overlay-gap-gestures`](adapters/omarchy/README.md#optional-pill-free-touch-gestures).
+It reuses the Tablet gestures from existing uncovered gaps behind the bar
+and windows, without changing the host layout.
+
+In the **standalone Tablet session**, Home has a clock and date in the grid.
+Flick up from the bottom center to go Home from an app; pull up more slowly
+and release to open Recents. A bottom-center swipe up from Home opens
+Recents, while swiping up on Home **content** opens the scrollable **All
+Apps** drawer. Swipe right along the bottom for an older running window
+or left for a newer one on this display. These swipes don't wrap or
+launch apps.
+
+Pull down from anywhere on the status row in Home or an ordinary app to
+open Shade. In portrait, pull from the left for Notifications or the right
+for Controls, then swipe sideways to switch pages. Landscape shows both
+panes. Notification history isn't connected yet. Swipe up to close Shade
+and return to where you opened it.
 
 **Quick Settings:** Use the separate **Wi-Fi Networks**, **Bluetooth Devices**,
 and **Audio Output** buttons to reconnect to saved networks or paired devices,
@@ -135,6 +155,7 @@ requires a physical keyboard for password unlock.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — Crate boundaries, `calloop` multi-surface runtime, and verification pyramid
 - [docs/ROADMAP.md](docs/ROADMAP.md) — `v0.1.0` overlay release gates, standalone goals, and development history
 - [docs/OVERLAY_VALIDATION.md](docs/OVERLAY_VALIDATION.md) — Overlay install and Surface Go 3 smoke-test checklist
+- [Tablet behavior audit](docs/tablet/README.md) — Denial behavior, Penumbra implementation references, and replay cases
 - [docs/DENIAL_COMPARISON.md](docs/DENIAL_COMPARISON.md) — Touch UX reference and feature inventory, not a release checklist
 - [docs/DENIAL_PARITY_SPEC.md](docs/DENIAL_PARITY_SPEC.md) — Pinned interaction and visual reference, and standalone acceptance gates
 - [docs/DENIAL_VALIDATION.md](docs/DENIAL_VALIDATION.md) — Test evidence and its limits

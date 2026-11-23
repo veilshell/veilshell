@@ -56,19 +56,38 @@ impl Dispatch<wl_output::WlOutput, u32> for State {
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let [socket, x, y, rest @ ..] = args.as_slice() else {
-        return Err("usage: hyprland_smoke_pointer /private/wayland-N X Y [END_Y]".into());
+        return Err("usage: hyprland_smoke_pointer /private/wayland-N X Y [[X:]Y ...]".into());
     };
-    if rest.len() > 1 {
-        return Err("expected at most one END_Y".into());
-    }
     let x: u32 = x.parse()?;
     let y: u32 = y.parse()?;
-    let end_y: Option<u32> = rest.first().map(|arg| arg.parse()).transpose()?;
+    let waypoints = rest
+        .iter()
+        .map(|point| -> Result<_, std::num::ParseIntError> {
+            if let Some((next_x, next_y)) = point.split_once(':') {
+                Ok((next_x.parse()?, next_y.parse()?))
+            } else {
+                Ok((x, point.parse()?))
+            }
+        })
+        .collect::<Result<Vec<(u32, u32)>, _>>()?;
     let extent =
         std::env::var("VEILSHELL_TEST_POINTER_EXTENT").unwrap_or_else(|_| "960x640".into());
+    // The default 120 ms per waypoint is used by the existing replay traces.
+    // Faster paces allow a short, within-screen flick on the 52 px bottom band.
+    let step_ms = match std::env::var("VEILSHELL_TEST_POINTER_STEP_MS") {
+        Ok(raw) => raw.parse::<u64>()?,
+        Err(std::env::VarError::NotPresent) => 20,
+        Err(err) => return Err(err.into()),
+    };
+    if !(4..=50).contains(&step_ms) {
+        return Err("VEILSHELL_TEST_POINTER_STEP_MS must be between 4 and 50".into());
+    }
     let (width, height) = extent.split_once('x').ok_or("expected WIDTHxHEIGHT")?;
     let (width, height) = (width.parse::<u32>()?, height.parse::<u32>()?);
-    if x >= width || y >= height || end_y.is_some_and(|end| end >= height) {
+    if std::iter::once((x, y))
+        .chain(waypoints.iter().copied())
+        .any(|(x, y)| x >= width || y >= height)
+    {
         return Err("pointer coordinates outside the supplied extent".into());
     }
     let connection = Connection::from_socket(UnixStream::connect(socket)?)?;
@@ -113,12 +132,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     pointer.button(timestamp(), BTN_LEFT, ButtonState::Pressed);
     pointer.frame();
     queue.roundtrip(&mut state)?;
-    if let Some(end_y) = end_y {
-        for step in 1..=6 {
-            sleep(Duration::from_millis(20));
-            move_to(x, (y * (6 - step) + end_y * step) / 6);
+    let mut prev = (x, y);
+    for next in waypoints {
+        for step in 1..=6_u64 {
+            sleep(Duration::from_millis(step_ms));
+            let lerp =
+                |start, end| ((u64::from(start) * (6 - step) + u64::from(end) * step) / 6) as u32;
+            move_to(lerp(prev.0, next.0), lerp(prev.1, next.1));
             queue.roundtrip(&mut state)?;
         }
+        prev = next;
     }
     pointer.button(timestamp(), BTN_LEFT, ButtonState::Released);
     pointer.frame();

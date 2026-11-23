@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use veilshell_core::{Rgba, ThemePalette};
 
-use crate::scene::push_bottom_pill_bar;
+use crate::scene::{build_home_under_recents, push_bottom_pill_bar};
 use crate::{
     font, HitRect, HitTarget, ImageQuad, RecentsCard, RenderTarget, RoundedRect, SceneContext,
-    SceneOutput, TextAlign,
+    SceneOutput, TabletOverviewOrigin, TextAlign,
 };
 
 const SCALE: f32 = 0.63;
@@ -51,6 +51,14 @@ pub(crate) fn build_recents(
     ctx: &SceneContext,
 ) {
     let progress = ctx.overlay_progress.clamp(0.0, 1.0);
+    let tablet_origin = ctx.tablet_overview.filter(|_| ctx.uses_touch_navigation());
+    if tablet_origin == Some(TabletOverviewOrigin::Home) {
+        build_home_under_recents(out, width, height, palette, ctx);
+    }
+    if (tablet_origin.is_some() || ctx.uses_overlay_gap_gestures()) && progress <= 0.0 {
+        push_bottom_pill_bar(&mut out.draw_list, width, height, palette, ctx);
+        return;
+    }
     // A plain dark scrim over the compositor. Do not sample the wallpaper blur
     // or paint the colored backdrop used by Quick Settings.
     out.draw_list.push_rect(RoundedRect::filled(
@@ -70,7 +78,11 @@ pub(crate) fn build_recents(
         out.draw_list.push_text(
             width * 0.5,
             height * 0.5 + (1.0 - progress) * 28.0,
-            "No open windows",
+            if ctx.uses_touch_navigation() {
+                "No windows"
+            } else {
+                "No open windows"
+            },
             2,
             palette.foreground.with_alpha(progress),
             TextAlign::Center,
@@ -88,6 +100,7 @@ pub(crate) fn build_recents(
             height,
             position,
             progress,
+            tablet_origin,
         };
         let mut order: Vec<_> = (first..=last).collect();
         // Draw the centered window above its neighbors so taps and imagery
@@ -112,6 +125,7 @@ struct DeckLayout {
     height: f32,
     position: f32,
     progress: f32,
+    tablet_origin: Option<TabletOverviewOrigin>,
 }
 
 impl DeckLayout {
@@ -135,9 +149,23 @@ impl DeckLayout {
             .as_ref()
             .filter(|(id, _)| id == &card.id)
             .map_or(0.0, |(_, offset)| *offset);
-        let scale = SCALE * (1.0 - depth) * (1.0 - (-throw / self.height).clamp(0.0, 1.0) * 0.18);
+        let lift = self.tablet_origin == Some(TabletOverviewOrigin::App)
+            && card.focused
+            && self.progress < 1.0;
+        let card_scale = if lift {
+            1.0 - (1.0 - SCALE) * self.progress
+        } else {
+            SCALE
+        };
+        let scale =
+            card_scale * (1.0 - depth) * (1.0 - (-throw / self.height).clamp(0.0, 1.0) * 0.18);
         let center_x = self.width * 0.5 + recents_stride(self.width, self.height) * distance;
-        let center_y = self.height * 0.5 + (1.0 - self.progress) * 48.0 + throw;
+        let from = match self.tablet_origin {
+            Some(TabletOverviewOrigin::App) if lift => 0.0,
+            Some(TabletOverviewOrigin::Home) => self.height * 0.48,
+            _ => 48.0,
+        };
+        let center_y = self.height * 0.5 + (1.0 - self.progress) * from + throw;
         let max_w = self.width * scale;
         let max_h = self.height * scale;
         let (w, h) = card.thumbnail.as_ref().map_or((max_w, max_h), |thumb| {
@@ -158,7 +186,7 @@ impl DeckLayout {
                 alpha: self.progress,
                 image: Arc::clone(thumb),
             });
-        } else {
+        } else if !lift {
             // A truthful fallback for a window that cannot be captured.
             out.draw_list.push_rect(RoundedRect::filled(
                 rect.x,
@@ -209,6 +237,14 @@ impl DeckLayout {
         icon: Option<&Arc<crate::RgbaImage>>,
         palette: &ThemePalette,
     ) {
+        let opacity = if self.tablet_origin.is_some() {
+            ((self.progress - 0.7) / 0.3).clamp(0.0, 1.0)
+        } else {
+            self.progress
+        };
+        if opacity <= 0.0 {
+            return;
+        }
         let size = APP_ICON.min(rect.y.max(8.0) * 0.72).min(rect.w * 0.24);
         let y = rect.y - LABEL_GAP - size;
         if let Some(icon) = icon {
@@ -219,7 +255,7 @@ impl DeckLayout {
                 h: size,
                 radius: 0.0,
                 image: Arc::clone(icon),
-                alpha: self.progress,
+                alpha: opacity,
             });
         } else {
             let initial = name
@@ -232,14 +268,14 @@ impl DeckLayout {
                 size,
                 size,
                 size * 0.24,
-                palette.surface.with_alpha(0.9 * self.progress),
+                palette.surface.with_alpha(0.9 * opacity),
             ));
             out.draw_list.push_text(
                 rect.x + size * 0.5,
                 y + (size - 14.0) * 0.5,
                 initial,
                 2,
-                palette.foreground.with_alpha(self.progress),
+                palette.foreground.with_alpha(opacity),
                 TextAlign::Center,
             );
         }
@@ -248,7 +284,7 @@ impl DeckLayout {
             y + (size - 14.0) * 0.5,
             font::fit_text(name, 2, rect.w - size - LABEL_GAP),
             2,
-            palette.foreground.with_alpha(self.progress),
+            palette.foreground.with_alpha(opacity),
             TextAlign::Left,
         );
     }
@@ -257,6 +293,122 @@ impl DeckLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{build_scene_layout, power::PowerMenu, DrawCommand, SceneKind};
+
+    #[test]
+    fn home_origin_overview_can_retract_to_the_exact_passive_home_page() {
+        let mut ctx = SceneContext {
+            power_menu: Some(PowerMenu::Closed),
+            tablet_overview: Some(TabletOverviewOrigin::Home),
+            home_page: 1,
+            home_apps: crate::default_demo_apps()
+                .into_iter()
+                .cycle()
+                .take(60)
+                .collect(),
+            ..SceneContext::default()
+        };
+        let theme = ThemePalette::default_dark();
+        for (w, h) in [(800.0, 1280.0), (1280.0, 800.0)] {
+            ctx.overlay_progress = 1.0;
+            let home = build_scene_layout(SceneKind::Home, w, h, &theme, &ctx);
+            assert!(home
+                .hit_regions
+                .iter()
+                .any(|hit| matches!(hit.target, HitTarget::LaunchApp { index } if index > 10)));
+            ctx.overlay_progress = 0.0;
+            let closed = build_scene_layout(SceneKind::Recents, w, h, &theme, &ctx);
+            assert_eq!(closed.draw_list, home.draw_list);
+            assert_eq!(closed.hit_regions, []);
+            ctx.overlay_progress = 0.6;
+            let held = build_scene_layout(SceneKind::Recents, w, h, &theme, &ctx);
+            assert_eq!(held.hit_regions, []);
+            assert!(held.draw_list.commands.iter().any(|cmd| matches!(cmd, DrawCommand::Image(quad) if (quad.alpha - 0.6).abs() < f32::EPSILON)));
+        }
+    }
+
+    #[test]
+    fn app_origin_overview_holds_inert_thumbnails_and_a_settled_empty_fallback() {
+        let mut ctx = SceneContext {
+            power_menu: Some(PowerMenu::Closed),
+            tablet_overview: Some(TabletOverviewOrigin::App),
+            overlay_progress: 0.25,
+            ..SceneContext::default()
+        };
+        let theme = ThemePalette::default_dark();
+        let build =
+            |ctx: &SceneContext| build_scene_layout(SceneKind::Recents, 1280.0, 800.0, &theme, ctx);
+        let held = build(&ctx);
+        assert_eq!(held.hit_regions, []);
+        assert!(held.draw_list.commands.iter().any(|cmd| matches!(
+            cmd, DrawCommand::Image(quad) if quad.w > 1000.0 && (quad.alpha - 0.25).abs() < f32::EPSILON
+        )));
+        ctx.overlay_progress = 1.0;
+        assert_eq!(
+            build(&ctx).hit_test(640.0, 400.0),
+            Some(&HitTarget::FocusWindow { id: "0x1".into() }),
+        );
+        ctx.recents_cards.clear();
+        let empty = build(&ctx);
+        assert_eq!(
+            empty.hit_test(640.0, 400.0),
+            Some(&HitTarget::DismissOverlay)
+        );
+        assert!(empty.draw_list.commands.iter().any(|cmd| matches!(
+            cmd, DrawCommand::Text(label) if label.text == "No windows"
+        )));
+    }
+
+    #[test]
+    fn gap_recents_lifts_the_app_preview_without_a_pill_or_early_hits() {
+        let mut ctx = SceneContext {
+            overlay_gap_gestures: true,
+            tablet_overview: Some(TabletOverviewOrigin::App),
+            overlay_progress: 0.0,
+            ..SceneContext::default()
+        };
+        let theme = ThemePalette::default_dark();
+        for (w, h) in [(1280.0, 800.0), (800.0, 1280.0)] {
+            let build =
+                |ctx: &SceneContext| build_scene_layout(SceneKind::Recents, w, h, &theme, ctx);
+            ctx.overlay_progress = 0.0;
+            assert_eq!(build(&ctx), SceneOutput::default());
+            ctx.overlay_progress = 0.25;
+            let held = build(&ctx);
+            assert_eq!(held.hit_regions, []);
+            let preview_width = |out: &SceneOutput| {
+                out.draw_list
+                    .commands
+                    .iter()
+                    .find_map(|command| match command {
+                        DrawCommand::Image(quad)
+                            if Arc::ptr_eq(
+                                &quad.image,
+                                ctx.recents_cards[0].thumbnail.as_ref().unwrap(),
+                            ) =>
+                        {
+                            Some(quad.w)
+                        }
+                        _ => None,
+                    })
+                    .unwrap()
+            };
+            ctx.overlay_progress = 1.0;
+            let open = build(&ctx);
+            assert!(preview_width(&held) > preview_width(&open));
+            assert_eq!(
+                open.hit_test(w * 0.5, h * 0.5),
+                Some(&HitTarget::FocusWindow { id: "0x1".into() })
+            );
+            assert!(open.hit_regions.iter().all(|hit| matches!(
+                hit.target,
+                HitTarget::DismissOverlay | HitTarget::FocusWindow { .. }
+            )));
+            assert!(!open.draw_list.commands.iter().any(|cmd| matches!(
+                cmd, DrawCommand::Rect(rect) if rect.y >= h - 30.0 && rect.h <= 11.0
+            )));
+        }
+    }
 
     #[test]
     fn preview_footprint_uses_physical_pixels_in_both_orientations() {

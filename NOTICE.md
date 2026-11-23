@@ -11,6 +11,10 @@ and ideas inspired VeilShell:
   bottom liquid gesture pill, pre-blurred wallpaper glass optimization, and
   Linux-tablet ergonomics directly inspired VeilShell's UX direction and
   performance philosophy.
+- **Penumbra (`penumbra-mobile/penumbra-env`)** — Licensed under
+  `MIT OR Apache-2.0`. A Rust implementation reference for gesture tracking,
+  compositor presentation, and the [Tablet behavior audit](docs/tablet/README.md);
+  not a dependency or the visual target.
 - **Omarchy** — Desktop workflow, Aether live theming contract (`colors.toml`
   and `theme-set.d`), and Hyprland conventions that VeilShell integrates with
   through its optional `adapters/omarchy/` layer.

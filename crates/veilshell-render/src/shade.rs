@@ -22,6 +22,23 @@ pub enum ShadePage {
     More,
 }
 
+/// Horizontal pages of the touch Shade, separate from detail views.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TabletShadePage {
+    Notifications,
+    #[default]
+    Controls,
+}
+
+/// Whether the Tablet Shade can present a known-empty notification history.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TabletNotifications {
+    #[default]
+    Unavailable,
+    /// An empty history supplied by a deterministic fixture.
+    Empty,
+}
+
 impl ShadePage {
     fn title(self) -> &'static str {
         match self {
@@ -88,7 +105,7 @@ impl ShadeExtras {
         }
     }
 
-    fn has_more(&self) -> bool {
+    pub(super) fn has_more(&self) -> bool {
         self.media.is_some() || self.screenshot || self.notifications
     }
 }
@@ -110,6 +127,10 @@ pub struct ShadeStatus {
     pub quiet: Option<bool>,
     pub feedback: Option<String>,
     pub extras: ShadeExtras,
+    pub tablet_page: TabletShadePage,
+    /// Absolute page position while dragging or settling (0 = notifications, 1 = controls).
+    pub tablet_page_position: Option<f32>,
+    pub tablet_notifications: TabletNotifications,
     pub page: ShadePage,
     pub page_offset: usize,
     pub choices: Vec<ShadeChoice>,
@@ -132,6 +153,9 @@ impl Default for ShadeStatus {
             quiet: Some(false),
             feedback: None,
             extras: ShadeExtras::default(),
+            tablet_page: TabletShadePage::default(),
+            tablet_page_position: None,
+            tablet_notifications: TabletNotifications::default(),
             page: ShadePage::Main,
             page_offset: 0,
             choices: Vec::new(),
@@ -153,6 +177,10 @@ pub(crate) fn build_shade(
     palette: &ThemePalette,
     ctx: &SceneContext,
 ) {
+    if ctx.uses_touch_shade() {
+        crate::tablet_shade::build_tablet_shade(out, width, height, palette, ctx);
+        return;
+    }
     let progress = ctx.overlay_progress.clamp(0.0, 1.0);
     let frost = (progress / 0.33).min(1.0);
     out.draw_list.push_backdrop(
@@ -213,6 +241,17 @@ pub(crate) fn build_shade(
     if progress < 1.0 {
         out.hit_regions.clear();
     }
+}
+
+pub(super) fn draw_tablet_details(
+    out: &mut SceneOutput,
+    width: f32,
+    height: f32,
+    palette: &ThemePalette,
+    ctx: &SceneContext,
+    progress: f32,
+) {
+    draw_details(out, &ShadeStyle { palette, progress }, ctx, width, height);
 }
 
 #[derive(Clone)]
@@ -1415,6 +1454,7 @@ mod tests {
     fn shade_core_controls_distinguish_unavailable_from_off() {
         let mut ctx = SceneContext {
             power_menu: Some(PowerMenu::Closed),
+            tablet_mode: false,
             shade: ShadeStatus {
                 wifi_radio: None,
                 bluetooth_available: false,
@@ -1534,6 +1574,7 @@ mod tests {
             for power_menu in [None, Some(PowerMenu::Closed)] {
                 let ctx = SceneContext {
                     power_menu,
+                    tablet_mode: power_menu.is_none(),
                     ..SceneContext::default()
                 };
                 let shade = scene(width, height, &ctx);

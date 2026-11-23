@@ -14,7 +14,11 @@ fi
 [[ -S "$PARENT" ]] || { echo "Parent Wayland socket not found: $PARENT" >&2; exit 1; }
 
 cd "$REPO_ROOT"
-cargo build --locked --bin veilshell --bin veilctl --example hyprland_smoke_pointer
+build_targets=(--bin veilshell --bin veilctl --example hyprland_smoke_pointer)
+if [[ ${VEILSHELL_TEST_OVERLAY_GAPS:-0} == 1 ]]; then
+    build_targets+=(--example hyprland_gap_test_bar)
+fi
+cargo build --locked "${build_targets[@]}"
 TARGET_DIR="$(cargo metadata --locked --no-deps --format-version 1 | jq -er .target_directory)"
 BIN="$TARGET_DIR/debug"
 
@@ -49,6 +53,7 @@ export DBUS_SESSION_BUS_ADDRESS="unix:path=$ROOT/no-user-bus"
 export DBUS_SYSTEM_BUS_ADDRESS="unix:path=$ROOT/no-system-bus" GSETTINGS_BACKEND=memory
 export XDG_CURRENT_DESKTOP=Hyprland VEILSHELL_SOCKET="$XDG_RUNTIME_DIR/veil.sock"
 unset DISPLAY WAYLAND_DISPLAY WAYLAND_SOCKET HYPRLAND_INSTANCE_SIGNATURE NOTIFY_SOCKET VEILSHELL_SESSION_DIR OMARCHY_PATH
+unset VEILSHELL_TEST_POINTER_STEP_MS
 
 # Never send these test taps to real radios or audio. The fixture records the
 # outgoing commands and reports the applied state to the same panel.
@@ -80,6 +85,9 @@ case "$1" in
   set-mute)
     [[ $2 == @DEFAULT_AUDIO_SINK@ && $3 == 1 ]] || exit 1
     touch "$VEIL_TEST_STATE/muted" ;;
+  set-volume)
+    [[ $2 == @DEFAULT_AUDIO_SINK@ && $3 =~ ^[0-9]+%$ ]] || exit 1
+    printf '%s\n' "$3" >>"$VEIL_TEST_STATE/volume-levels" ;;
   *) exit 1 ;;
 esac
 EOF
@@ -128,6 +136,7 @@ for _ in {1..60}; do
 done
 [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]] || { echo "Nested Hyprland did not start" >&2; exit 1; }
 nested_ctl() { timeout 5 hyprctl -i "$HYPRLAND_INSTANCE_SIGNATURE" "$@"; }
+export VEILSHELL_TEST_POINTER_EXTENT=960x640
 pointer() {
     timeout 5 "$BIN/examples/hyprland_smoke_pointer" "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" "$@"
 }
@@ -153,13 +162,37 @@ show() {
 }
 in_scene() {
     timeout 5 "$BIN/veilctl" status | tee "$ROOT/status.log" |
-        grep -F "scene: $1, visible: true, output: veil-smoke 960x640," >/dev/null
+        grep -F "scene: $1, visible: true, output: veil-smoke $VEILSHELL_TEST_POINTER_EXTENT," >/dev/null
+}
+in_tablet_shade() {
+    in_scene shade && grep -Fx "  tablet shade: $1" "$ROOT/status.log" >/dev/null
+}
+assert_legacy_shade() {
+    if grep -Fq 'tablet shade:' "$ROOT/status.log"; then
+        echo "Unexpected standalone Tablet Shade in $(grep -F 'scene: shade' "$ROOT/status.log")" >&2
+        return 1
+    fi
+}
+assert_drawer_unavailable() {
+    local reply rc=0
+    reply="$(timeout 5 "$BIN/veilctl" show drawer)" || rc=$?
+    if [[ $rc != 1 || $reply != "err Drawer requires standalone Tablet mode" ]]; then
+        echo "Unexpected show drawer reply (code $rc): $reply" >&2
+        return 1
+    fi
 }
 
 [[ $(nested_ctl output create headless veil-smoke) == ok ]]
 [[ $(nested_ctl eval 'hl.monitor({ output = "veil-smoke", mode = "960x640@60", position = "3000x0", scale = 1 })') == ok ]]
 wait_for "960x640 smoke output" json_matches monitors \
     'any(.[]; .name == "veil-smoke" and .width == 960 and .height == 640 and .scale == 1)'
+
+if [[ ${VEILSHELL_TEST_OVERLAY_GAPS:-0} == 1 ]]; then
+    # shellcheck source=scripts/test-hyprland-overlay-gaps.inc.sh
+    source "$REPO_ROOT/scripts/test-hyprland-overlay-gaps.inc.sh"
+    test_overlay_gaps
+    exit 0
+fi
 
 if [[ ${VEILSHELL_TEST_KEYBOARD:-0} == 1 ]]; then
     # shellcheck source=scripts/test-hyprland-keyboard.inc.sh
@@ -219,15 +252,23 @@ if [[ ${VEILSHELL_TEST_STANDALONE:-0} == 1 ]]; then
     mkdir -m 700 "$VEILSHELL_SESSION_DIR"
     printf '%s\n' "$WAYLAND_DISPLAY" "$HYPRLAND_INSTANCE_SIGNATURE" >"$VEILSHELL_SESSION_DIR/display"
     export VEILSHELL_SOCKET="$VEILSHELL_SESSION_DIR/control.sock"
+    # Keep the original Home fixture first in both grids.
+    cat >"$XDG_DATA_HOME/applications/veil-sheet.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Veil Sheet Fixture
+Exec=foot --hold --app-id=veil-sheet --title=VeilSheet true
+EOF
+    # shellcheck source=scripts/test-hyprland-tablet-nav.inc.sh
+    source "$REPO_ROOT/scripts/test-hyprland-tablet-nav.inc.sh"
 fi
 
 WAYLAND_DEBUG="${VEILSHELL_TEST_WAYLAND_DEBUG:-0}" \
-    "$BIN/veilshell" --no-watchers --policy tablet --output veil-smoke --renderer software \
+    "$BIN/veilshell" --no-watchers --policy tablet --osk manual --output veil-smoke --renderer software \
     >"$ROOT/veilshell.log" 2>&1 &
 PIDS+=("$!")
 wait_for "VeilShell socket" test -S "$VEILSHELL_SOCKET"
-# The fixture terminal may auto-open the OSK once on initial IM activation.
-show pill
+# App keyboard behavior is exercised by the separate keyboard workflow above.
 show pill
 wait_for "initial Pill on smoke output" in_scene pill
 # A short drag from padding must cancel; a tap there is not a button press.
@@ -235,22 +276,39 @@ pointer 480 600
 in_scene pill
 pointer 480 600 588
 wait_for "short Home pull canceled" in_scene pill
-# Neither edge grabs the transparent sides.
+# The bottom handle doesn't grab the transparent sides in either mode.
 pointer 105 600 516
 in_scene pill
-pointer 575 36 120
-in_scene pill
-pointer 480 36
-in_scene pill
-pointer 480 36 120
-wait_for "short top swipe opened Quick Settings" in_scene shade
-show pill
-pointer 480 600 516
-wait_for "short bottom swipe opened Home" in_scene home
+if [[ ${VEILSHELL_TEST_STANDALONE:-0} == 1 ]]; then
+    tablet_bottom_up
+    wait_for "Fast Tablet bottom flick opened Home from the app" in_scene home
+else
+    assert_drawer_unavailable
+    in_scene pill
+    # The overlay doesn't own a status row; its top handle stays narrow.
+    pointer 575 36 120
+    in_scene pill
+    pointer 480 36
+    in_scene pill
+    pointer 480 36 120
+    wait_for "overlay top swipe opened Quick Settings" in_scene shade
+    assert_legacy_shade
+    show pill
+    pointer 480 600 516
+    wait_for "short bottom swipe opened Home" in_scene home
+fi
 echo "Edge grab zones, swipe-only padding and short pulls passed."
 sleep 0.8
-# The only discovered app is in the first Home grid cell.
-pointer 110 110
+# The overlay starts with an app in its first cell. Tablet Home puts its
+# passive clock in the first two cells and the app in the third.
+home_app_x=110
+if [[ ${VEILSHELL_TEST_STANDALONE:-0} == 1 ]]; then
+    home_app_x=597
+    pointer 245 150
+    in_scene home
+    json_matches clients 'map(.class) == ["veil-other"]'
+fi
+pointer "$home_app_x" 110
 wait_for "Home launched its fixture" json_matches clients \
     'map(.class) | sort == ["veil-home", "veil-other"]'
 echo "Home launch passed."
@@ -262,10 +320,10 @@ if [[ ${VEILSHELL_TEST_STANDALONE:-0} == 1 ]]; then
     nested_ctl eval "hl.dispatch(hl.dsp.focus({ window = \"address:$other_address\" }))" >/dev/null
     wait_for "other window focused before reactivation" json_matches activewindow '.address == $id' --arg id "$other_address"
     show pill
-    pointer 480 600 516
-    wait_for "second bottom swipe opened Home" in_scene home
+    tablet_bottom_up
+    wait_for "Second fast Tablet bottom flick opened Home" in_scene home
     sleep 0.8
-    pointer 110 110
+    pointer "$home_app_x" 110
     wait_for "standalone Home focused the existing address" json_matches activewindow \
         '.address == $id' --arg id "$home_address"
     json_matches clients 'map(.class) | sort == ["veil-home", "veil-other"]'
@@ -274,6 +332,8 @@ if [[ ${VEILSHELL_TEST_STANDALONE:-0} == 1 ]]; then
     [[ $("$BIN/veilctl" mode desk) == "Mode set to Desk "* ]]
     wait_for "Desk keeps the shell visible" in_scene pill
     "$BIN/veilctl" status | grep -F 'session    : standalone (Desk)' >/dev/null
+    assert_drawer_unavailable
+    in_scene pill
     desk_panel_reserved() {
         json_matches monitors 'any(.[]; .name == "veil-smoke" and .reserved[1] == $height)' \
             --argjson height "$1"
@@ -291,6 +351,7 @@ if [[ ${VEILSHELL_TEST_STANDALONE:-0} == 1 ]]; then
     show pill
     pointer 900 22
     wait_for "Controls pill opens Quick Settings" in_scene shade
+    assert_legacy_shade
     show settings
     in_scene settings
     # Settings rows are centered in a 620px panel at this 960×640 viewport.
@@ -323,28 +384,60 @@ if [[ ${VEILSHELL_TEST_STANDALONE:-0} == 1 ]]; then
     json_matches clients 'map(.address) | sort == $windows' --argjson windows "$saved_windows"
     show pill
     nested_ctl eval "hl.dispatch(hl.dsp.focus({ window = \"address:$home_address\" }))" >/dev/null
-    show pill # Focus can trigger the fixture terminal's automatic keyboard.
     wait_for "Tablet app fills the usable area" json_matches activewindow \
         '.address == $id and .at == [3000,48] and .size == [960,592]' --arg id "$home_address" ||
         { nested_ctl -j activewindow; nested_ctl -j monitors; exit 1; }
-    pointer 480 24 120
-    wait_for "Tablet status pull opens Quick Settings" in_scene shade
-    desk_panel_reserved 48
+    # The whole reserved status row starts a vertical gesture, not a tap.
+    # A short, horizontal, reversed, or app-content gesture must not open it.
+    pointer 480 24
+    in_scene pill
+    # 144 px over three slow waypoints is below the 126/488 height threshold.
+    pointer 24 24 72 120 168
+    wait_for "Tablet short status pull cancels" in_scene pill
+    pointer 24 24 175:24
+    in_scene pill
+    pointer 24 24 230 28
+    wait_for "Tablet reversed status pull restores the app" in_scene pill
+    pointer 24 56 180
+    in_scene pill
+    for x in 24 480 936; do
+        pointer "$x" 24 224
+        wait_for "Tablet status x=$x opens both landscape panes" in_tablet_shade split
+        desk_panel_reserved 48
+        # Dismiss from the notification side so a slider doesn't take the gesture.
+        sleep 0.6
+        pointer 35 280 224
+        wait_for "Tablet Shade returns to its app" in_scene pill
+        json_matches activewindow '.address == $id' --arg id "$home_address"
+    done
+    show home
+    pointer 24 24
+    in_scene home
+    pointer 936 24 230 28
+    wait_for "Tablet reversed status pull restores Home" in_scene home
+    pointer 936 24 224
+    wait_for "Tablet Home status row opens both panes" in_tablet_shade split
+    sleep 0.6
+    pointer 5 175 12
+    wait_for "Tablet Shade returns to Home" in_scene home
     show pill
     nested_ctl eval "hl.dispatch(hl.dsp.window.fullscreen({ mode = \"fullscreen\", action = \"set\", window = \"address:$home_address\" }))" >/dev/null
     wait_for "True fullscreen fills the whole output" json_matches activewindow \
         '.address == $id and .at == [3000,0] and .size == [960,640]' --arg id "$home_address"
+    pointer 24 24 224
+    in_scene pill
     if command -v grim >/dev/null && command -v python3 >/dev/null; then
         # Both points are in the terminal's flat background in immersive mode.
         # The upper point would be distinctly tinted if the status row were on top.
-        timeout 5 grim -o veil-smoke -t ppm "$ROOT/fullscreen.ppm"
-        python3 - "$ROOT/fullscreen.ppm" <<'PY'
-import sys
-with open(sys.argv[1], "rb") as f:
+        # Stream the screenshot so the check doesn't depend on tmpfs quota.
+        timeout 5 grim -o veil-smoke -t ppm - | python3 - 3<&0 <<'PY'
+import os
+with os.fdopen(3, "rb") as f:
     assert f.readline().strip() == b"P6"
-    width, _ = map(int, f.readline().split())
+    width, height = map(int, f.readline().split())
     assert f.readline().strip() == b"255"
     pixels = f.read()
+assert len(pixels) == width * height * 3
 def pixel(x, y):
     i = 3 * (y * width + x)
     return pixels[i:i+3]
@@ -359,7 +452,96 @@ PY
     nested_ctl eval 'hl.monitor({ output = "veil-smoke", mode = "960x640@60", position = "3000x0", scale = 1, transform = 1 })' >/dev/null
     wait_for "Portrait keeps the same status inset" json_matches activewindow \
         '.address == $id and .at == [3000,48] and .size == [640,912]' --arg id "$home_address"
-    echo "Desk pills, Tablet app stage, status pull and fullscreen geometry passed."
+    VEILSHELL_TEST_POINTER_EXTENT=640x960
+    wait_for "VeilShell follows the portrait output" in_scene pill
+    # This pull crosses the center on its first move. Down X, not the current
+    # coordinate at recognition or release, picks the first page.
+    pointer 315 24 355:294
+    wait_for "Tablet left-half pull opens Notifications" in_tablet_shade notifications
+    sleep 0.6
+    pointer 24 24
+    in_tablet_shade notifications
+    pointer 420 610 386:610
+    wait_for "Portrait swipe undershoot stays on Notifications" in_tablet_shade notifications
+    pointer 540 610 150:610
+    wait_for "Portrait swipe left reaches Controls" in_tablet_shade controls
+    pointer 110 610 530:610
+    wait_for "Portrait swipe right returns to Notifications" in_tablet_shade notifications
+    pointer 35 280 249
+    wait_for "Short upward content pull stays open" in_tablet_shade notifications
+    sleep 0.6
+    pointer 35 280 224
+    wait_for "Notifications dismisses back to the app" in_scene pill
+    json_matches activewindow '.address == $id' --arg id "$home_address"
+
+    pointer 616 24 294
+    wait_for "Tablet right-half pull opens Controls" in_tablet_shade controls
+    sleep 0.6
+    # The point is inside the volume bar. Horizontal intent should page, not
+    # send a level change. A vertical gesture starting there still owns it.
+    pointer 245 415 540:424
+    wait_for "Horizontal swipe across a level tile pages" in_tablet_shade notifications
+    [[ ! -e "$ROOT/volume-levels" ]]
+    pointer 540 610 150:610
+    wait_for "Swipe returns to Controls for volume adjustment" in_tablet_shade controls
+    pointer 245 415 360
+    wait_for "Vertical volume drag dispatched a level" test -s "$ROOT/volume-levels"
+    in_tablet_shade controls
+    # Rotate with Shade still open, not via an explicit reopen.
+    nested_ctl eval 'hl.monitor({ output = "veil-smoke", mode = "960x640@60", position = "3000x0", scale = 1, transform = 0 })' >/dev/null
+    VEILSHELL_TEST_POINTER_EXTENT=960x640
+    wait_for "Open portrait Shade reflows to landscape split" in_tablet_shade split
+    nested_ctl eval 'hl.monitor({ output = "veil-smoke", mode = "960x640@60", position = "3000x0", scale = 1, transform = 1 })' >/dev/null
+    VEILSHELL_TEST_POINTER_EXTENT=640x960
+    wait_for "Rotating back keeps the Controls page" in_tablet_shade controls
+    pointer 5 285 146
+    wait_for "Controls dismisses back to the app" in_scene pill
+    json_matches activewindow '.address == $id' --arg id "$home_address"
+
+    show home
+    pointer 24 24 294
+    wait_for "Portrait Home left-half pull opens Notifications" in_tablet_shade notifications
+    sleep 0.6
+    pointer 35 280 224
+    wait_for "Notifications dismisses back to the originating Home" in_scene home
+    sleep 0.3
+    pointer 24 24 294
+    wait_for "Home opens Notifications again" in_tablet_shade notifications
+    sleep 0.6
+    pointer 35 280
+    wait_for "Shade backdrop tap also returns to Home" in_scene home
+    show shade
+    in_tablet_shade controls
+
+    # A rightward swipe from this spot pages Controls when no modal is
+    # present. Opening details or Power must consume it instead.
+    pointer 300 280
+    sleep 0.3
+    pointer 110 610 530:610
+    sleep 0.6
+    in_tablet_shade controls
+    [[ ! -e "$ROOT/wifi-radio-toggled" ]]
+    show shade
+    pointer 568 162
+    sleep 0.3
+    pointer 110 610 530:610
+    sleep 0.6
+    in_tablet_shade controls
+    show pill
+
+    # The second identical waypoint keeps the contact held after a qualified
+    # pull. Resize before release; the gesture must not open a stale panel.
+    pointer 24 24 315 315 315 315 315 315 315 315 315 315 &
+    held_pointer=$!
+    PIDS+=("$held_pointer")
+    wait_for "Tablet reveal is active before rotation" in_tablet_shade notifications
+    nested_ctl eval 'hl.monitor({ output = "veil-smoke", mode = "960x640@60", position = "3000x0", scale = 1, transform = 0 })' >/dev/null
+    VEILSHELL_TEST_POINTER_EXTENT=960x640
+    wait "$held_pointer"
+    unset 'PIDS[-1]'
+    wait_for "Rotation during a pull cancels back to the app" in_scene pill
+    echo "Desk pills, Tablet Shade split/paging, return, rotation, Home, and fullscreen passed."
+    test_tablet_navigation "$other_address" "$home_address"
     timeout 5 "$BIN/veilctl" quit >/dev/null
     exit 0
 fi

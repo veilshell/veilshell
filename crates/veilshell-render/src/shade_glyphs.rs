@@ -26,6 +26,9 @@ pub(crate) enum Glyph {
     Battery,
     Bell,
     Profile,
+    Settings,
+    ChevronRight,
+    BellOff,
 }
 
 type Cache = HashMap<(Glyph, [u8; 3]), Arc<RgbaImage>>;
@@ -133,6 +136,16 @@ fn arrow(glyph: Glyph, x: f32, y: f32) -> bool {
         || stroke_contains(sample, (12.0, 5.0), (18.0, 11.0))
 }
 
+fn settings_gear(x: f32, y: f32) -> bool {
+    let dx = x - 12.0;
+    let dy = y - 12.0;
+    let r2 = dx * dx + dy * dy;
+    // Four pairs of gear teeth around a round hub.
+    let axial = dx.abs().min(dy.abs());
+    let diagonal = (dx.abs() - dy.abs()).abs() * std::f32::consts::FRAC_1_SQRT_2;
+    r2 > 3.4 * 3.4 && (r2 <= 7.9 * 7.9 || (r2 <= 10.2 * 10.2 && axial.min(diagonal) < 2.0))
+}
+
 fn contains(glyph: Glyph, x: f32, y: f32) -> bool {
     let distance_sq = |cx: f32, cy: f32| (x - cx) * (x - cx) + (y - cy) * (y - cy);
     let circle = |cx: f32, cy: f32, r: f32| distance_sq(cx, cy) <= r * r;
@@ -202,6 +215,7 @@ fn contains(glyph: Glyph, x: f32, y: f32) -> bool {
         Glyph::ArrowLeft | Glyph::ArrowRight | Glyph::ArrowUp | Glyph::ArrowDown => {
             arrow(glyph, x, y)
         }
+        Glyph::ChevronRight => line(10.0, 7.5, 14.5, 12.0) || line(14.5, 12.0, 10.0, 16.5),
         Glyph::Power => {
             (ring(12.0, 13.0, 7.7) && y >= 7.1)
                 || circle(7.0, 7.1, STROKE)
@@ -221,12 +235,16 @@ fn contains(glyph: Glyph, x: f32, y: f32) -> bool {
                 || line(5.0, 16.5, 19.0, 16.5)
                 || (circle(12.0, 19.0, 1.9) && y >= 18.5)
         }
+        Glyph::BellOff => {
+            line(4.0, 4.0, 20.0, 20.0) || ((y - x).abs() > 2.7 && contains(Glyph::Bell, x, y))
+        }
         Glyph::Profile => {
             (ring(12.0, 12.0, 8.1) && y <= 18.0)
                 || line(7.0, 18.0, 17.0, 18.0)
                 || line(12.0, 13.4, 15.8, 9.1)
                 || circle(12.0, 13.4, 1.55)
         }
+        Glyph::Settings => settings_gear(x, y),
     }
 }
 

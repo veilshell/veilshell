@@ -133,14 +133,19 @@ Mode, which simply hides VeilShell.
 
 ### Shared tablet experience
 
+The [Tablet behavior audit](tablet/README.md) specifies the standalone path
+separately from shared overlay behavior. It tracks Denial as the target and
+labels gaps that require compositor support or runtime evidence.
+
 - [x] Finger-following Home and Quick Settings reveals with reversible drags and spring settling, plus interactive Home paging.
 - [x] Responsive control center: Connectivity, Display & Sound, and Device sections, compacting to the available controls and using both columns in landscape.
-- [x] Denial-style Recents deck: frameless live window previews with app icon/name above each card, higher-resolution captures, swipe paging, and swipe-up-to-close.
+- [x] Denial-style Recents deck: frameless bounded window thumbnails with app icon/name above each card, swipe paging, and swipe-up-to-close.
+- [x] Standalone Tablet: [Home flick, Recents pull and adjacent-window swipes](tablet/navigation.md), plus the [separate All Apps drawer](tablet/home.md).
 - [ ] Notification center: actionable banners, history, dismissal, and lock-screen privacy.
 - [ ] Touch Wi-Fi network selection and Bluetooth pairing, not just radio toggles.
 - [x] Keyboard hold-to-repeat for Backspace and arrows, and a terminal utility row with Escape, Tab and all four arrows.
 - [ ] Keyboard long-press accents and optional local suggestions that are disabled for sensitive fields.
-- [ ] Editable Home: reorder icons, create folders, persist layout, share a dock across pages, and open a separate alphabetical app drawer.
+- [ ] Editable Home: reorder icons, create folders, persist layout, and share a dock across pages.
 - [x] Desktop launcher with search and physical-keyboard navigation, separate from Tablet Home.
 - [ ] Desktop launcher recent suggestions and pointer scrolling.
 

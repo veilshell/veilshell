@@ -244,6 +244,13 @@ The Cover watcher still polls; the 250 ms interval does not guarantee the
 150 ms [mode transition target](PERFORMANCE_BUDGET.md#hard-budgets). Measure
 physical transitions separately from a `veilctl mode` command.
 
+The [opt-in pill-free gap profile](tablet/overlay-gaps.md) has a separate
+acceptance matrix for real touch contacts, mouse routing, native resize,
+and window coverage. Do not use the legacy virtual-pointer test as evidence
+that a gap gesture was delivered as touch. See its
+[mixed-input result](tablet/overlay-gaps.md#authenticated-mixed-input-result)
+for the disposable SDDM runs in both orientations.
+
 ## Validation record template
 
 Use `pass`, `fail`, `unavailable` (missing capability/blocked), or `not run`

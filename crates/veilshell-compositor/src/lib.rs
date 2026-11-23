@@ -1,5 +1,7 @@
 //! Compositor-agnostic traits plus live `Hyprland` Unix-socket IPC and mock backends.
 
+mod overlay_gaps;
+
 use std::fmt;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -89,6 +91,21 @@ pub trait CompositorBackend {
     /// Returns [`CompositorError`] if the compositor cannot be queried.
     fn list_windows(&self) -> Result<Vec<WindowInfo>, CompositorError>;
 
+    /// Mapped normal-workspace windows on the named touch navigation output, most recent first.
+    /// A window is marked focused only if it is the active window on that output.
+    ///
+    /// # Errors
+    /// Returns an error if the output or its windows cannot be queried.
+    fn list_tablet_windows(&self, _output: &str) -> Result<Vec<WindowInfo>, CompositorError> {
+        Err(CompositorError::Unsupported("Tablet window query"))
+    }
+
+    /// Safe top and bottom overlay strip depths in logical pixels, or zero on
+    /// either edge that cannot be verified. Called only for opt-in gap overlays.
+    fn overlay_gap_depths(&self) -> (u32, u32) {
+        (0, 0)
+    }
+
     /// Focus and raise a window by its [`WindowId`].
     ///
     /// # Errors
@@ -141,6 +158,7 @@ pub trait CompositorBackend {
 pub struct MockBackend {
     windows: Vec<WindowInfo>,
     outputs: Vec<OutputInfo>,
+    tablet_mru: Vec<WindowId>,
     mode: ShellMode,
     last_workspace_delta: i32,
     launched_commands: Arc<Mutex<Vec<String>>>,
@@ -185,6 +203,7 @@ impl Default for MockBackend {
                 scale: 1.5,
                 orientation: Orientation::Normal,
             }],
+            tablet_mru: Vec::new(),
             mode: ShellMode::Laptop,
             last_workspace_delta: 0,
             launched_commands: Arc::new(Mutex::new(Vec::new())),
@@ -224,6 +243,21 @@ impl CompositorBackend for MockBackend {
         Ok(self.windows.clone())
     }
 
+    fn list_tablet_windows(&self, output: &str) -> Result<Vec<WindowInfo>, CompositorError> {
+        // The mock's windows all belong to its single fixture output.
+        if !self.outputs.iter().any(|o| o.name == output) {
+            return Err(CompositorError::NotFound(output.to_owned()));
+        }
+        let mut windows = self.windows.clone();
+        windows.sort_by_key(|window| {
+            self.tablet_mru
+                .iter()
+                .position(|id| *id == window.id)
+                .unwrap_or(usize::MAX)
+        });
+        Ok(windows)
+    }
+
     fn focus_window(&mut self, id: &WindowId) -> Result<(), CompositorError> {
         if !self.windows.iter().any(|w| &w.id == id) {
             return Err(CompositorError::NotFound(id.0.clone()));
@@ -231,6 +265,8 @@ impl CompositorBackend for MockBackend {
         for window in &mut self.windows {
             window.focused = &window.id == id;
         }
+        self.tablet_mru.retain(|window| window != id);
+        self.tablet_mru.insert(0, id.clone());
         Ok(())
     }
 
@@ -240,6 +276,7 @@ impl CompositorBackend for MockBackend {
         if self.windows.len() == before {
             return Err(CompositorError::NotFound(id.0.clone()));
         }
+        self.tablet_mru.retain(|window| window != id);
         Ok(())
     }
 
@@ -282,6 +319,7 @@ impl CompositorBackend for MockBackend {
 pub struct HyprlandBackend {
     socket_path: PathBuf,
     timeout: Duration,
+    overlay_gaps: Option<overlay_gaps::GapQuery>,
 }
 
 impl HyprlandBackend {
@@ -296,7 +334,17 @@ impl HyprlandBackend {
         Self {
             socket_path,
             timeout: Duration::from_secs(2),
+            overlay_gaps: None,
         }
+    }
+
+    /// Enable sizing queries and restrict touch navigation to the active normal
+    /// workspace on the gesture output. In the overlay even a window focus
+    /// must not intentionally switch workspaces.
+    #[must_use]
+    pub fn with_overlay_gap_gestures(mut self) -> Self {
+        self.overlay_gaps.get_or_insert_with(Default::default);
+        self
     }
 
     /// Discover a running `Hyprland` instance from the process environment.
@@ -377,6 +425,45 @@ impl HyprlandBackend {
 #[derive(Deserialize)]
 struct HyprWorkspaceRef {
     name: String,
+    id: Option<i64>,
+    // 0.57+ distinguishes an addressable name from the display name.
+    address: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+}
+
+impl HyprWorkspaceRef {
+    fn is_normal(&self) -> bool {
+        match self.kind.as_deref() {
+            Some(kind) => kind == "normal",
+            // Pre-0.57 JSON has no workspace type. Named workspaces may have
+            // negative IDs too, but the special workspace range is -99..=-2.
+            None => {
+                !self.name.is_empty()
+                    && self.name != "special"
+                    && !self.name.starts_with("special:")
+                    && self.id.is_none_or(|id| !(-99..=-1).contains(&id))
+            }
+        }
+    }
+
+    fn is_same_workspace(&self, other: &Self) -> bool {
+        self.id == other.id
+            && match (&self.address, &other.address) {
+                (Some(a), Some(b)) => !a.is_empty() && a == b,
+                (None, None) => self.id.is_some_and(|id| id != 0),
+                _ => false,
+            }
+    }
+
+    fn is_empty_special_workspace(&self) -> bool {
+        // v0.56: {id: 0, name: ""}; v0.57: {address: "", type: "", name: ""}.
+        self.name.is_empty()
+            && match &self.address {
+                Some(address) => address.is_empty() && self.kind.as_deref() == Some(""),
+                None => self.id == Some(0),
+            }
+    }
 }
 
 #[derive(Deserialize)]
@@ -387,16 +474,28 @@ struct HyprClient {
     class: String,
     workspace: HyprWorkspaceRef,
     floating: bool,
-    #[serde(default = "default_mapped")]
-    mapped: bool,
+    mapped: Option<bool>,
+    hidden: Option<bool>,
+    accepts_input: Option<bool>,
     #[serde(rename = "focusHistoryID", default = "default_focus_history")]
     focus_history_id: i32,
     #[serde(default)]
     stable_id: Option<String>,
+    monitor: Option<i64>,
 }
 
-const fn default_mapped() -> bool {
-    true
+impl HyprClient {
+    fn into_window(self, focused: bool) -> WindowInfo {
+        WindowInfo {
+            id: WindowId(self.address),
+            title: self.title,
+            app_id: self.class,
+            workspace: self.workspace.name,
+            focused,
+            floating: self.floating,
+            foreign_id: self.stable_id,
+        }
+    }
 }
 
 const fn default_focus_history() -> i32 {
@@ -413,6 +512,39 @@ struct HyprMonitor {
     transform: u8,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HyprTabletMonitor {
+    name: String,
+    id: Option<i64>,
+    #[serde(default)]
+    disabled: bool,
+    active_workspace: Option<HyprWorkspaceRef>,
+    special_workspace: Option<HyprWorkspaceRef>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HyprActiveWindow {
+    // An empty object is a valid reply when no mapped window is active.
+    address: Option<String>,
+    monitor: Option<i64>,
+    workspace: Option<HyprWorkspaceRef>,
+    stable_id: Option<String>,
+}
+
+impl HyprActiveWindow {
+    fn matches(&self, client: &HyprClient) -> bool {
+        self.address.as_ref() == Some(&client.address)
+            && self.monitor == client.monitor
+            && self.stable_id == client.stable_id
+            && self
+                .workspace
+                .as_ref()
+                .is_some_and(HyprWorkspaceRef::is_normal)
+    }
+}
+
 /// Parse `hyprctl -j clients` JSON output into [`WindowInfo`] records sorted by recency.
 ///
 /// Unmapped helper surfaces are filtered out and negative `focusHistoryID` values are
@@ -423,7 +555,7 @@ struct HyprMonitor {
 pub fn parse_hyprland_clients_json(raw: &str) -> Result<Vec<WindowInfo>, CompositorError> {
     let mut clients: Vec<HyprClient> =
         serde_json::from_str(raw).map_err(|e| CompositorError::Protocol(e.to_string()))?;
-    clients.retain(|c| c.mapped);
+    clients.retain(|c| c.mapped.unwrap_or(true));
     clients.sort_by_key(|c| {
         if c.focus_history_id < 0 {
             i32::MAX
@@ -433,14 +565,96 @@ pub fn parse_hyprland_clients_json(raw: &str) -> Result<Vec<WindowInfo>, Composi
     });
     Ok(clients
         .into_iter()
-        .map(|c| WindowInfo {
-            id: WindowId(c.address),
-            title: c.title,
-            app_id: c.class,
-            workspace: c.workspace.name,
-            focused: c.focus_history_id == 0,
-            floating: c.floating,
-            foreign_id: c.stable_id,
+        .map(|c| {
+            let focused = c.focus_history_id == 0;
+            c.into_window(focused)
+        })
+        .collect())
+}
+
+fn tablet_monitor(raw: &str, output: &str) -> Result<(i64, HyprTabletMonitor), CompositorError> {
+    let monitors: Vec<HyprTabletMonitor> =
+        serde_json::from_str(raw).map_err(|e| CompositorError::Protocol(e.to_string()))?;
+    monitors
+        .into_iter()
+        .find(|m| m.name == output && !m.disabled)
+        .and_then(|m| m.id.filter(|id| *id >= 0).map(|id| (id, m)))
+        .ok_or_else(|| CompositorError::NotFound(output.to_owned()))
+}
+
+#[cfg(test)]
+fn tablet_monitor_id(raw: &str, output: &str) -> Result<i64, CompositorError> {
+    tablet_monitor(raw, output).map(|(id, _)| id)
+}
+
+fn parse_tablet_snapshot(raw: &str, output: &str) -> Result<Vec<WindowInfo>, CompositorError> {
+    parse_output_snapshot(raw, output, false)
+}
+
+fn parse_output_snapshot(
+    raw: &str,
+    output: &str,
+    overlay: bool,
+) -> Result<Vec<WindowInfo>, CompositorError> {
+    let mut replies = raw.splitn(3, "\n\n\n");
+    let (Some(monitors_json), Some(clients_json), Some(active_json)) =
+        (replies.next(), replies.next(), replies.next())
+    else {
+        return Err(CompositorError::Protocol(
+            "incomplete Tablet window snapshot".into(),
+        ));
+    };
+    let (monitor, topology) = tablet_monitor(monitors_json, output)?;
+    let overlay_workspace = if overlay {
+        let Some(active) = topology
+            .active_workspace
+            .filter(HyprWorkspaceRef::is_normal)
+        else {
+            return Ok(Vec::new());
+        };
+        if !topology
+            .special_workspace
+            .is_some_and(|ws| ws.is_empty_special_workspace())
+        {
+            // Focusing a normal client can dismiss a special workspace.
+            return Ok(Vec::new());
+        }
+        Some(active)
+    } else {
+        None
+    };
+    let mut clients: Vec<HyprClient> =
+        serde_json::from_str(clients_json).map_err(|e| CompositorError::Protocol(e.to_string()))?;
+    let active: HyprActiveWindow =
+        serde_json::from_str(active_json).map_err(|e| CompositorError::Protocol(e.to_string()))?;
+    clients.retain(|c| {
+        c.mapped == Some(true)
+            && c.monitor == Some(monitor)
+            && c.workspace.is_normal()
+            && !c.address.is_empty()
+            && c.address != "0x0"
+            && overlay_workspace.as_ref().is_none_or(|active| {
+                c.workspace.is_same_workspace(active)
+                    && c.hidden != Some(true)
+                    && c.accepts_input != Some(false)
+            })
+    });
+    // Rank 0 denotes most recent, not necessarily currently focused. Anchor
+    // on activewindow when it matches; put unranked clients after all ranks
+    // with a consistent tie-break independent of the IPC enumeration order.
+    let key = |c: &HyprClient| {
+        (
+            !active.matches(c),
+            c.focus_history_id < 0,
+            c.focus_history_id.max(0),
+        )
+    };
+    clients.sort_by(|a, b| key(a).cmp(&key(b)).then_with(|| a.address.cmp(&b.address)));
+    Ok(clients
+        .into_iter()
+        .map(|c| {
+            let focused = active.matches(&c);
+            c.into_window(focused)
         })
         .collect())
 }
@@ -481,6 +695,22 @@ impl CompositorBackend for HyprlandBackend {
     fn list_windows(&self) -> Result<Vec<WindowInfo>, CompositorError> {
         let raw = self.send_request("j/clients")?;
         parse_hyprland_clients_json(&raw)
+    }
+
+    fn list_tablet_windows(&self, output: &str) -> Result<Vec<WindowInfo>, CompositorError> {
+        // Read the topology, recency and focus together in one IPC request.
+        let raw = self.send_request("[[BATCH]]j/monitors;j/clients;j/activewindow")?;
+        if self.overlay_gaps.is_some() {
+            parse_output_snapshot(&raw, output, true)
+        } else {
+            parse_tablet_snapshot(&raw, output)
+        }
+    }
+
+    fn overlay_gap_depths(&self) -> (u32, u32) {
+        self.overlay_gaps
+            .as_ref()
+            .map_or((0, 0), |query| query.depths(&self.socket_path))
     }
 
     fn focus_window(&mut self, id: &WindowId) -> Result<(), CompositorError> {
@@ -595,6 +825,9 @@ fn lua_escape(raw: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tablet_tests;
 
 #[cfg(test)]
 mod tests {

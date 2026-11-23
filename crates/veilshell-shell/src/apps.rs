@@ -247,5 +247,30 @@ pub fn current_clock_hhmm() -> String {
     "12:00".to_owned()
 }
 
+/// Read time and long local date in one sample, so they agree across midnight.
+#[must_use]
+pub fn current_tablet_clock() -> (String, String) {
+    Command::new("date")
+        .arg("+%H:%M%n%A %-d %B")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| parse_tablet_clock(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_else(|| ("12:00".into(), String::new()))
+}
+
+fn parse_tablet_clock(output: &str) -> Option<(String, String)> {
+    let (time, date) = output.trim().split_once('\n')?;
+    let valid_time = time.len() == 5
+        && time.bytes().enumerate().all(|(i, byte)| {
+            if i == 2 {
+                byte == b':'
+            } else {
+                byte.is_ascii_digit()
+            }
+        });
+    (valid_time && !date.is_empty()).then(|| (time.to_owned(), date.to_owned()))
+}
+
 #[cfg(test)]
 mod tests;
